@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, or_, select, update
 
 from app.config import Settings
 from app.database import Database
@@ -75,26 +75,35 @@ class ProcessingPipeline:
     async def process(self, call_id: str) -> None:
         lock = self._locks.setdefault(call_id, asyncio.Lock())
         async with lock:
+            claimed_at = datetime.now(UTC)
             try:
-                await self._process(call_id)
-            except Exception as exc:
+                async with asyncio.timeout(self.settings.processing_timeout_seconds):
+                    await self._process(call_id, claimed_at)
+            except Exception:
                 logger.exception("call processing failed", extra={"call_id": call_id})
                 async with self.database.sessions() as session:
                     call = await session.get(CallRecord, call_id)
-                    if call:
+                    if (
+                        call
+                        and call.processing_claimed_at
+                        and aware_datetime(call.processing_claimed_at) == claimed_at
+                    ):
                         call.state = CallState.ANALYSIS_FAILED.value
-                        call.processing_error = str(exc)[:2000]
+                        call.processing_error = "Analysis failed; inspect server logs"
+                        call.processing_claimed_at = None
                         await session.commit()
-                await self.purge_call_audio(call_id)
+                        await self.purge_call_audio(call_id)
             finally:
                 self._locks.pop(call_id, None)
 
-    async def _process(self, call_id: str) -> None:
+    async def _process(self, call_id: str, claimed_at: datetime) -> None:
         async with self.database.sessions() as session:
             call = await session.get(CallRecord, call_id)
             if call is None or call.state in {
                 CallState.ANALYZED.value,
                 CallState.ANALYSIS_EXCLUDED.value,
+                CallState.ANALYSIS_FAILED.value,
+                CallState.PROCESSING.value,
             }:
                 return
             if not call.recording_enabled or call.ended_at is None:
@@ -102,6 +111,23 @@ class ProcessingPipeline:
             assets = (
                 await session.scalars(select(AudioAsset).where(AudioAsset.call_id == call_id))
             ).all()
+            now = datetime.now(UTC)
+            elapsed = (now - aware_datetime(call.ended_at)).total_seconds()
+            for asset in assets:
+                if asset.status != AssetStatus.PENDING.value:
+                    continue
+                timeout = (
+                    (now - aware_datetime(asset.created_at)).total_seconds()
+                    >= self.settings.upload_url_ttl_seconds
+                    if asset.kind == AssetKind.DEVICE_RAW.value
+                    else elapsed >= self.settings.egress_wait_seconds
+                )
+                if await self.storage.exists(asset.uri):
+                    asset.status = AssetStatus.UPLOADED.value
+                    asset.uploaded_at = now
+                elif timeout:
+                    asset.status = AssetStatus.FAILED.value
+            await session.commit()
             egress_assets = [
                 item
                 for item in assets
@@ -124,7 +150,7 @@ class ProcessingPipeline:
             )
             raw_only = self.settings.allow_raw_only_analysis and parent_egress is None
             if parent_egress is None and not raw_only:
-                if egress_assets:
+                if egress_assets or elapsed >= self.settings.egress_wait_seconds:
                     call.state = CallState.ANALYSIS_FAILED.value
                     call.processing_error = "부모 Egress 녹음이 완료되지 않았습니다"
                     await session.commit()
@@ -156,9 +182,13 @@ class ProcessingPipeline:
                 return
             if raw_asset is None:
                 if raw_only:
+                    if elapsed >= self.settings.upload_url_ttl_seconds:
+                        call.state = CallState.ANALYSIS_FAILED.value
+                        call.processing_error = "Raw audio upload expired"
+                        await session.commit()
+                        await self.purge_call_audio(call_id)
                     return
-                elapsed = datetime.now(UTC) - aware_datetime(call.ended_at)
-                if elapsed.total_seconds() < self.settings.raw_audio_wait_seconds:
+                if elapsed < self.settings.raw_audio_wait_seconds:
                     return
             # 여기서 PROCESSING을 조건부 UPDATE로 선점한다. `process()`의 asyncio.Lock은
             # 프로세스 안에서만 유효한데, scripts/replay_call.py는 백엔드와 별개 프로세스로
@@ -178,7 +208,7 @@ class ProcessingPipeline:
                         ]
                     ),
                 )
-                .values(state=CallState.PROCESSING.value)
+                .values(state=CallState.PROCESSING.value, processing_claimed_at=claimed_at)
             )
             if claimed.rowcount == 0:
                 return
@@ -267,6 +297,7 @@ class ProcessingPipeline:
                 call = await session.get(CallRecord, call_id)
                 if call:
                     call.state = CallState.ANALYSIS_EXCLUDED.value
+                    call.processing_claimed_at = None
                     await session.commit()
             await self.purge_call_audio(call_id)
             return
@@ -364,6 +395,7 @@ class ProcessingPipeline:
             if call:
                 await self.signals.process_call(session, call)
                 call.state = CallState.ANALYZED.value
+                call.processing_claimed_at = None
             await session.commit()
 
         await self.purge_call_audio(call_id)
@@ -401,8 +433,7 @@ class ProcessingPipeline:
                     select(AudioAsset.call_id)
                     .where(
                         AudioAsset.status != AssetStatus.PURGED.value,
-                        AudioAsset.uploaded_at.is_not(None),
-                        AudioAsset.uploaded_at < cutoff,
+                        func.coalesce(AudioAsset.uploaded_at, AudioAsset.created_at) < cutoff,
                     )
                     .distinct()
                 )
@@ -412,12 +443,17 @@ class ProcessingPipeline:
         return len(call_ids)
 
     async def process_pending(self) -> int:
+        await self.release_stale_claims()
         async with self.database.sessions() as session:
             call_ids = list(
                 await session.scalars(
-                    select(CallRecord.id).where(
-                        CallRecord.state.in_([CallState.ENDED.value, CallState.PROCESSING.value])
+                    select(CallRecord.id)
+                    .where(
+                        CallRecord.state == CallState.ENDED.value,
+                        CallRecord.recording_enabled.is_(True),
                     )
+                    .order_by(CallRecord.ended_at)
+                    .limit(100)
                 )
             )
         for call_id in call_ids:
@@ -425,17 +461,18 @@ class ProcessingPipeline:
         return len(call_ids)
 
     async def release_stale_claims(self) -> int:
-        """기동 시 PROCESSING에 걸려 있는 통화를 ENDED로 되돌린다.
-
-        PROCESSING은 선점 표시라서 다른 쪽이 잡고 있는 동안 재처리되지 않는다. 분석 중이던
-        프로세스가 죽으면 표시만 남아 영영 안 풀리는데, 기동 시점에는 그 프로세스가 살아
-        있을 수 없으므로 여기서 되돌려야 cleanup_loop이 다시 집어간다.
-        """
+        cutoff = datetime.now(UTC) - timedelta(seconds=self.settings.processing_lease_seconds)
         async with self.database.sessions() as session:
             released = await session.execute(
                 update(CallRecord)
-                .where(CallRecord.state == CallState.PROCESSING.value)
-                .values(state=CallState.ENDED.value)
+                .where(
+                    CallRecord.state == CallState.PROCESSING.value,
+                    or_(
+                        CallRecord.processing_claimed_at.is_(None),
+                        CallRecord.processing_claimed_at < cutoff,
+                    ),
+                )
+                .values(state=CallState.ENDED.value, processing_claimed_at=None)
             )
             await session.commit()
         if released.rowcount:
