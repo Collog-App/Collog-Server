@@ -5,7 +5,6 @@ import random
 import string
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
-from zoneinfo import ZoneInfo
 
 from fastapi import (
     APIRouter,
@@ -18,10 +17,11 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.auth_router import router as auth_router
 from app.config import Settings
+from app.container import AppContainer
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
@@ -36,12 +36,12 @@ from app.models import (
     ConsentRecord,
     Device,
     ExtractionEvidence,
+    Family,
     FamilyMember,
     HealthExtraction,
     Invitation,
     ParentProfile,
     RepeatEvent,
-    TimeSlot,
     Transcript,
     User,
     UserRole,
@@ -65,13 +65,17 @@ from app.services.domain import (
     ensure_child_can_access_parent,
     ensure_report_access,
     family_for_child,
-    family_of,
     has_consent,
     latest_consent,
     latest_invitation,
 )
 from app.services.livekit import LiveKitError
-from app.services.notifications import IncomingCallPush, PushNotificationError
+from app.services.notifications import (
+    IncomingCallPush,
+    PushNotificationError,
+    UnregisteredVoipToken,
+    VoipPushGateway,
+)
 from app.services.questions import daily_questions
 from app.services.repeat_detector import repeat_rate_per_minute
 from app.services.signals import baseline_to_dict, signal_to_dict
@@ -141,16 +145,23 @@ async def questions_for_parent(request: Request, session: SessionDep, parent_id:
 
 
 async def deliver_incoming_call_push(
-    gateway,
+    gateway: VoipPushGateway,
     voip_token: str,
     push: IncomingCallPush,
+    container: AppContainer,
 ) -> None:
     try:
         await gateway.send_incoming_call(voip_token, push)
+    except UnregisteredVoipToken:
+        async with container.database.sessions() as session:
+            await session.execute(
+                update(Device).where(Device.voip_token == voip_token).values(voip_token=None)
+            )
+            await session.commit()
+        await container.calls.finish(push.call_id)
     except PushNotificationError as exc:
-        # POST /calls already created a valid LiveKit call. Push delivery is best-effort
-        # because the original API also permits foreground-only demo signaling.
         logger.warning("incoming VoIP push failed for call %s: %s", push.call_id, exc)
+        await container.calls.finish(push.call_id)
 
 
 @router.post("/devices", status_code=201, tags=["Auth"])
@@ -186,6 +197,7 @@ async def create_device(payload: DeviceCreate, user: CurrentUser, session: Sessi
         device.token = payload.token
         device.voip_token = payload.voip_token
         device.created_at = datetime.now(UTC)
+    device.call_notifications_enabled = payload.call_notifications_enabled
     await session.commit()
     return {"deviceId": device.id}
 
@@ -252,8 +264,14 @@ async def get_members(
 ) -> dict:
     # 구성원 목록은 그 가족에 속한 사람이면 볼 수 있다. 자녀는 가족을 만든 사람으로,
     # 부모는 초대를 수락한 구성원으로 확인한다.
-    family = await family_of(session, user)
-    if family is None or family.id != family_id:
+    family = await session.get(Family, family_id)
+    membership = await session.scalar(
+        select(FamilyMember.id).where(
+            FamilyMember.family_id == family_id,
+            FamilyMember.user_id == user.id,
+        )
+    )
+    if family is None or (family.created_by != user.id and membership is None):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
     members = list(
         await session.scalars(select(FamilyMember).where(FamilyMember.family_id == family_id))
@@ -466,6 +484,19 @@ async def create_call(
     parent = await session.get(User, payload.callee_id)
     if parent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "부모 계정을 찾을 수 없습니다")
+    if settings_from(request).app_env == "production":
+        receiver = await session.scalar(
+            select(Device.id).where(
+                Device.user_id == parent.id,
+                Device.platform == "IOS",
+                Device.voip_token.is_not(None),
+                Device.call_notifications_enabled.is_(True),
+            )
+        )
+        if receiver is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "상대방의 통화 수신 기기가 등록되지 않았습니다"
+            )
     source, questions = await questions_for_parent(request, session, parent.id)
     del source
     recording_enabled = await has_consent(session, parent.id)
@@ -496,6 +527,7 @@ async def create_call(
             Device.user_id == parent.id,
             Device.platform == "IOS",
             Device.voip_token.is_not(None),
+            Device.call_notifications_enabled.is_(True),
         )
         .order_by(Device.created_at.desc())
         .limit(1)
@@ -513,6 +545,7 @@ async def create_call(
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings_from(request).incoming_call_ttl_seconds),
             ),
+            request.app.state.container,
         )
     elif settings_from(request).apns_voip_enabled:
         logger.warning("no iOS VoIP token registered for parent %s", parent.id)
@@ -534,27 +567,35 @@ async def create_call(
 async def accept_call(
     call_id: Annotated[str, Path(alias="callId")],
     request: Request,
+    background: BackgroundTasks,
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
     require_role(user, UserRole.PARENT)
-    call = await session.get(CallRecord, call_id)
+    call = await session.scalar(
+        select(CallRecord).where(CallRecord.id == call_id).with_for_update()
+    )
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     if call.parent_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "수신 권한이 없습니다")
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
+    settings = settings_from(request)
+    if (
+        datetime.now(UTC) - aware(call.started_at)
+    ).total_seconds() >= settings.incoming_call_ttl_seconds:
+        raise HTTPException(status.HTTP_410_GONE, "수신 대기 시간이 만료되었습니다")
+    if call.recording_enabled and not await has_consent(session, call.parent_id):
+        call.recording_enabled = False
+        call.recording_disabled_reason = "CONSENT_DENIED"
     call.state = CallState.ACTIVE.value
     call.accepted_at = datetime.now(UTC)
     settings = settings_from(request)
     livekit = request.app.state.container.livekit
     token = livekit.participant_token(call.room_name, user.id, user.name)
-    # Egress worker가 없는 raw-only 개발 환경에서는 Track Egress를 아예 시작하지 않는다.
-    # worker가 없으면 StartTrackEgress가 20초 넘게 블로킹된 뒤 503으로 실패하는데, 그동안
-    # 부모가 토큰을 못 받아 통화가 붙지 않고 열린 쓰기 트랜잭션이 다른 요청까지 잠근다.
     if call.recording_enabled and not settings.allow_raw_only_analysis:
-        for identity, kind, filename in (
+        for _, kind, filename in (
             (call.parent_id, AssetKind.WEBRTC_EGRESS_PARENT, "parent.ogg"),
             (call.child_id, AssetKind.WEBRTC_EGRESS_CHILD, "child.ogg"),
         ):
@@ -566,16 +607,9 @@ async def accept_call(
                 content_type="audio/ogg",
             )
             session.add(asset)
-            await session.flush()
-            try:
-                track_id = await livekit.find_audio_track_id(call.room_name, identity)
-                if track_id:
-                    started = await livekit.start_track_egress(call.room_name, track_id, key)
-                    asset.egress_id = started.egress_id
-            except LiveKitError as exc:
-                asset.status = AssetStatus.FAILED.value
-                call.processing_error = str(exc)[:2000]
     await session.commit()
+    if call.recording_enabled and not settings.allow_raw_only_analysis:
+        background.add_task(request.app.state.container.calls.start_recordings, call.id)
     response = CallAccepted(
         call_id=call.id,
         livekit_url=settings.livekit_url,
@@ -590,6 +624,7 @@ async def accept_call(
 @router.post("/calls/{callId}/decline", tags=["Call"])
 async def decline_call(
     call_id: Annotated[str, Path(alias="callId")],
+    request: Request,
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
@@ -599,10 +634,10 @@ async def decline_call(
     await ensure_call_access(session, user, call)
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 처리된 통화입니다")
-    call.state = CallState.ENDED.value
-    call.ended_at = datetime.now(UTC)
-    call.duration_sec = 0
-    await session.commit()
+    if user.id != call.parent_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "수신자만 거절할 수 있습니다")
+    await session.rollback()
+    await request.app.state.container.calls.finish(call_id)
     return {"status": "DECLINED"}
 
 
@@ -618,40 +653,10 @@ async def end_call(
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     await ensure_call_access(session, user, call)
-    if call.ended_at is None:
-        call.ended_at = datetime.now(UTC)
-        call.state = CallState.ENDED.value
-        started = aware(call.accepted_at or call.started_at)
-        call.duration_sec = max(0, round((datetime.now(UTC) - started).total_seconds()))
-        local_hour = started.astimezone(ZoneInfo("Asia/Seoul")).hour
-        call.time_slot = (
-            TimeSlot.MORNING.value if 6 <= local_hour <= 11 else TimeSlot.AFTERNOON_EVENING.value
-        )
-        assets = list(
-            await session.scalars(
-                select(AudioAsset).where(
-                    AudioAsset.call_id == call.id,
-                    AudioAsset.kind.in_(
-                        [
-                            AssetKind.WEBRTC_EGRESS_PARENT.value,
-                            AssetKind.WEBRTC_EGRESS_CHILD.value,
-                        ]
-                    ),
-                )
-            )
-        )
-        for asset in assets:
-            if asset.egress_id:
-                try:
-                    await request.app.state.container.livekit.stop_egress(asset.egress_id)
-                except LiveKitError:
-                    pass
-            elif asset.status == AssetStatus.PENDING.value:
-                # A participant that never published a microphone track must not
-                # leave this call stuck in ENDED forever.
-                asset.status = AssetStatus.FAILED.value
-        await session.commit()
-    background.add_task(request.app.state.container.pipeline.process, call.id)
+    await session.rollback()
+    await request.app.state.container.calls.finish(call_id)
+    call = await session.get(CallRecord, call_id, populate_existing=True)
+    background.add_task(request.app.state.container.pipeline.process, call_id)
     return call_to_dict(call)
 
 
@@ -668,6 +673,12 @@ async def raw_audio_upload_url(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     if user.id != call.parent_id or not call.recording_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "원시 오디오 업로드 권한이 없습니다")
+    if call.state not in {CallState.ACTIVE.value, CallState.ENDED.value}:
+        raise HTTPException(status.HTTP_409_CONFLICT, "오디오 업로드 시간이 지났습니다")
+    if call.ended_at and (datetime.now(UTC) - aware(call.ended_at)).total_seconds() > (
+        settings_from(request).upload_url_ttl_seconds
+    ):
+        raise HTTPException(status.HTTP_410_GONE, "오디오 업로드 시간이 지났습니다")
     key = f"calls/{call.id}/raw/parent-{random.randrange(10**10):010d}.wav"
     asset = AudioAsset(
         call_id=call.id,
@@ -746,6 +757,22 @@ async def raw_audio_complete(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "오디오 자산을 찾을 수 없습니다")
     if user.id != call.parent_id or asset.kind != AssetKind.DEVICE_RAW.value:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "오디오 자산 접근 권한이 없습니다")
+    if asset.uploaded_at is not None and asset.status in {
+        AssetStatus.UPLOADED.value,
+        AssetStatus.PURGED.value,
+    }:
+        return {"status": "COMPLETED" if asset.status == AssetStatus.PURGED.value else "QUEUED"}
+    if asset.status != AssetStatus.PENDING.value or call.state not in {
+        CallState.ACTIVE.value,
+        CallState.ENDED.value,
+    }:
+        raise HTTPException(status.HTTP_409_CONFLICT, "오디오 업로드 시간이 지났습니다")
+    if (datetime.now(UTC) - aware(asset.created_at)).total_seconds() > settings_from(
+        request
+    ).upload_url_ttl_seconds:
+        raise HTTPException(status.HTTP_410_GONE, "오디오 업로드 URL이 만료되었습니다")
+    if not await request.app.state.container.storage.exists(asset.uri):
+        raise HTTPException(status.HTTP_409_CONFLICT, "오디오 업로드가 완료되지 않았습니다")
     asset.status = AssetStatus.UPLOADED.value
     asset.uploaded_at = datetime.now(UTC)
     await session.commit()
@@ -961,6 +988,15 @@ async def livekit_webhook(
     except LiveKitError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, str(exc)) from exc
     event_name = event.get("event")
+    if event_name == "room_finished":
+        room_name = (event.get("room") or {}).get("name")
+        call = await session.scalar(select(CallRecord).where(CallRecord.room_name == room_name))
+        if call is not None:
+            call_id = call.id
+            await session.rollback()
+            await request.app.state.container.calls.finish(call_id)
+            background.add_task(request.app.state.container.pipeline.process, call_id)
+        return Response(status_code=204)
     if event_name == "track_published":
         room = event.get("room") or {}
         participant = event.get("participant") or {}
@@ -976,28 +1012,11 @@ async def livekit_webhook(
         call = await session.scalar(select(CallRecord).where(CallRecord.room_name == room_name))
         if call is None or not call.recording_enabled or call.state != CallState.ACTIVE.value:
             return Response(status_code=204)
-        kind = None
-        if identity == call.parent_id:
-            kind = AssetKind.WEBRTC_EGRESS_PARENT.value
-        elif identity == call.child_id:
-            kind = AssetKind.WEBRTC_EGRESS_CHILD.value
-        if kind is None:
+        if identity not in {call.parent_id, call.child_id}:
             return Response(status_code=204)
-        asset = await session.scalar(
-            select(AudioAsset).where(AudioAsset.call_id == call.id, AudioAsset.kind == kind)
+        background.add_task(
+            request.app.state.container.calls.start_recordings, call.id, {identity: track_id}
         )
-        if asset is None or asset.egress_id or asset.status != AssetStatus.PENDING.value:
-            return Response(status_code=204)
-        try:
-            key = request.app.state.container.storage.object_key(asset.uri)
-            started = await request.app.state.container.livekit.start_track_egress(
-                call.room_name, track_id, key
-            )
-            asset.egress_id = started.egress_id
-        except LiveKitError as exc:
-            asset.status = AssetStatus.FAILED.value
-            call.processing_error = str(exc)[:2000]
-        await session.commit()
         return Response(status_code=204)
     if event_name != "egress_ended":
         return Response(status_code=204)
@@ -1007,6 +1026,8 @@ async def livekit_webhook(
         return Response(status_code=204)
     asset = await session.scalar(select(AudioAsset).where(AudioAsset.egress_id == egress_id))
     if asset is None:
+        return Response(status_code=204)
+    if asset.status in {AssetStatus.UPLOADED.value, AssetStatus.PURGED.value}:
         return Response(status_code=204)
     egress_status = str(info.get("status", "EGRESS_COMPLETE"))
     if egress_status in {"EGRESS_COMPLETE", "3", "COMPLETE"}:
@@ -1020,5 +1041,9 @@ async def livekit_webhook(
 
 
 @router.get("/health", include_in_schema=False)
-async def health() -> dict:
+async def health(request: Request, session: SessionDep) -> dict:
+    await session.execute(select(1))
+    tasks = getattr(request.app.state, "maintenance_tasks", [])
+    if any(task.done() for task in tasks):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "정기 작업이 중단되었습니다")
     return {"status": "ok"}

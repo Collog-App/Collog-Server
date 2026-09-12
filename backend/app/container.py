@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.config import Settings
 from app.database import Database
 from app.services.acoustics import create_acoustic_analyzer
+from app.services.calls import CallLifecycle
 from app.services.deepgram import create_stt_gateway
 from app.services.gemini import create_extraction_gateway
 from app.services.livekit import create_livekit_gateway
@@ -21,6 +22,7 @@ class AppContainer:
         self.storage = create_storage(settings)
         self.question_tts = create_question_tts_gateway(settings, self.storage)
         self.livekit = create_livekit_gateway(settings)
+        self.calls = CallLifecycle(settings, self.database, self.livekit, self.storage)
         self.voip_push = create_voip_push_gateway(settings)
         self.stt = create_stt_gateway(settings)
         self.extraction = create_extraction_gateway(settings)

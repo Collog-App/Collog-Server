@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,6 +14,15 @@ from app.api import router
 from app.config import Settings, get_settings
 from app.container import AppContainer
 from app.team_portal import build_team_status, render_team_portal
+
+
+async def run_maintenance(operation: Callable[[], Awaitable[object]], interval: int) -> None:
+    while True:
+        try:
+            await operation()
+        except Exception:
+            logging.getLogger(__name__).exception("Maintenance operation failed and will retry")
+        await asyncio.sleep(interval)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -35,19 +44,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.database.ensure_schema(auto_reset=settings.schema_auto_reset)
         await container.pipeline.release_stale_claims()
 
-        async def cleanup_loop() -> None:
-            while True:
-                await asyncio.sleep(10)
-                await container.pipeline.process_pending()
-                await container.pipeline.purge_expired_audio()
-
-        cleanup = asyncio.create_task(cleanup_loop())
+        tasks = [
+            asyncio.create_task(run_maintenance(operation, settings.maintenance_interval_seconds))
+            for operation in (
+                container.calls.maintain,
+                container.pipeline.process_pending,
+                container.pipeline.purge_expired_audio,
+            )
+        ]
+        app.state.maintenance_tasks = tasks
         try:
             yield
         finally:
-            cleanup.cancel()
-            with suppress(asyncio.CancelledError):
-                await cleanup
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
             await container.voip_push.close()
             await container.database.close()
 
