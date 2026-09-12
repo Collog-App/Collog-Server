@@ -135,7 +135,7 @@ class AudioConstraints(ApiModel):
     auto_gain_control: bool = False
     dtx: bool = False
     audio_bitrate: int = 48_000
-    raw_capture_sample_rate: int = 48_000
+    raw_capture_sample_rate: int = 16_000
 
 
 class CallCreate(ApiModel):

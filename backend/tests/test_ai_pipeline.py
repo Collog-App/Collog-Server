@@ -173,9 +173,8 @@ def timing_segments() -> list[dict]:
     return segments
 
 
-async def test_acoustic_analyzer_computes_all_four_metrics() -> None:
-    # iOS target format: mono 48 kHz signed 16-bit PCM WAV.
-    sample_rate = 48_000
+@pytest.mark.parametrize("sample_rate", [16_000, 48_000])
+async def test_acoustic_analyzer_computes_all_four_metrics(sample_rate: int) -> None:
     seconds = 6
     time = np.arange(sample_rate * seconds) / sample_rate
     samples = 0.2 * np.sin(2 * math.pi * 150 * time)
