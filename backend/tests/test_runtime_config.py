@@ -63,3 +63,19 @@ def test_production_refuses_plaintext_public_urls(production: Settings) -> None:
     production.livekit_url = "ws://rtc.example.com"
     with pytest.raises(ValueError, match="HTTPS and WSS"):
         production.validate_runtime()
+
+
+def test_apple_login_can_run_without_sms_credentials(production: Settings) -> None:
+    production.solapi_api_key = ""
+    production.solapi_api_secret = ""
+    production.solapi_sender = ""
+    production.validate_runtime()
+    production.apple_login_enabled = False
+    with pytest.raises(ValueError, match="SOLAPI_API_KEY"):
+        production.validate_runtime()
+
+
+def test_enabled_apple_login_requires_client_id(production: Settings) -> None:
+    production.apple_client_id = ""
+    with pytest.raises(ValueError, match="APPLE_CLIENT_ID"):
+        production.validate_runtime()

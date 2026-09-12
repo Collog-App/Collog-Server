@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     solapi_api_secret: str = ""
     solapi_sender: str = ""
     otp_max_attempts: int = Field(default=5, ge=1, le=10)
+    apple_login_enabled: bool = True
+    apple_client_id: str = "com.dohyeoplim.collog-ios"
+    apple_challenge_ttl_seconds: int = Field(default=300, ge=30, le=600)
 
     schema_auto_reset: bool = False
 
@@ -179,13 +182,19 @@ class Settings(BaseSettings):
             "S3_SECRET_ACCESS_KEY": self.s3_secret_access_key,
             "DEEPGRAM_API_KEY": self.deepgram_api_key,
             "GEMINI_API_KEY": self.gemini_api_key,
-            "SOLAPI_API_KEY": self.solapi_api_key,
-            "SOLAPI_API_SECRET": self.solapi_api_secret,
-            "SOLAPI_SENDER": self.solapi_sender,
             "APNS_TEAM_ID": self.apns_team_id,
             "APNS_KEY_ID": self.apns_key_id,
             "APNS_BUNDLE_ID": self.apns_bundle_id,
         }
+        if self.apple_login_enabled:
+            required["APPLE_CLIENT_ID"] = self.apple_client_id
+        sms_settings = {
+            "SOLAPI_API_KEY": self.solapi_api_key,
+            "SOLAPI_API_SECRET": self.solapi_api_secret,
+            "SOLAPI_SENDER": self.solapi_sender,
+        }
+        if not self.apple_login_enabled or any(sms_settings.values()):
+            required.update(sms_settings)
         missing = [key for key, value in required.items() if not value.strip()]
         if missing:
             raise ValueError(f"Missing production settings: {', '.join(missing)}")
