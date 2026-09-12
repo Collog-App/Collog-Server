@@ -10,9 +10,8 @@ import httpx
 from app.config import Settings
 from app.services.notifications import ApnsVoipPushGateway, IncomingCallPush, PushNotificationError
 
-# APNs never accepts an all-zero token, so a rejection that names the token proves the
-# provider JWT and topic were already accepted. This validates the .p8/Team ID/Key ID/
-# Bundle ID set before any iPhone build exists.
+# A reserved token checks APNs connectivity without delivering a notification.
+# Only a registered device can verify delivery and the complete topic configuration.
 PROBE_TOKEN = "0" * 64
 
 CREDENTIALS_OK_REASONS = frozenset({"BadDeviceToken", "DeviceTokenNotForTopic", "Unregistered"})
@@ -81,7 +80,7 @@ def report(response: httpx.Response, *, probe: bool) -> bool:
     print(f"HTTP {response.status_code} {reason or '-'}  apns-id={apns_id}")
     if probe:
         if reason in CREDENTIALS_OK_REASONS:
-            print("결과: 자격증명 정상. 실제 기기 토큰만 있으면 발송할 수 있다.")
+            print("Apple 접속 확인. 실제 기기 수신은 별도로 확인해야 합니다.")
             return True
     elif response.status_code == 200:
         print("결과: 발송 성공. 기기에서 PushKit delegate와 CallKit 화면을 확인한다.")
