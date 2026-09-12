@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
-import string
+import secrets
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 
@@ -240,7 +240,7 @@ async def create_invitation(
 
 async def unique_invitation_code(session: SessionDep) -> str:
     for _ in range(20):
-        code = "".join(random.choices(string.digits, k=6))
+        code = f"{secrets.randbelow(1_000_000):06d}"
         if await session.scalar(select(Invitation.id).where(Invitation.code == code)) is None:
             return code
     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "초대 코드를 만들지 못했습니다")
@@ -256,7 +256,7 @@ def invitation_dict(invitation: Invitation) -> dict:
         "invitationId": invitation.id,
         "code": invitation.code,
         "shareText": f"콜록 가족 초대 코드 {invitation.code}를 앱에 입력해주세요.",
-        "expiresAt": invitation.expires_at,
+        "expiresAt": aware(invitation.expires_at),
         "status": status_value,
     }
 
@@ -291,13 +291,35 @@ async def get_members(
                 "userId": member.user_id,
                 "name": member.name,
                 "relation": member.relation,
+                "role": UserRole.PARENT.value,
                 "status": member_status,
                 "canRegisterConditions": member_status == "CONSENT_GRANTED",
-                "invitedAt": member.invited_at,
-                "expiresAt": invitation.expires_at if invitation else None,
+                "invitedAt": aware(member.invited_at),
+                "expiresAt": aware(invitation.expires_at) if invitation else None,
+                "invitation": (
+                    invitation_dict(invitation)
+                    if invitation and family.created_by == user.id
+                    else None
+                ),
             }
         )
-    return {"members": output}
+    owner = await session.get(User, family.created_by)
+    if owner:
+        output.append(
+            {
+                "memberId": owner.id,
+                "userId": owner.id,
+                "name": owner.name,
+                "relation": "CHILD",
+                "role": UserRole.CHILD.value,
+                "status": "ACTIVE",
+                "canRegisterConditions": False,
+                "invitedAt": None,
+                "expiresAt": None,
+                "invitation": None,
+            }
+        )
+    return {"members": output, "canInvite": family.created_by == user.id}
 
 
 @router.post("/invitations/{invitationId}/resend", status_code=201, tags=["Family"])
@@ -310,10 +332,19 @@ async def resend_invitation(
     old = await session.get(Invitation, invitation_id)
     if old is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "초대를 찾을 수 없습니다")
-    member = await session.get(FamilyMember, old.member_id)
+    member = await session.scalar(
+        select(FamilyMember).where(FamilyMember.id == old.member_id).with_for_update()
+    )
     family = await family_for_child(session, user.id)
     if member is None or family is None or member.family_id != family.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
+    if member.user_id is not None or old.accepted_at is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "이미 수락한 초대입니다")
+    await session.execute(
+        update(Invitation)
+        .where(Invitation.member_id == member.id, Invitation.accepted_at.is_(None))
+        .values(expires_at=datetime.now(UTC))
+    )
     invitation = Invitation(
         member_id=member.id,
         code=await unique_invitation_code(session),
@@ -336,14 +367,39 @@ async def accept_invitation(
     )
     if invitation is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "초대 코드를 찾을 수 없습니다")
-    if aware(invitation.expires_at) <= datetime.now(UTC):
-        raise HTTPException(status.HTTP_410_GONE, "만료된 초대예요. 다시 초대를 요청해주세요")
-    member = await session.get(FamilyMember, invitation.member_id)
+    await session.scalar(select(User).where(User.id == user.id).with_for_update())
+    member = await session.scalar(
+        select(FamilyMember).where(FamilyMember.id == invitation.member_id).with_for_update()
+    )
     if member is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 구성원을 찾을 수 없습니다")
     if member.user_id and member.user_id != user.id:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 다른 계정이 수락한 초대입니다")
-    member.user_id = user.id
+    await session.refresh(invitation)
+    if member.user_id == user.id and invitation.accepted_at is not None:
+        return {
+            "familyId": member.family_id,
+            "memberId": member.id,
+            "status": await derived_member_status(session, member, invitation),
+        }
+    if aware(invitation.expires_at) <= datetime.now(UTC):
+        raise HTTPException(status.HTTP_410_GONE, "만료된 초대예요. 다시 초대를 요청해주세요")
+    existing = await session.scalar(
+        select(FamilyMember.id).where(
+            FamilyMember.family_id == member.family_id,
+            FamilyMember.user_id == user.id,
+            FamilyMember.id != member.id,
+        )
+    )
+    if existing is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "이미 가입한 가족입니다")
+    assigned = await session.execute(
+        update(FamilyMember)
+        .where(FamilyMember.id == member.id, FamilyMember.user_id.is_(None))
+        .values(user_id=user.id)
+    )
+    if assigned.rowcount != 1:
+        raise HTTPException(status.HTTP_409_CONFLICT, "이미 수락한 초대입니다")
     invitation.accepted_at = datetime.now(UTC)
     await session.commit()
     return {"familyId": member.family_id, "memberId": member.id, "status": "AWAITING_CONSENT"}

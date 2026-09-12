@@ -72,6 +72,7 @@ async def derived_member_status(
         consent = await latest_consent(session, member.user_id)
         if consent:
             return "CONSENT_GRANTED" if consent.decision == "GRANTED" else "CONSENT_DENIED"
+        return "AWAITING_CONSENT"
     invitation = invitation or await latest_invitation(session, member.id)
     now = datetime.now(UTC)
     if invitation and invitation.expires_at.replace(tzinfo=UTC) <= now:
