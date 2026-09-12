@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.account_router import router as account_router
 from app.api import router
 from app.config import Settings, get_settings
 from app.container import AppContainer
@@ -32,6 +33,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # uvicorn은 자신의 로거에만 핸들러를 붙이므로 app.* 로거의 INFO는 어디에도 출력되지
     # 않는다. STT 같은 파이프라인 로그를 서버 로그에서 보려면 루트 핸들러가 필요하다.
     logging.getLogger("app").setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
@@ -83,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(router, prefix=settings.api_prefix)
+    app.include_router(account_router, prefix=settings.api_prefix)
 
     @app.get("/team", include_in_schema=False, response_class=HTMLResponse)
     async def team_portal(request: Request) -> HTMLResponse:
