@@ -64,6 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await task
             await container.voip_push.close()
             await container.report_push.close()
+            await container.apple_identity.close()
             await container.database.close()
 
     app = FastAPI(
