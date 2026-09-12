@@ -107,6 +107,20 @@ class Device(Base):
     platform: Mapped[str] = mapped_column(String(16))
     token: Mapped[str] = mapped_column(Text)
     voip_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    call_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    push_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -180,6 +194,11 @@ class CallRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    room_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    report_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
