@@ -13,6 +13,45 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 
 BACKEND = Path(__file__).resolve().parents[1]
+LIVEKIT_PROBE = """import asyncio
+import uuid
+
+from livekit import api
+
+from app.config import Settings
+from app.services.livekit import RealLiveKitGateway
+
+
+async def probe() -> None:
+    settings = Settings()
+    gateway = RealLiveKitGateway(settings)
+    room = f"smoke-{uuid.uuid4().hex}"
+    client = api.LiveKitAPI(
+        settings.livekit_http_url, settings.livekit_api_key, settings.livekit_api_secret
+    )
+    try:
+        await gateway.create_room(room)
+        try:
+            participants = await client.room.list_participants(
+                api.ListParticipantsRequest(room=room)
+            )
+            if participants.participants:
+                raise RuntimeError("The smoke room must have no participants")
+            if await gateway.find_audio_track_id(room, "smoke-participant") is not None:
+                raise RuntimeError("An empty smoke room must have no audio track")
+        finally:
+            await gateway.delete_room(room)
+        rooms = await client.room.list_rooms(api.ListRoomsRequest(names=[room]))
+        if rooms.rooms:
+            raise RuntimeError("The smoke room was not deleted")
+        await gateway.delete_room(room)
+    finally:
+        await client.aclose()
+    print("LiveKit room creation, participant lookup, deletion, and repeated deletion passed.")
+
+
+asyncio.run(probe())
+"""
 
 
 def text_field(value: object, path: tuple[str, ...]) -> str:
@@ -128,11 +167,15 @@ def run_stack(image: str) -> None:
                 env=environment, check=True, timeout=30,
             )
             subprocess.run(
+                [*command, "exec", "-T", "backend", "python", "-"],
+                input=LIVEKIT_PROBE, text=True, env=environment, check=True, timeout=30,
+            )
+            subprocess.run(
                 [*command, "exec", "-T", "caddy", "wget", "-q", "-O", "-",
                  "http://localhost:8080/v1/health"],
                 env=environment, check=True, timeout=30,
             )
-            print("\nProduction stack startup, schema, and proxy health passed.")
+            print("\nProduction stack startup, schema, LiveKit API, and proxy health passed.")
         except (subprocess.SubprocessError, KeyboardInterrupt):
             subprocess.run(
                 [*command, "logs", "--tail=30", "backend", "migrate", "egress", "livekit"],
