@@ -301,6 +301,7 @@ async def get_members(
     )
     output = []
     for member in members:
+        member_user = await session.get(User, member.user_id) if member.user_id else None
         invitation = await latest_invitation(session, member.id)
         member_status = await derived_member_status(session, member, invitation)
         output.append(
@@ -309,9 +310,13 @@ async def get_members(
                 "userId": member.user_id,
                 "name": member.name,
                 "relation": member.relation,
-                "role": UserRole.PARENT.value,
+                "role": member_user.role if member_user else UserRole.PARENT.value,
                 "status": member_status,
-                "canRegisterConditions": member_status == "CONSENT_GRANTED",
+                "canRegisterConditions": (
+                    member_status == "CONSENT_GRANTED"
+                    and member_user is not None
+                    and member_user.role == UserRole.PARENT.value
+                ),
                 "invitedAt": aware(member.invited_at),
                 "expiresAt": aware(invitation.expires_at) if invitation else None,
                 "invitation": (
@@ -323,21 +328,28 @@ async def get_members(
         )
     owner = await session.get(User, family.created_by)
     if owner:
+        owner_consent = await has_consent(session, owner.id)
         output.append(
             {
                 "memberId": owner.id,
                 "userId": owner.id,
                 "name": owner.name,
-                "relation": "CHILD",
-                "role": UserRole.CHILD.value,
-                "status": "ACTIVE",
-                "canRegisterConditions": False,
+                "relation": owner.role,
+                "role": owner.role,
+                "status": (
+                    "ACTIVE" if owner.role == UserRole.CHILD.value
+                    else "CONSENT_GRANTED" if owner_consent else "AWAITING_CONSENT"
+                ),
+                "canRegisterConditions": owner.role == UserRole.PARENT.value and owner_consent,
                 "invitedAt": None,
                 "expiresAt": None,
                 "invitation": None,
             }
         )
-    return {"members": output, "canInvite": family.created_by == user.id}
+    return {
+        "members": output,
+        "canInvite": family.created_by == user.id and user.role == UserRole.CHILD.value,
+    }
 
 
 @router.post("/invitations/{invitationId}/resend", status_code=201, tags=["Family"])

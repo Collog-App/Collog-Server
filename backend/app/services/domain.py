@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
@@ -13,7 +13,6 @@ from app.models import (
     FamilyMember,
     Invitation,
     User,
-    UserRole,
 )
 
 
@@ -37,9 +36,7 @@ async def family_for_parent(session: AsyncSession, parent_id: str) -> Family | N
 
 
 async def family_of(session: AsyncSession, user: User) -> Family | None:
-    if user.role == UserRole.CHILD.value:
-        return await family_for_child(session, user.id)
-    return await family_for_parent(session, user.id)
+    return await family_for_child(session, user.id) or await family_for_parent(session, user.id)
 
 
 async def latest_consent(session: AsyncSession, parent_id: str) -> ConsentRecord | None:
@@ -82,19 +79,21 @@ async def derived_member_status(
 
 async def ensure_child_can_access_parent(
     session: AsyncSession, child: User, parent_id: str
-) -> FamilyMember:
-    family = await family_for_child(session, child.id)
-    if family is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
-    member = await session.scalar(
-        select(FamilyMember).where(
-            FamilyMember.family_id == family.id,
-            FamilyMember.user_id == parent_id,
-        )
+) -> None:
+    child_families = select(Family.id).outerjoin(FamilyMember).where(
+        or_(Family.created_by == child.id, FamilyMember.user_id == child.id)
     )
-    if member is None:
+    shared_family = await session.scalar(
+        select(Family.id)
+        .outerjoin(FamilyMember)
+        .where(
+            Family.id.in_(child_families),
+            or_(Family.created_by == parent_id, FamilyMember.user_id == parent_id),
+        )
+        .limit(1)
+    )
+    if shared_family is None or child.id == parent_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
-    return member
 
 
 async def ensure_report_access(session: AsyncSession, user: User, parent_id: str) -> None:
