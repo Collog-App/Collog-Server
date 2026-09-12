@@ -165,7 +165,9 @@ async def deliver_incoming_call_push(
 
 
 @router.post("/devices", status_code=201, tags=["Auth"])
-async def create_device(payload: DeviceCreate, user: CurrentUser, session: SessionDep) -> dict:
+async def create_device(
+    payload: DeviceCreate, request: Request, user: CurrentUser, session: SessionDep
+) -> dict:
     # Re-registration should be idempotent. A PushKit token belongs to an app
     # installation, so logging into another account transfers that installation.
     device = None
@@ -198,6 +200,7 @@ async def create_device(payload: DeviceCreate, user: CurrentUser, session: Sessi
         device.voip_token = payload.voip_token
         device.created_at = datetime.now(UTC)
     device.call_notifications_enabled = payload.call_notifications_enabled
+    device.auth_session_id = request.state.auth_session_id
     device.push_token = payload.push_token
     device.report_notifications_enabled = payload.report_notifications_enabled
     await session.commit()

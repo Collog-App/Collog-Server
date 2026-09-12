@@ -66,6 +66,7 @@ async def current_user(
     user = await session.get(User, payload["sub"])
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "사용자를 찾을 수 없습니다")
+    request.state.auth_session_id = auth_session.id
     return user
 
 

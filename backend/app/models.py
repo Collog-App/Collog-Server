@@ -104,6 +104,9 @@ class Device(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    auth_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("refresh_sessions.id"), nullable=True, index=True
+    )
     platform: Mapped[str] = mapped_column(String(16))
     token: Mapped[str] = mapped_column(Text)
     voip_token: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -198,7 +201,9 @@ class CallRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     room_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    report_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    report_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

@@ -9,7 +9,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from sqlalchemy import func, select, update
 
 from app.config import Settings
-from app.models import Family, OtpChallenge, RefreshSession, User, UserRole
+from app.models import Device, Family, OtpChallenge, RefreshSession, User, UserRole
 from app.schemas import OtpRequest, OtpVerify, RefreshRequest, TokenResponse, UserView
 from app.security import SessionDep, issue_token, otp_hash
 from app.services.domain import family_of
@@ -159,10 +159,17 @@ async def refresh(payload: RefreshRequest, request: Request, session: SessionDep
 
 @router.post("/logout", status_code=204)
 async def logout(payload: RefreshRequest, session: SessionDep) -> Response:
-    await session.execute(
+    auth_session_id = await session.scalar(
         update(RefreshSession)
         .where(RefreshSession.token_hash == refresh_hash(payload.refresh_token))
         .values(revoked_at=datetime.now(UTC))
+        .returning(RefreshSession.id)
     )
+    if auth_session_id is not None:
+        await session.execute(
+            update(Device)
+            .where(Device.auth_session_id == auth_session_id)
+            .values(voip_token=None, push_token=None)
+        )
     await session.commit()
     return Response(status_code=204)
