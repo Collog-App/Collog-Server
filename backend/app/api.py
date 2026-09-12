@@ -18,8 +18,9 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import func, select
+from sqlalchemy import select
 
+from app.auth_router import router as auth_router
 from app.config import Settings
 from app.models import (
     AcousticAnalysisRun,
@@ -35,11 +36,9 @@ from app.models import (
     ConsentRecord,
     Device,
     ExtractionEvidence,
-    Family,
     FamilyMember,
     HealthExtraction,
     Invitation,
-    OtpChallenge,
     ParentProfile,
     RepeatEvent,
     TimeSlot,
@@ -56,13 +55,11 @@ from app.schemas import (
     DeviceCreate,
     InvitationAccept,
     InvitationCreate,
-    OtpRequest,
-    OtpVerify,
     ProfilePut,
     RawAudioComplete,
     RawAudioUploadRequest,
 )
-from app.security import CurrentUser, SessionDep, issue_token, otp_hash, require_role
+from app.security import CurrentUser, SessionDep, require_role
 from app.services.domain import (
     derived_member_status,
     ensure_child_can_access_parent,
@@ -81,6 +78,7 @@ from app.services.signals import baseline_to_dict, signal_to_dict
 from app.services.storage import LocalStorage
 
 router = APIRouter()
+router.include_router(auth_router)
 logger = logging.getLogger(__name__)
 
 CONSENT_ITEMS = [
@@ -153,85 +151,6 @@ async def deliver_incoming_call_push(
         # POST /calls already created a valid LiveKit call. Push delivery is best-effort
         # because the original API also permits foreground-only demo signaling.
         logger.warning("incoming VoIP push failed for call %s: %s", push.call_id, exc)
-
-
-# Auth
-@router.post("/auth/otp/request", status_code=202, tags=["Auth"])
-async def request_otp(payload: OtpRequest, request: Request, session: SessionDep) -> dict:
-    settings = settings_from(request)
-    recent_count = await session.scalar(
-        select(func.count(OtpChallenge.id)).where(
-            OtpChallenge.phone == payload.phone,
-            OtpChallenge.created_at >= datetime.now(UTC) - timedelta(minutes=10),
-        )
-    )
-    if (recent_count or 0) >= 5:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "잠시 후 다시 요청해주세요")
-    code = (
-        settings.dev_otp_code
-        if settings.app_env != "production"
-        else "".join(random.choices(string.digits, k=6))
-    )
-    session.add(
-        OtpChallenge(
-            phone=payload.phone,
-            code_hash=otp_hash(payload.phone, code, settings.jwt_secret),
-            requested_role=str(payload.role),
-            requested_name=payload.name,
-            expires_at=datetime.now(UTC) + timedelta(seconds=settings.otp_ttl_seconds),
-        )
-    )
-    await session.commit()
-    result = {"expiresIn": settings.otp_ttl_seconds}
-    if settings.app_env != "production":
-        result["devCode"] = code
-    return result
-
-
-@router.post("/auth/otp/verify", tags=["Auth"])
-async def verify_otp(payload: OtpVerify, request: Request, session: SessionDep) -> dict:
-    settings = settings_from(request)
-    challenge = await session.scalar(
-        select(OtpChallenge)
-        .where(OtpChallenge.phone == payload.phone, OtpChallenge.verified_at.is_(None))
-        .order_by(OtpChallenge.created_at.desc())
-        .limit(1)
-    )
-    if challenge is None or aware(challenge.expires_at) < datetime.now(UTC):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "인증번호가 만료되었거나 없습니다")
-    challenge.attempts += 1
-    if challenge.code_hash != otp_hash(payload.phone, payload.code, settings.jwt_secret):
-        await session.commit()
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "인증번호가 올바르지 않습니다")
-    challenge.verified_at = datetime.now(UTC)
-    user = await session.scalar(select(User).where(User.phone == payload.phone))
-    if user is None:
-        user = User(
-            phone=payload.phone,
-            role=challenge.requested_role,
-            name=challenge.requested_name,
-        )
-        session.add(user)
-        await session.flush()
-    # 부모도 초대를 수락하면 가족에 속한다. 자녀에게만 familyId를 주면 부모 계정에서는
-    # 가족 목록을 아예 불러올 수 없다(앱 `AppSession.refreshMembers`가 familyId로 막힌다).
-    family = await family_of(session, user)
-    if user.role == UserRole.CHILD.value and family is None:
-        family = Family(created_by=user.id)
-        session.add(family)
-        await session.flush()
-    await session.commit()
-    return {
-        "accessToken": issue_token(user, settings),
-        "refreshToken": issue_token(user, settings, refresh=True),
-        "user": {
-            "id": user.id,
-            "role": user.role,
-            "name": user.name,
-            "phone": user.phone,
-            "familyId": family.id if family else None,
-        },
-    }
 
 
 @router.post("/devices", status_code=201, tags=["Auth"])

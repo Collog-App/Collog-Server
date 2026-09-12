@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.database import get_session
-from app.models import User, UserRole
+from app.models import RefreshSession, User, UserRole
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -20,20 +20,16 @@ def otp_hash(phone: str, code: str, secret: str) -> str:
     return hashlib.sha256(f"{phone}:{code}:{secret}".encode()).hexdigest()
 
 
-def issue_token(user: User, settings: Settings, *, refresh: bool = False) -> str:
+def issue_token(user: User, settings: Settings, session_id: str) -> str:
     now = datetime.now(UTC)
-    ttl = (
-        timedelta(days=settings.refresh_ttl_days)
-        if refresh
-        else timedelta(minutes=settings.jwt_ttl_minutes)
-    )
     return jwt.encode(
         {
             "sub": user.id,
             "role": user.role,
-            "type": "refresh" if refresh else "access",
+            "type": "access",
+            "sid": session_id,
             "iat": now,
-            "exp": now + ttl,
+            "exp": now + timedelta(minutes=settings.jwt_ttl_minutes),
         },
         settings.jwt_secret,
         algorithm="HS256",
@@ -49,12 +45,25 @@ async def current_user(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "인증이 필요합니다")
     settings: Settings = request.app.state.container.settings
     try:
-        payload = jwt.decode(credentials.credentials, settings.jwt_secret, algorithms=["HS256"])
-        if payload.get("type") != "access":
+        payload = jwt.decode(
+            credentials.credentials,
+            settings.jwt_secret,
+            algorithms=["HS256"],
+            options={"require": ["exp", "iat", "sub", "sid", "type"]},
+        )
+        if payload["type"] != "access" or not isinstance(payload["sid"], str):
             raise ValueError("not an access token")
     except (jwt.PyJWTError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "유효하지 않은 인증 정보입니다") from exc
-    user = await session.get(User, payload.get("sub"))
+    auth_session = await session.get(RefreshSession, payload["sid"])
+    if (
+        auth_session is None
+        or auth_session.user_id != payload["sub"]
+        or auth_session.revoked_at is not None
+        or auth_session.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+    ):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "로그인이 만료되었습니다")
+    user = await session.get(User, payload["sub"])
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "사용자를 찾을 수 없습니다")
     return user

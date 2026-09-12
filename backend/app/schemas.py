@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from app.models import BaselineKind, CallState, Metric, TimeSlot, UserRole
 
@@ -27,15 +27,33 @@ class ErrorResponse(ApiModel):
     message: str
 
 
+def normalize_phone(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    phone = value.replace("-", "").replace(" ", "")
+    if phone.startswith("+82"):
+        phone = "0" + phone[3:]
+    return phone
+
+
+PhoneNumber = Annotated[
+    str, Field(pattern=r"^01[016789][0-9]{7,8}$"), BeforeValidator(normalize_phone)
+]
+
+
 class OtpRequest(ApiModel):
-    phone: str = Field(pattern=r"^[0-9+\-]{8,20}$")
+    phone: PhoneNumber
     role: UserRole = UserRole.CHILD
     name: str = Field(default="사용자", min_length=1, max_length=80)
 
 
 class OtpVerify(ApiModel):
-    phone: str
-    code: str = Field(min_length=6, max_length=6)
+    phone: PhoneNumber
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class RefreshRequest(ApiModel):
+    refresh_token: str = Field(min_length=32, max_length=512)
 
 
 class UserView(ApiModel):
