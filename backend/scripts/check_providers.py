@@ -16,7 +16,11 @@ from app.config import Settings
 from app.services.deepgram import DeepgramSttGateway, SttError
 from app.services.gemini import ExtractionError, GeminiExtractionGateway
 from app.services.storage import LocalStorage
-from app.services.tts import ElevenLabsQuestionTtsGateway, QuestionTtsError
+from app.services.tts import (
+    ElevenLabsDirectTtsGateway,
+    ElevenLabsQuestionTtsGateway,
+    QuestionTtsError,
+)
 
 Provider = Literal["gemini", "deepgram", "elevenlabs", "sms", "apns"]
 PROVIDERS: tuple[Provider, ...] = ("gemini", "deepgram", "elevenlabs", "sms", "apns")
@@ -103,6 +107,11 @@ async def probe(provider: Provider, settings: Settings) -> CheckResult:
             "ELEVENLABS_API_KEY": settings.elevenlabs_api_key,
             "ELEVENLABS_VOICE_ID": settings.elevenlabs_voice_id,
         })
+        if settings.question_tts_provider == "elevenlabs_direct":
+            await ElevenLabsDirectTtsGateway(settings).issue_token()
+            return CheckResult(
+                provider, "PASS", "Single-use token issued, device audio remains untested"
+            )
         with TemporaryDirectory(prefix="collog-provider-check-") as directory:
             isolated = settings.model_copy(update={"local_storage_path": Path(directory)})
             gateway = ElevenLabsQuestionTtsGateway(settings, LocalStorage(isolated))
@@ -163,14 +172,14 @@ async def check(settings: Settings, selected: list[Provider] | None = None) -> i
     ))
     if skip_sms:
         providers.remove("sms")
-    if selected is None and settings.question_tts_provider == "elevenlabs":
+    if selected is None and settings.question_tts_provider in {"elevenlabs", "elevenlabs_direct"}:
         providers.append("elevenlabs")
     results = await asyncio.gather(*(run_check(provider, settings) for provider in providers))
     for result in results:
         print(f"{result.provider} {result.status} {result.detail}")
     if skip_sms:
         print("sms SKIP Apple login is enabled and SMS credentials are not configured")
-    if selected is None and settings.question_tts_provider != "elevenlabs":
+    if selected is None and settings.question_tts_provider == "ios_local":
         print("elevenlabs SKIP Remote TTS is disabled")
     print("Synthetic samples only. SMS and APNs delivery are never tested by this command.")
     return 1 if any(result.status == "FAIL" for result in results) else 0

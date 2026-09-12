@@ -81,7 +81,7 @@ def main() -> None:
             ) else "missing/unreadable",
         ),
     ]
-    if settings.question_tts_provider == "elevenlabs":
+    if settings.question_tts_provider in {"elevenlabs", "elevenlabs_direct"}:
         checks.extend(
             [
                 Check(

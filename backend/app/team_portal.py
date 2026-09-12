@@ -29,7 +29,8 @@ def build_team_status(settings: Settings) -> dict[str, Any]:
     elevenlabs_ready = bool(
         settings.elevenlabs_api_key.startswith("sk_") and settings.elevenlabs_voice_id
     )
-    elevenlabs_selected = settings.question_tts_provider == "elevenlabs"
+    elevenlabs_selected = settings.question_tts_provider in {"elevenlabs", "elevenlabs_direct"}
+    direct_tts = settings.question_tts_provider == "elevenlabs_direct"
     return {
         "service": "Collog backend",
         "status": "ok",
@@ -51,8 +52,11 @@ def build_team_status(settings: Settings) -> dict[str, Any]:
             "apnsVoip": {"configured": apns_ready, "enabled": settings.apns_voip_enabled},
             "questionTts": {
                 "configured": not elevenlabs_selected or elevenlabs_ready,
-                "provider": "elevenlabs" if elevenlabs_selected else "ios-local",
-                "mode": "remote-asset" if elevenlabs_selected and elevenlabs_ready else "ios-local",
+                "provider": settings.question_tts_provider if elevenlabs_selected else "ios-local",
+                "mode": (
+                    "direct-websocket" if direct_tts and elevenlabs_ready
+                    else "remote-asset" if elevenlabs_selected and elevenlabs_ready else "ios-local"
+                ),
                 "language": "ko-KR",
                 "model": settings.elevenlabs_model if elevenlabs_selected else None,
                 "fallback": "ios-local",
@@ -129,7 +133,7 @@ def render_team_portal(settings: Settings) -> str:
                 "질문 TTS",
                 (
                     f"ElevenLabs {providers['questionTts']['model']} · iOS 폴백"
-                    if providers["questionTts"]["provider"] == "elevenlabs"
+                    if providers["questionTts"]["provider"] in {"elevenlabs", "elevenlabs_direct"}
                     else "iOS AVSpeechSynthesizer · ko-KR"
                 ),
                 readiness(providers["questionTts"]["configured"]),

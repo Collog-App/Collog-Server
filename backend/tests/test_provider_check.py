@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.config import Settings
+from app.team_portal import build_team_status
 from scripts.check_providers import check, run_check, safe_error, synthetic_wav
 
 
@@ -137,3 +138,29 @@ async def test_apple_login_skips_unconfigured_sms_by_default(capsys) -> None:
     assert "sms FAIL" not in output
     assert await check(settings, ["sms"]) == 1
     assert "sms FAIL" in capsys.readouterr().out
+
+
+async def test_direct_tts_check_issues_token_without_printing_it(monkeypatch, capsys) -> None:
+    paths = []
+
+    def respond(request):
+        paths.append(request.url.path)
+        return httpx.Response(200, json={"token": "sutkn_private-test-value"})
+
+    original = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original(
+        transport=httpx.MockTransport(respond), **kwargs
+    ))
+    settings = Settings(
+        _env_file=None, question_tts_provider="elevenlabs_direct",
+        elevenlabs_api_key="sk_private-test-value", elevenlabs_voice_id="test-voice",
+        gemini_api_key="", deepgram_api_key="", apns_voip_enabled=False,
+    )
+    assert await check(settings) == 1
+    output = capsys.readouterr().out
+    assert "elevenlabs PASS Single-use token issued" in output
+    assert "private-test-value" not in output
+    assert paths == ["/v1/single-use-token/tts_websocket"]
+    status = build_team_status(settings)["providers"]["questionTts"]
+    assert status["provider"] == "elevenlabs_direct"
+    assert status["mode"] == "direct-websocket"

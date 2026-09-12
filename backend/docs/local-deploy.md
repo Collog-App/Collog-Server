@@ -1,7 +1,13 @@
 # 데스크탑에서 실행
 
 Docker Desktop과 같은 Wi-Fi의 iPhone을 사용한다. 서버는 LAN 주소로 접속하며 Apple 인증, APNs,
-Deepgram, Gemini, ElevenLabs는 실제 서비스를 사용한다. 인터넷 접속이 필요하다.
+Deepgram, Gemini는 실제 서비스를 사용한다. 인터넷 접속이 필요하다.
+질문 음성은 `QUESTION_TTS_PROVIDER=elevenlabs_direct`로 설정한다. API 키와 voice ID는 서버에 보관한다.
+발신 앱은 인증된 서버 API에서 일회용 토큰을 받은 뒤 ElevenLabs WebSocket으로 직접 음성을 받는다.
+토큰은 15분간 유효하며 한 번 사용할 수 있다. 발급은 통화의 질문당 2회, 사용자당 시간당 20회로 제한한다.
+음성 생성 비용은 ElevenLabs에서 청구한다. `elevenlabs`는 서버 음성 캐시를 사용하고,
+`ios_local`은 iPhone 기본 음성을 사용한다. 직접 요청에 실패하면 iPhone 기본 음성으로 재생한다.
+분석용 녹음은 기기에서 16kHz mono PCM으로 변환해 업로드한다. 통화 음성 전송은 그대로 유지한다.
 
 `backend` 디렉터리에서 실행한다. 기존 `.env`에는 서비스 키를 보관한다.
 `deploy/local.env.example`을 `.env.local`로 복사하고 데스크탑 LAN IPv4와 로컬 서비스 암호를 입력한다.
