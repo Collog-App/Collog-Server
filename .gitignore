@@ -1,5 +1,7 @@
 # Secrets and local runtime state
 .env
+.env.*
+!.env.example
 *-env.txt
 *.p8
 secrets/
