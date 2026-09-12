@@ -81,7 +81,10 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     role: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(80))
-    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
+    apple_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -97,6 +100,15 @@ class OtpChallenge(Base):
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AppleLoginChallenge(Base):
+    __tablename__ = "apple_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Device(Base):

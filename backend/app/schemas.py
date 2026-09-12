@@ -56,11 +56,25 @@ class RefreshRequest(ApiModel):
     refresh_token: str = Field(min_length=32, max_length=512)
 
 
+class AppleLoginRequest(ApiModel):
+    identity_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    role: UserRole = UserRole.CHILD
+    name: str | None = Field(default=None, max_length=80)
+
+
+class AppleChallengeResponse(ApiModel):
+    challenge_id: str
+    nonce: str
+    expires_in: int
+
+
 class UserView(ApiModel):
     id: str
     role: str
     name: str
-    phone: str
+    phone: str | None = None
+    apple_user_id: str | None = None
     family_id: str | None = None
 
 
