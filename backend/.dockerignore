@@ -1,4 +1,11 @@
 .env
+.env.*
+secrets
+models
+*.db
+*.sqlite*
+*.dump
+*-env.txt
 private
 *.p8
 .venv

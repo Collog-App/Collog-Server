@@ -1,10 +1,54 @@
+x-backend-environment: &backend-environment
+  APP_ENV: production
+  DATABASE_URL: postgresql+asyncpg://collog:${DB_PASSWORD:?Set DB_PASSWORD}@postgres:5432/collog
+  SCHEMA_AUTO_RESET: "false"
+  MOCK_EXTERNAL_SERVICES: "false"
+  ALLOW_RAW_ONLY_ANALYSIS: "false"
+  LOG_STT_TRANSCRIPT: "false"
+  TEAM_PORTAL_ENABLED: "false"
+  JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+  PUBLIC_BASE_URL: https://${API_DOMAIN:?Set API_DOMAIN}
+  LIVEKIT_URL: wss://${LIVEKIT_DOMAIN:?Set LIVEKIT_DOMAIN}
+  LIVEKIT_INTERNAL_URL: http://livekit:7880
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:?Set S3_ENDPOINT_URL}
+  S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:?Set S3_PUBLIC_ENDPOINT_URL}
+  S3_REGION: ${S3_REGION:-ap-northeast-2}
+  S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+  S3_FORCE_PATH_STYLE: "true"
+  SMS_PROVIDER: solapi
+  SOLAPI_API_KEY: ${SOLAPI_API_KEY:?Set SOLAPI_API_KEY}
+  SOLAPI_API_SECRET: ${SOLAPI_API_SECRET:?Set SOLAPI_API_SECRET}
+  SOLAPI_SENDER: ${SOLAPI_SENDER:?Set SOLAPI_SENDER}
+  APNS_VOIP_ENABLED: "true"
+  APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:?Set APNS_ENVIRONMENT}
+  APNS_TEAM_ID: ${APNS_TEAM_ID:?Set APNS_TEAM_ID}
+  APNS_KEY_ID: ${APNS_KEY_ID:?Set APNS_KEY_ID}
+  APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:?Set APNS_BUNDLE_ID}
+  APNS_PRIVATE_KEY_PATH: /run/secrets/apns.p8
+  DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?Set DEEPGRAM_API_KEY}
+  DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+  DEEPGRAM_LANGUAGE: ko
+  GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY}
+  GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+  QUESTION_TTS_PROVIDER: ${QUESTION_TTS_PROVIDER:-ios_local}
+  ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+  ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
+  ELEVENLABS_MODEL: ${ELEVENLABS_MODEL:-eleven_flash_v2_5}
+  COUGH_DETECTOR_VALIDATED: "false"
+
 services:
   postgres:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: collog
       POSTGRES_USER: collog
-      POSTGRES_PASSWORD: collog-local-only
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -15,6 +59,7 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
@@ -24,130 +69,131 @@ services:
       timeout: 3s
       retries: 20
 
-  minio:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
-    environment:
-      MINIO_ROOT_USER: collog-minio
-      MINIO_ROOT_PASSWORD: collog-minio-secret
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio-data:/data
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_started
-    entrypoint:
-      - /bin/sh
-      - -c
-      - >-
-        until mc alias set collog http://minio:9000 collog-minio collog-minio-secret;
-        do sleep 1; done
-        && mc mb --ignore-existing collog/collog-audio
-        && mc anonymous set none collog/collog-audio
-
   livekit:
     image: livekit/livekit-server:v1.13.1
-    command: ["--config", "/etc/livekit/livekit.yaml"]
+    restart: unless-stopped
     depends_on:
       redis:
         condition: service_healthy
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        bind_addresses: ["0.0.0.0"]
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: true
+        redis:
+          address: redis:6379
+        keys:
+          "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}": "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}"
+        webhook:
+          api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}"
+          urls: ["http://backend:8080/v1/webhooks/livekit"]
+        room:
+          empty_timeout: 60
+          departure_timeout: 20
+        logging:
+          level: info
     ports:
-      - "7880:7880"
       - "7881:7881"
       - "7882:7882/udp"
-    volumes:
-      # 클라우드 인스턴스에서는 LIVEKIT_CONFIG_FILE=livekit-cloud.yaml로 바꾼다.
-      # 공인 IP 뒤에서 기본값(use_external_ip:false)을 쓰면 통화는 연결되고 소리만 안 난다.
-      - ./deploy/${LIVEKIT_CONFIG_FILE:-livekit.yaml}:/etc/livekit/livekit.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7880/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
   egress:
     image: livekit/egress:v1.12.0
-    cap_add: ["SYS_ADMIN"]
-    shm_size: "1gb"
+    restart: unless-stopped
+    shm_size: 1gb
     depends_on:
       redis:
         condition: service_healthy
       livekit:
-        condition: service_started
-      minio-init:
-        condition: service_completed_successfully
+        condition: service_healthy
     environment:
-      EGRESS_CONFIG_FILE: /etc/livekit/egress.yaml
-    volumes:
-      - ./deploy/egress.yaml:/etc/livekit/egress.yaml:ro
+      EGRESS_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}"
+        api_secret: "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}"
+        ws_url: ws://livekit:7880
+        insecure: true
+        redis:
+          address: redis:6379
+        health_port: 8081
+        log_level: info
+        enable_chrome_sandbox: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
-  backend:
+  migrate:
     build: .
     depends_on:
       postgres:
         condition: service_healthy
-      livekit:
-        condition: service_started
-      minio-init:
-        condition: service_completed_successfully
     environment:
-      APP_ENV: development
-      DATABASE_URL: postgresql+asyncpg://collog:collog-local-only@postgres:5432/collog
-      SCHEMA_AUTO_RESET: ${SCHEMA_AUTO_RESET:-true}
-      JWT_SECRET: ${JWT_SECRET:-collog-local-jwt-secret-change-before-production}
-      MOCK_EXTERNAL_SERVICES: "false"
-      TEAM_PORTAL_ENABLED: ${TEAM_PORTAL_ENABLED:-true}
-      TEAM_PORTAL_REPOSITORY_URL: ${TEAM_PORTAL_REPOSITORY_URL:-https://github.com/Collog-App/14th-hackathon}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
-      LIVEKIT_URL: ${LIVEKIT_URL:-ws://localhost:7880}
-      LIVEKIT_INTERNAL_URL: http://livekit:7880
-      LIVEKIT_API_KEY: collog-dev-key
-      LIVEKIT_API_SECRET: collog-dev-secret-change-before-production
-      APNS_VOIP_ENABLED: ${APNS_VOIP_ENABLED:-false}
-      APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:-sandbox}
-      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
-      APNS_KEY_ID: ${APNS_KEY_ID:-}
-      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-}
-      APNS_PRIVATE_KEY_PATH: ${APNS_PRIVATE_KEY_PATH:-}
-      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
-      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
-      DEEPGRAM_LANGUAGE: ko
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
-      GEMINI_MAX_OUTPUT_TOKENS: ${GEMINI_MAX_OUTPUT_TOKENS:-2048}
-      QUESTION_TTS_PROVIDER: ${QUESTION_TTS_PROVIDER:-ios_local}
-      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
-      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-}
-      ELEVENLABS_MODEL: ${ELEVENLABS_MODEL:-eleven_flash_v2_5}
-      ELEVENLABS_OUTPUT_FORMAT: ${ELEVENLABS_OUTPUT_FORMAT:-mp3_44100_128}
-      TTS_URL_TTL_SECONDS: ${TTS_URL_TTL_SECONDS:-3600}
-      ACOUSTIC_ANALYZER_VERSION: ${ACOUSTIC_ANALYZER_VERSION:-collog-acoustic-v3}
-      COUGH_SCORE_THRESHOLD: ${COUGH_SCORE_THRESHOLD:-0.65}
-      QUALITY_MIN_DURATION_SEC: ${QUALITY_MIN_DURATION_SEC:-5.0}
-      QUALITY_MAX_CLIPPING_RATIO: ${QUALITY_MAX_CLIPPING_RATIO:-0.01}
-      QUALITY_ACTIVE_PERCENTILE: ${QUALITY_ACTIVE_PERCENTILE:-90.0}
-      QUALITY_MIN_ACTIVE_DBFS: ${QUALITY_MIN_ACTIVE_DBFS:--55.0}
-      PAUSE_MIN_GAP_MS: ${PAUSE_MIN_GAP_MS:-300}
-      PAUSE_MAX_GAP_MS: ${PAUSE_MAX_GAP_MS:-2000}
-      ALLOW_RAW_ONLY_ANALYSIS: ${ALLOW_RAW_ONLY_ANALYSIS:-false}
-      LOG_STT_TRANSCRIPT: ${LOG_STT_TRANSCRIPT:-false}
-      STORAGE_BACKEND: s3
-      S3_ENDPOINT_URL: http://minio:9000
-      S3_PUBLIC_ENDPOINT_URL: ${S3_PUBLIC_ENDPOINT_URL:-http://localhost:9000}
-      S3_BUCKET: collog-audio
-      S3_ACCESS_KEY_ID: collog-minio
-      S3_SECRET_ACCESS_KEY: collog-minio-secret
-      S3_FORCE_PATH_STYLE: "true"
+      DATABASE_URL: postgresql+asyncpg://collog:${DB_PASSWORD:?Set DB_PASSWORD}@postgres:5432/collog
+    command: ["alembic", "upgrade", "head"]
+
+  backend:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      livekit:
+        condition: service_healthy
+      egress:
+        condition: service_healthy
+    environment: *backend-environment
     volumes:
-      # Put the ignored AuthKey_*.p8 under backend/private/ and set
-      # APNS_PRIVATE_KEY_PATH=/run/secrets/collog/AuthKey_XXXXXXXXXX.p8.
-      - ./private:/run/secrets/collog:ro
-      # backend/secrets/에 키를 둔 경우를 위한 경로. 컨테이너에서는 호스트 절대경로가
-      # 존재하지 않으므로 APNS_PRIVATE_KEY_PATH를 이 경로로 지정해야 푸시가 동작한다.
-      - ./secrets:/run/secrets/collog-apns:ro
+      - type: bind
+        source: ${APNS_KEY_FILE:?Set APNS_KEY_FILE}
+        target: /run/secrets/apns.p8
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/health')
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?Set API_DOMAIN}
+      LIVEKIT_DOMAIN: ${LIVEKIT_DOMAIN:?Set LIVEKIT_DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL}
     ports:
-      - "8080:8080"
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
 volumes:
   postgres-data:
   redis-data:
-  minio-data:
+  caddy-data:
+  caddy-config:
