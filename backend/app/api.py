@@ -17,7 +17,7 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 
 from app.auth_router import router as auth_router
 from app.config import Settings
@@ -41,6 +41,7 @@ from app.models import (
     HealthExtraction,
     Invitation,
     ParentProfile,
+    QuestionTtsGrant,
     RepeatEvent,
     Transcript,
     User,
@@ -80,6 +81,7 @@ from app.services.questions import daily_questions
 from app.services.repeat_detector import repeat_rate_per_minute
 from app.services.signals import baseline_to_dict, signal_to_dict
 from app.services.storage import LocalStorage
+from app.services.tts import ElevenLabsDirectTtsGateway, QuestionTtsError
 
 router = APIRouter()
 router.include_router(auth_router)
@@ -662,6 +664,63 @@ async def create_reserved_call(
         audio_constraints=AudioConstraints(),
     )
     return response.model_dump(by_alias=True)
+
+
+@router.post("/calls/{callId}/questions/{questionId}/tts-token", tags=["Question"])
+async def create_question_tts_token(
+    call_id: Annotated[str, Path(alias="callId")],
+    question_id: Annotated[str, Path(alias="questionId", max_length=120)],
+    request: Request,
+    response: Response,
+    user: CurrentUser,
+    session: SessionDep,
+) -> dict:
+    container = request.app.state.container
+    async with container.calls.reserve_participants([user.id]):
+        await session.execute(select(User.id).where(User.id == user.id).with_for_update())
+        call = await session.scalar(
+            select(CallRecord).where(CallRecord.id == call_id).with_for_update()
+        )
+        if call is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
+        if call.effective_caller_id != user.id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "발신자만 질문 음성을 요청할 수 있습니다"
+            )
+        if call.state != CallState.RINGING.value or call.ended_at is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "수신 대기 중에만 질문 음성을 요청할 수 있습니다"
+            )
+        now = datetime.now(UTC)
+        waiting_seconds = (now - aware(call.started_at)).total_seconds()
+        if waiting_seconds >= container.settings.incoming_call_ttl_seconds:
+            raise HTTPException(status.HTTP_410_GONE, "수신 대기 시간이 만료되었습니다")
+        if question_id not in call.asked_question_ids:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "통화 질문을 찾을 수 없습니다")
+        gateway = container.question_tts
+        if not isinstance(gateway, ElevenLabsDirectTtsGateway):
+            raise HTTPException(status.HTTP_409_CONFLICT, "직접 음성 재생이 설정되지 않았습니다")
+        question_count = await session.scalar(
+            select(func.count()).select_from(QuestionTtsGrant).where(
+                QuestionTtsGrant.call_id == call_id, QuestionTtsGrant.question_id == question_id,
+            )
+        )
+        user_count = await session.scalar(
+            select(func.count()).select_from(QuestionTtsGrant).where(
+                QuestionTtsGrant.user_id == user.id,
+                QuestionTtsGrant.created_at > now - timedelta(hours=1),
+            )
+        )
+        if question_count >= 2 or user_count >= 20:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "음성 요청 횟수를 초과했습니다")
+        session.add(QuestionTtsGrant(user_id=user.id, call_id=call_id, question_id=question_id))
+        await session.commit()
+    try:
+        token = await gateway.issue_token()
+    except QuestionTtsError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+    response.headers["Cache-Control"] = "no-store"
+    return token.model_dump(by_alias=True)
 
 
 @router.post("/calls/{callId}/accept", tags=["Call"])

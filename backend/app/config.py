@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_max_output_tokens: int = 2048
 
-    question_tts_provider: Literal["ios_local", "elevenlabs"] = "ios_local"
+    question_tts_provider: Literal["ios_local", "elevenlabs", "elevenlabs_direct"] = "ios_local"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     elevenlabs_model: str = "eleven_flash_v2_5"
@@ -211,7 +211,7 @@ class Settings(BaseSettings):
             raise ValueError("Production requires APNs VoIP credentials")
         if not self.apns_private_key_path.is_file():
             raise ValueError("APNS_PRIVATE_KEY_PATH must point to a readable key file")
-        if self.question_tts_provider == "elevenlabs" and not (
+        if self.question_tts_provider in {"elevenlabs", "elevenlabs_direct"} and not (
             self.elevenlabs_api_key and self.elevenlabs_voice_id
         ):
             raise ValueError("ElevenLabs requires an API key and voice ID")

@@ -228,6 +228,18 @@ class CallRecord(Base):
         return self.child_id if self.effective_caller_id == self.parent_id else self.parent_id
 
 
+class QuestionTtsGrant(Base):
+    __tablename__ = "question_tts_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    question_id: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
 class AudioAsset(Base):
     __tablename__ = "audio_assets"
 

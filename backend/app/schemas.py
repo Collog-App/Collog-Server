@@ -126,7 +126,15 @@ class QuestionView(ApiModel):
     condition_code: str | None
     tts_asset_url: str | None
     duration_ms: int | None
-    tts_mode: Literal["IOS_LOCAL", "REMOTE_ASSET"] = "IOS_LOCAL"
+    tts_mode: Literal["IOS_LOCAL", "REMOTE_ASSET", "ELEVENLABS_DIRECT"] = "IOS_LOCAL"
+
+
+class QuestionTtsToken(ApiModel):
+    token: str
+    voice_id: str
+    model_id: str
+    output_format: str
+    expires_in: int = 900
 
 
 class AudioConstraints(ApiModel):
