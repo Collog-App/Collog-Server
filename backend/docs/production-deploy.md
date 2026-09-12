@@ -31,7 +31,10 @@ S3_ENDPOINT_URL과 S3_PUBLIC_ENDPOINT_URL에는 HTTPS S3 API 주소를 넣습니
 공개 읽기는 차단하고 버전 관리는 비활성화하세요. 버전 관리가 켜져 있으면 삭제 후에도 원본 버전이 남습니다.
 애플리케이션은 분석 후 오디오를 삭제합니다. 장애 대비 수명 주기 만료 정책도 버킷에 설정하세요.
 
-SOLAPI 발신 번호 등록과 API 키, Deepgram 및 Gemini API 키를 설정합니다.
+Deepgram 및 Gemini API 키를 설정합니다.
+Apple 로그인은 기본으로 활성화되며 APPLE_CLIENT_ID에는 앱 Bundle ID를 지정합니다.
+SMS 인증 API도 유지합니다. 문자를 발송할 때 SOLAPI API 키와 등록된 발신 번호를 설정합니다.
+Apple 로그인을 사용할 때는 SOLAPI 설정을 모두 비워둘 수 있습니다.
 APNS_KEY_FILE은 호스트의 `.p8` 절대 경로이며 컨테이너 UID 10001이 읽을 수 있어야 합니다.
 개발 서명 빌드는 sandbox, TestFlight와 App Store 빌드는 production을 사용합니다.
 QUESTION_TTS_PROVIDER는 기기의 한국어 음성 합성을 쓰는 ios_local 또는 elevenlabs입니다.
@@ -39,6 +42,7 @@ elevenlabs를 선택하면 API 키와 voice ID도 필요합니다.
 
 앱의 설정 화면에서 API 주소를 배포한 HTTPS 주소로 지정합니다.
 기존 로그인 토큰은 새 세션 방식에서 사용할 수 없으므로 다시 로그인해야 합니다.
+Apple 계정은 Apple 사용자 식별자로 관리하며 기존 SMS 계정과 별도로 생성합니다.
 기기 등록은 VoIP 토큰과 일반 알림 토큰을 따로 저장합니다.
 로그아웃하면 해당 기기의 토큰을 제거하며 다른 기기의 로그인은 유지합니다.
 

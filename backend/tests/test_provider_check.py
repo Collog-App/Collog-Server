@@ -23,6 +23,7 @@ async def test_missing_provider_credentials_fail_without_network(monkeypatch, ca
         deepgram_api_key="",
         solapi_api_key="",
         apns_voip_enabled=False,
+        apple_login_enabled=False,
     )
     assert await check(settings) == 1
     output = capsys.readouterr().out
@@ -120,3 +121,19 @@ def test_stt_sample_is_a_one_second_pcm_wav() -> None:
         assert audio.getframerate() == 16_000
         assert audio.getnframes() == 16_000
         assert audio.getsampwidth() == 2
+
+
+async def test_apple_login_skips_unconfigured_sms_by_default(capsys) -> None:
+    settings = Settings(
+        _env_file=None,
+        apple_login_enabled=True,
+        gemini_api_key="", deepgram_api_key="",
+        solapi_api_key="", solapi_api_secret="", solapi_sender="",
+        apns_voip_enabled=False,
+    )
+    assert await check(settings) == 1
+    output = capsys.readouterr().out
+    assert "sms SKIP" in output
+    assert "sms FAIL" not in output
+    assert await check(settings, ["sms"]) == 1
+    assert "sms FAIL" in capsys.readouterr().out

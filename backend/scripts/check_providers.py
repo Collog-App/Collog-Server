@@ -158,11 +158,18 @@ async def run_check(provider: Provider, settings: Settings) -> CheckResult:
 
 async def check(settings: Settings, selected: list[Provider] | None = None) -> int:
     providers: list[Provider] = selected or ["gemini", "deepgram", "sms", "apns"]
+    skip_sms = selected is None and settings.apple_login_enabled and not any((
+        settings.solapi_api_key, settings.solapi_api_secret, settings.solapi_sender,
+    ))
+    if skip_sms:
+        providers.remove("sms")
     if selected is None and settings.question_tts_provider == "elevenlabs":
         providers.append("elevenlabs")
     results = await asyncio.gather(*(run_check(provider, settings) for provider in providers))
     for result in results:
         print(f"{result.provider} {result.status} {result.detail}")
+    if skip_sms:
+        print("sms SKIP Apple login is enabled and SMS credentials are not configured")
     if selected is None and settings.question_tts_provider != "elevenlabs":
         print("elevenlabs SKIP Remote TTS is disabled")
     print("Synthetic samples only. SMS and APNs delivery are never tested by this command.")
