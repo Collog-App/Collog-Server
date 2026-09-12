@@ -198,6 +198,8 @@ async def create_device(payload: DeviceCreate, user: CurrentUser, session: Sessi
         device.voip_token = payload.voip_token
         device.created_at = datetime.now(UTC)
     device.call_notifications_enabled = payload.call_notifications_enabled
+    device.push_token = payload.push_token
+    device.report_notifications_enabled = payload.report_notifications_enabled
     await session.commit()
     return {"deviceId": device.id}
 

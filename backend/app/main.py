@@ -50,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 container.calls.maintain,
                 container.pipeline.process_pending,
                 container.pipeline.purge_expired_audio,
+                container.report_notifications.maintain,
             )
         ]
         app.state.maintenance_tasks = tasks
@@ -62,6 +63,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 with suppress(asyncio.CancelledError):
                     await task
             await container.voip_push.close()
+            await container.report_push.close()
             await container.database.close()
 
     app = FastAPI(

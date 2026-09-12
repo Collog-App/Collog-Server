@@ -75,6 +75,8 @@ class DeviceCreate(ApiModel):
     token: str
     voip_token: str | None = None
     call_notifications_enabled: bool = True
+    push_token: str | None = None
+    report_notifications_enabled: bool = True
 
 
 class InvitationCreate(ApiModel):
