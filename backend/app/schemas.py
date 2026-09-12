@@ -88,6 +88,7 @@ class DeviceCreate(ApiModel):
     platform: Literal["IOS", "ANDROID"]
     token: str
     voip_token: str | None = None
+    apns_environment: Literal["sandbox", "production"] | None = None
     call_notifications_enabled: bool = True
     push_token: str | None = None
     report_notifications_enabled: bool = True

@@ -150,22 +150,34 @@ async def questions_for_parent(request: Request, session: SessionDep, parent_id:
 
 async def deliver_incoming_call_push(
     gateway: VoipPushGateway,
-    voip_token: str,
+    device: Device,
     push: IncomingCallPush,
     container: AppContainer,
-) -> None:
+) -> bool:
+    voip_token = device.voip_token
+    if voip_token is None:
+        return False
     try:
-        await gateway.send_incoming_call(voip_token, push)
-    except UnregisteredVoipToken:
+        environment = await gateway.send_incoming_call(voip_token, push)
+        if environment:
+            async with container.database.sessions() as session:
+                await session.execute(
+                    update(Device).where(Device.id == device.id, Device.voip_token == voip_token)
+                    .values(apns_environment=environment)
+                )
+                await session.commit()
+        return True
+    except UnregisteredVoipToken as exc:
         async with container.database.sessions() as session:
             await session.execute(
-                update(Device).where(Device.voip_token == voip_token).values(voip_token=None)
+                update(Device).where(Device.id == device.id, Device.voip_token == voip_token)
+                .values(voip_token=None)
             )
             await session.commit()
-        await container.calls.finish(push.call_id)
+        logger.warning("incoming VoIP token rejected for call %s: %s", push.call_id, exc)
     except PushNotificationError as exc:
         logger.warning("incoming VoIP push failed for call %s: %s", push.call_id, exc)
-        await container.calls.finish(push.call_id)
+    return False
 
 
 @router.post("/devices", status_code=201, tags=["Auth"])
@@ -204,6 +216,8 @@ async def create_device(
         device.voip_token = payload.voip_token
         device.created_at = datetime.now(UTC)
     device.call_notifications_enabled = payload.call_notifications_enabled
+    if payload.apns_environment is not None:
+        device.apns_environment = payload.apns_environment
     device.auth_session_id = request.state.auth_session_id
     device.push_token = payload.push_token
     device.report_notifications_enabled = payload.report_notifications_enabled
@@ -540,7 +554,6 @@ async def get_daily_questions(
 async def create_call(
     payload: CallCreate,
     request: Request,
-    background: BackgroundTasks,
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
@@ -554,12 +567,11 @@ async def create_call(
     parent, child = (user, callee) if user.role == UserRole.PARENT.value else (callee, user)
     await ensure_child_can_access_parent(session, child, parent.id)
     async with request.app.state.container.calls.reserve_participants([parent.id, child.id]):
-        return await create_reserved_call(request, background, user, callee, parent, child, session)
+        return await create_reserved_call(request, user, callee, parent, child, session)
 
 
 async def create_reserved_call(
     request: Request,
-    background: BackgroundTasks,
     user: User,
     callee: User,
     parent: User,
@@ -567,9 +579,18 @@ async def create_reserved_call(
     session: SessionDep,
 ) -> dict:
     participants = [parent.id, child.id]
-    await session.execute(
+    locked = list(await session.scalars(
         select(User.id).where(User.id.in_(participants)).order_by(User.id).with_for_update()
-    )
+    ))
+    if len(locked) != 2:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 계정을 찾을 수 없습니다")
+    await session.refresh(parent)
+    await session.refresh(child)
+    if parent.role != UserRole.PARENT.value or child.role != UserRole.CHILD.value:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "사용자 역할이 변경되었습니다. 다시 시도해주세요"
+        )
+    await ensure_child_can_access_parent(session, child, parent.id)
     busy = await session.scalar(
         select(CallRecord.id)
         .where(
@@ -621,8 +642,8 @@ async def create_reserved_call(
     except LiveKitError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
     token = livekit.participant_token(call.room_name, user.id, user.name)
-    voip_token = await session.scalar(
-        select(Device.voip_token)
+    devices = list(await session.scalars(
+        select(Device)
         .where(
             Device.user_id == callee.id,
             Device.platform == "IOS",
@@ -630,25 +651,31 @@ async def create_reserved_call(
             Device.call_notifications_enabled.is_(True),
         )
         .order_by(Device.created_at.desc())
-        .limit(1)
-    )
+    ))
     await session.commit()
-    if voip_token:
-        background.add_task(
-            deliver_incoming_call_push,
+    delivered = False
+    for device in devices:
+        delivered = await deliver_incoming_call_push(
             request.app.state.container.voip_push,
-            voip_token,
+            device,
             IncomingCallPush(
                 call_id=call.id,
                 caller_id=user.id,
                 caller_name=user.name,
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings_from(request).incoming_call_ttl_seconds),
+                apns_environment=device.apns_environment,
             ),
             request.app.state.container,
         )
-    elif settings_from(request).apns_voip_enabled:
-        logger.warning("no iOS VoIP token registered for callee %s", callee.id)
+        if delivered:
+            break
+    if not delivered and (devices or not settings_from(request).mock_external_services):
+        await request.app.state.container.calls.finish(call.id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "상대방에게 통화 알림을 보내지 못했어요. 상대방 앱에서 다시 로그인한 뒤 시도해주세요",
+        )
     response = CallCreated(
         call_id=call.id,
         caller_id=call.effective_caller_id,

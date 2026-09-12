@@ -122,6 +122,7 @@ class Device(Base):
     platform: Mapped[str] = mapped_column(String(16))
     token: Mapped[str] = mapped_column(Text)
     voip_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apns_environment: Mapped[str | None] = mapped_column(String(16), nullable=True)
     call_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     push_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     report_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)

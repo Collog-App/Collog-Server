@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
@@ -44,8 +45,8 @@ class ReportNotifications:
                 call.report_notified_at = now
                 await session.commit()
                 return
-            tokens = list(await session.scalars(
-                select(Device.push_token)
+            devices = list(await session.scalars(
+                select(Device)
                 .where(
                     Device.user_id.in_([call.parent_id, call.child_id]),
                     Device.platform == "IOS",
@@ -53,15 +54,25 @@ class ReportNotifications:
                     Device.push_token.is_not(None),
                     Device.push_token != "",
                 )
-                .distinct()
             ))
             failed = False
+            delivered: dict[str, str | None] = {}
             push = ReportReadyPush(call_id=call.id, expires_at=expires_at)
-            for token in tokens:
+            for device in devices:
+                token = device.push_token
                 if token is None:
                     continue
+                if token in delivered:
+                    if delivered[token]:
+                        device.apns_environment = delivered[token]
+                    continue
                 try:
-                    await self.gateway.send_report(token, push)
+                    environment = await self.gateway.send_report(
+                        token, replace(push, apns_environment=device.apns_environment)
+                    )
+                    if environment:
+                        device.apns_environment = environment
+                    delivered[token] = environment
                 except UnregisteredPushToken:
                     await session.execute(
                         update(Device).where(Device.push_token == token).values(push_token=None)
