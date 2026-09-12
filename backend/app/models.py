@@ -194,6 +194,7 @@ class CallRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     parent_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     child_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    caller_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=CallState.CREATED.value, index=True)
     room_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     recording_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -217,6 +218,14 @@ class CallRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    @property
+    def effective_caller_id(self) -> str:
+        return self.caller_id or self.child_id
+
+    @property
+    def callee_id(self) -> str:
+        return self.child_id if self.effective_caller_id == self.parent_id else self.parent_id
 
 
 class AudioAsset(Base):
