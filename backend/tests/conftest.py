@@ -19,6 +19,7 @@ from app.main import create_app
 def client(tmp_path: Path) -> Iterator[TestClient]:
     settings = Settings(
         app_env="test",
+        schema_auto_reset=True,
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
         local_storage_path=tmp_path / "audio",
         public_base_url="http://testserver",

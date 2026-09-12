@@ -18,6 +18,7 @@ from app.team_portal import build_team_status, render_team_portal
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    settings.validate_runtime()
     settings.ensure_local_directories()
     # uvicorn은 자신의 로거에만 핸들러를 붙이므로 app.* 로거의 INFO는 어디에도 출력되지
     # 않는다. STT 같은 파이프라인 로그를 서버 로그에서 보려면 루트 핸들러가 필요하다.
