@@ -17,7 +17,7 @@ from fastapi import (
     Response,
     status,
 )
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from app.auth_router import router as auth_router
 from app.config import Settings
@@ -106,6 +106,8 @@ def call_to_dict(call: CallRecord) -> dict:
         "callId": call.id,
         "parentId": call.parent_id,
         "childId": call.child_id,
+        "callerId": call.effective_caller_id,
+        "calleeId": call.callee_id,
         "state": call.state,
         "timeSlot": call.time_slot,
         "startedAt": call.started_at,
@@ -540,15 +542,49 @@ async def create_call(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    require_role(user, UserRole.CHILD)
-    await ensure_child_can_access_parent(session, user, payload.callee_id)
-    parent = await session.get(User, payload.callee_id)
-    if parent is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "부모 계정을 찾을 수 없습니다")
-    if settings_from(request).app_env == "production":
+    callee = await session.get(User, payload.callee_id)
+    if callee is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 계정을 찾을 수 없습니다")
+    if user.id == callee.id or user.role == callee.role:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "가족의 부모와 자녀 사이에 통화할 수 있습니다"
+        )
+    parent, child = (user, callee) if user.role == UserRole.PARENT.value else (callee, user)
+    await ensure_child_can_access_parent(session, child, parent.id)
+    async with request.app.state.container.calls.reserve_participants([parent.id, child.id]):
+        return await create_reserved_call(request, background, user, callee, parent, child, session)
+
+
+async def create_reserved_call(
+    request: Request,
+    background: BackgroundTasks,
+    user: User,
+    callee: User,
+    parent: User,
+    child: User,
+    session: SessionDep,
+) -> dict:
+    participants = [parent.id, child.id]
+    await session.execute(
+        select(User.id).where(User.id.in_(participants)).order_by(User.id).with_for_update()
+    )
+    busy = await session.scalar(
+        select(CallRecord.id)
+        .where(
+            or_(CallRecord.parent_id.in_(participants), CallRecord.child_id.in_(participants)),
+            CallRecord.ended_at.is_(None),
+            CallRecord.state.in_(
+                [CallState.CREATED.value, CallState.RINGING.value, CallState.ACTIVE.value]
+            ),
+        )
+        .limit(1)
+    )
+    if busy is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "본인 또는 상대방이 이미 통화 중입니다")
+    if not settings_from(request).mock_external_services:
         receiver = await session.scalar(
             select(Device.id).where(
-                Device.user_id == parent.id,
+                Device.user_id == callee.id,
                 Device.platform == "IOS",
                 Device.voip_token.is_not(None),
                 Device.call_notifications_enabled.is_(True),
@@ -567,7 +603,8 @@ async def create_call(
         disabled_reason = "CONSENT_DENIED" if latest else "CONSENT_PENDING"
     call = CallRecord(
         parent_id=parent.id,
-        child_id=user.id,
+        child_id=child.id,
+        caller_id=user.id,
         state=CallState.RINGING.value,
         room_name=f"collog-{datetime.now(UTC):%Y%m%d}-{random.randrange(10**10):010d}",
         recording_enabled=recording_enabled,
@@ -585,7 +622,7 @@ async def create_call(
     voip_token = await session.scalar(
         select(Device.voip_token)
         .where(
-            Device.user_id == parent.id,
+            Device.user_id == callee.id,
             Device.platform == "IOS",
             Device.voip_token.is_not(None),
             Device.call_notifications_enabled.is_(True),
@@ -609,9 +646,12 @@ async def create_call(
             request.app.state.container,
         )
     elif settings_from(request).apns_voip_enabled:
-        logger.warning("no iOS VoIP token registered for parent %s", parent.id)
+        logger.warning("no iOS VoIP token registered for callee %s", callee.id)
     response = CallCreated(
         call_id=call.id,
+        caller_id=call.effective_caller_id,
+        callee_id=call.callee_id,
+        raw_capture_required=recording_enabled and user.id == parent.id,
         livekit_url=settings_from(request).livekit_url,
         room_name=call.room_name,
         access_token=token,
@@ -632,13 +672,12 @@ async def accept_call(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    require_role(user, UserRole.PARENT)
     call = await session.scalar(
         select(CallRecord).where(CallRecord.id == call_id).with_for_update()
     )
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
-    if call.parent_id != user.id:
+    if call.callee_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "수신 권한이 없습니다")
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
@@ -676,7 +715,7 @@ async def accept_call(
         livekit_url=settings.livekit_url,
         room_name=call.room_name,
         access_token=token,
-        raw_capture_required=call.recording_enabled,
+        raw_capture_required=call.recording_enabled and user.id == call.parent_id,
         audio_constraints=AudioConstraints(),
     )
     return response.model_dump(by_alias=True)
@@ -695,7 +734,7 @@ async def decline_call(
     await ensure_call_access(session, user, call)
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 처리된 통화입니다")
-    if user.id != call.parent_id:
+    if user.id != call.callee_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "수신자만 거절할 수 있습니다")
     await session.rollback()
     await request.app.state.container.calls.finish(call_id)

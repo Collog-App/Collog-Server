@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select
@@ -31,6 +35,18 @@ class CallLifecycle:
         self.database = database
         self.livekit = livekit
         self.storage = storage
+        self._participant_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+
+    @asynccontextmanager
+    async def reserve_participants(self, user_ids: list[str]) -> AsyncIterator[None]:
+        locks = [
+            self._participant_locks.setdefault(user_id, asyncio.Lock())
+            for user_id in sorted(set(user_ids))
+        ]
+        async with AsyncExitStack() as stack:
+            for lock in locks:
+                await stack.enter_async_context(lock)
+            yield
 
     async def start_recordings(self, call_id: str, tracks: dict[str, str] | None = None) -> None:
         if self.settings.allow_raw_only_analysis:

@@ -144,6 +144,9 @@ class CallCreate(ApiModel):
 
 class CallCreated(ApiModel):
     call_id: str
+    caller_id: str
+    callee_id: str
+    raw_capture_required: bool
     livekit_url: str
     room_name: str
     access_token: str
