@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import random
-import secrets
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 
@@ -20,9 +19,6 @@ from fastapi import (
 from sqlalchemy import func, or_, select, update
 
 from app.auth_router import router as auth_router
-from app.config import Settings
-from app.consent import CONSENT_ITEMS
-from app.container import AppContainer
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
@@ -33,14 +29,9 @@ from app.models import (
     CallRecord,
     CallState,
     ChangeSignal,
-    ConsentDecision,
-    ConsentRecord,
     Device,
     ExtractionEvidence,
-    Family,
-    FamilyMember,
     HealthExtraction,
-    Invitation,
     ParentProfile,
     QuestionTtsGrant,
     RepeatEvent,
@@ -48,39 +39,31 @@ from app.models import (
     User,
     UserRole,
 )
+from app.routes.consents import router as consents_router
+from app.routes.devices import deliver_incoming_call_push
+from app.routes.devices import router as devices_router
+from app.routes.families import router as families_router
+from app.routes.profiles import router as profiles_router
+from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
 from app.schemas import (
     AudioConstraints,
     CallAccepted,
     CallAcceptRequest,
     CallCreate,
     CallCreated,
-    ConsentSubmit,
-    DeviceCreate,
-    InvitationAccept,
-    InvitationCreate,
-    ProfilePut,
     RawAudioComplete,
     RawAudioUploadRequest,
 )
-from app.security import CurrentUser, SessionDep, require_role
+from app.security import CurrentUser, SessionDep
 from app.services.domain import (
-    consent_is_current,
-    derived_member_status,
     ensure_child_can_access_parent,
     ensure_report_access,
-    family_for_child,
     has_consent,
     latest_consent,
-    latest_invitation,
     participants_consented,
 )
 from app.services.livekit import LiveKitError
-from app.services.notifications import (
-    IncomingCallPush,
-    PushNotificationError,
-    UnregisteredVoipToken,
-    VoipPushGateway,
-)
+from app.services.notifications import IncomingCallPush
 from app.services.questions import daily_questions
 from app.services.repeat_detector import repeat_rate_per_minute
 from app.services.signals import baseline_to_dict, signal_to_dict
@@ -89,45 +72,11 @@ from app.services.tts import ElevenLabsDirectTtsGateway, QuestionTtsError
 
 router = APIRouter()
 router.include_router(auth_router)
+router.include_router(devices_router)
+router.include_router(families_router)
+router.include_router(consents_router)
+router.include_router(profiles_router)
 logger = logging.getLogger(__name__)
-
-def settings_from(request: Request) -> Settings:
-    return request.app.state.container.settings
-
-
-def aware(value: datetime) -> datetime:
-    return value if value.tzinfo else value.replace(tzinfo=UTC)
-
-
-def call_to_dict(call: CallRecord) -> dict:
-    return {
-        "callId": call.id,
-        "parentId": call.parent_id,
-        "childId": call.child_id,
-        "callerId": call.effective_caller_id,
-        "calleeId": call.callee_id,
-        "state": call.state,
-        "timeSlot": call.time_slot,
-        "startedAt": call.started_at,
-        "endedAt": call.ended_at,
-        "durationSec": call.duration_sec,
-        "recorded": call.recording_enabled,
-        "recordingEnabled": call.recording_enabled,
-        "recordingDisabledReason": call.recording_disabled_reason,
-        "recordingDisabledMessage": (
-            "녹음이 중단되어 이번 통화는 분석하지 않아요"
-            if call.recording_disabled_reason == "RECORDING_INTERRUPTED"
-            else "녹음과 AI 분석 없이 통화해요" if not call.recording_enabled else None
-        ),
-        "parentSpeechSec": call.parent_speech_sec,
-        "askedQuestionIds": call.asked_question_ids,
-        "rawAudioPurgedAt": call.raw_audio_purged_at,
-    }
-
-
-async def ensure_call_access(session: SessionDep, user: User, call: CallRecord) -> None:
-    if user.id not in {call.parent_id, call.child_id}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "통화 접근 권한이 없습니다")
 
 
 async def recent_question_exclusions(session: SessionDep, parent_id: str) -> set[str]:
@@ -157,473 +106,6 @@ async def questions_for_parent(
     return source, questions
 
 
-async def deliver_incoming_call_push(
-    gateway: VoipPushGateway,
-    device: Device,
-    push: IncomingCallPush,
-    container: AppContainer,
-) -> bool:
-    voip_token = device.voip_token
-    if voip_token is None:
-        return False
-    try:
-        environment = await gateway.send_incoming_call(voip_token, push)
-        if environment:
-            async with container.database.sessions() as session:
-                await session.execute(
-                    update(Device).where(Device.id == device.id, Device.voip_token == voip_token)
-                    .values(apns_environment=environment)
-                )
-                await session.commit()
-        return True
-    except UnregisteredVoipToken as exc:
-        async with container.database.sessions() as session:
-            await session.execute(
-                update(Device).where(Device.id == device.id, Device.voip_token == voip_token)
-                .values(voip_token=None)
-            )
-            await session.commit()
-        logger.warning("incoming VoIP token rejected for call %s: %s", push.call_id, exc)
-    except PushNotificationError as exc:
-        logger.warning("incoming VoIP push failed for call %s: %s", push.call_id, exc)
-    return False
-
-
-@router.post("/devices", status_code=201, tags=["Auth"])
-async def create_device(
-    payload: DeviceCreate, request: Request, user: CurrentUser, session: SessionDep
-) -> dict:
-    # Re-registration should be idempotent. A PushKit token belongs to an app
-    # installation, so logging into another account transfers that installation.
-    device = None
-    if payload.voip_token:
-        device = await session.scalar(
-            select(Device).where(
-                Device.platform == payload.platform,
-                Device.voip_token == payload.voip_token,
-            )
-        )
-    if device is None:
-        device = await session.scalar(
-            select(Device).where(
-                Device.user_id == user.id,
-                Device.platform == payload.platform,
-                Device.token == payload.token,
-            )
-        )
-    if device is None:
-        device = Device(
-            user_id=user.id,
-            platform=payload.platform,
-            token=payload.token,
-            voip_token=payload.voip_token,
-        )
-        session.add(device)
-    else:
-        device.user_id = user.id
-        device.token = payload.token
-        device.voip_token = payload.voip_token
-        device.created_at = datetime.now(UTC)
-    device.call_notifications_enabled = payload.call_notifications_enabled
-    if payload.apns_environment is not None:
-        device.apns_environment = payload.apns_environment
-    device.auth_session_id = request.state.auth_session_id
-    device.push_token = payload.push_token
-    device.report_notifications_enabled = payload.report_notifications_enabled
-    await session.commit()
-    return {"deviceId": device.id}
-
-
-# Family
-@router.get("/families", tags=["Family"])
-async def get_families(user: CurrentUser, session: SessionDep) -> dict:
-    membership = select(FamilyMember.family_id).where(FamilyMember.user_id == user.id)
-    owned = Family.created_by == user.id
-    if user.role == UserRole.PARENT:
-        populated = select(FamilyMember.id).where(
-            FamilyMember.family_id == Family.id,
-            FamilyMember.user_id.is_not(None),
-            FamilyMember.user_id != user.id,
-        ).exists()
-        owned = owned & populated
-    rows = await session.execute(
-        select(Family, User.name)
-        .join(User, User.id == Family.created_by)
-        .where(or_(owned, Family.id.in_(membership)))
-        .order_by(Family.created_at, Family.id)
-    )
-    families = [{"familyId": family.id, "name": f"{name}의 가족"} for family, name in rows]
-    return {"families": families}
-
-
-@router.post("/families/{familyId}/invitations", status_code=201, tags=["Family"])
-async def create_invitation(
-    family_id: Annotated[str, Path(alias="familyId")],
-    payload: InvitationCreate,
-    user: CurrentUser,
-    session: SessionDep,
-) -> dict:
-    require_role(user, UserRole.CHILD)
-    family = await family_for_child(session, user.id)
-    if family is None or family.id != family_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
-    member = FamilyMember(
-        family_id=family.id,
-        name=payload.name,
-        relation=payload.relation,
-        invited_at=datetime.now(UTC),
-    )
-    session.add(member)
-    await session.flush()
-    code = await unique_invitation_code(session)
-    invitation = Invitation(
-        member_id=member.id,
-        code=code,
-        expires_at=datetime.now(UTC) + timedelta(hours=24),
-    )
-    session.add(invitation)
-    await session.commit()
-    return invitation_dict(invitation)
-
-
-async def unique_invitation_code(session: SessionDep) -> str:
-    for _ in range(20):
-        code = f"{secrets.randbelow(1_000_000):06d}"
-        if await session.scalar(select(Invitation.id).where(Invitation.code == code)) is None:
-            return code
-    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "초대 코드를 만들지 못했습니다")
-
-
-def invitation_dict(invitation: Invitation) -> dict:
-    status_value = (
-        "ACCEPTED"
-        if invitation.accepted_at
-        else ("EXPIRED" if aware(invitation.expires_at) <= datetime.now(UTC) else "PENDING")
-    )
-    return {
-        "invitationId": invitation.id,
-        "code": invitation.code,
-        "shareText": f"콜록 가족 초대 코드 {invitation.code}를 앱에 입력해주세요.",
-        "expiresAt": aware(invitation.expires_at),
-        "status": status_value,
-    }
-
-
-@router.get("/families/{familyId}/members", tags=["Family"])
-async def get_members(
-    family_id: Annotated[str, Path(alias="familyId")],
-    request: Request,
-    user: CurrentUser,
-    session: SessionDep,
-) -> dict:
-    # 구성원 목록은 그 가족에 속한 사람이면 볼 수 있다. 자녀는 가족을 만든 사람으로,
-    # 부모는 초대를 수락한 구성원으로 확인한다.
-    family = await session.get(Family, family_id)
-    membership = await session.scalar(
-        select(FamilyMember.id).where(
-            FamilyMember.family_id == family_id,
-            FamilyMember.user_id == user.id,
-        )
-    )
-    if family is None or (family.created_by != user.id and membership is None):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
-    members = list(
-        await session.scalars(select(FamilyMember).where(FamilyMember.family_id == family_id))
-    )
-    output = []
-    for member in members:
-        member_user = await session.get(User, member.user_id) if member.user_id else None
-        invitation = await latest_invitation(session, member.id)
-        member_status = await derived_member_status(
-            session, member, invitation, settings_from(request).consent_document_version
-        )
-        output.append(
-            {
-                "memberId": member.id,
-                "userId": member.user_id,
-                "name": member.name,
-                "relation": member.relation,
-                "role": member_user.role if member_user else UserRole.PARENT.value,
-                "status": member_status,
-                "canRegisterConditions": (
-                    member_status == "CONSENT_GRANTED"
-                    and member_user is not None
-                    and member_user.role == UserRole.PARENT.value
-                ),
-                "invitedAt": aware(member.invited_at),
-                "expiresAt": aware(invitation.expires_at) if invitation else None,
-                "invitation": (
-                    invitation_dict(invitation)
-                    if invitation and family.created_by == user.id
-                    else None
-                ),
-            }
-        )
-    owner = await session.get(User, family.created_by)
-    if owner:
-        owner_consent = await has_consent(
-            session, owner.id, settings_from(request).consent_document_version
-        )
-        output.append(
-            {
-                "memberId": owner.id,
-                "userId": owner.id,
-                "name": owner.name,
-                "relation": owner.role,
-                "role": owner.role,
-                "status": (
-                    "ACTIVE" if owner.role == UserRole.CHILD.value
-                    else "CONSENT_GRANTED" if owner_consent else "AWAITING_CONSENT"
-                ),
-                "canRegisterConditions": owner.role == UserRole.PARENT.value and owner_consent,
-                "invitedAt": None,
-                "expiresAt": None,
-                "invitation": None,
-            }
-        )
-    return {
-        "members": output,
-        "canInvite": family.created_by == user.id and user.role == UserRole.CHILD.value,
-    }
-
-
-@router.post("/invitations/{invitationId}/resend", status_code=201, tags=["Family"])
-async def resend_invitation(
-    invitation_id: Annotated[str, Path(alias="invitationId")],
-    user: CurrentUser,
-    session: SessionDep,
-) -> dict:
-    require_role(user, UserRole.CHILD)
-    old = await session.get(Invitation, invitation_id)
-    if old is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "초대를 찾을 수 없습니다")
-    member = await session.scalar(
-        select(FamilyMember).where(FamilyMember.id == old.member_id).with_for_update()
-    )
-    family = await family_for_child(session, user.id)
-    if member is None or family is None or member.family_id != family.id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
-    if member.user_id is not None or old.accepted_at is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "이미 수락한 초대입니다")
-    await session.execute(
-        update(Invitation)
-        .where(Invitation.member_id == member.id, Invitation.accepted_at.is_(None))
-        .values(expires_at=datetime.now(UTC))
-    )
-    invitation = Invitation(
-        member_id=member.id,
-        code=await unique_invitation_code(session),
-        expires_at=datetime.now(UTC) + timedelta(hours=24),
-    )
-    session.add(invitation)
-    await session.commit()
-    return invitation_dict(invitation)
-
-
-@router.post("/invitations/accept", tags=["Family"])
-async def accept_invitation(
-    payload: InvitationAccept, request: Request, user: CurrentUser, session: SessionDep
-) -> dict:
-    require_role(user, UserRole.PARENT)
-    invitation = await session.scalar(
-        select(Invitation)
-        .where(Invitation.code == payload.code)
-        .order_by(Invitation.created_at.desc())
-    )
-    if invitation is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "초대 코드를 찾을 수 없습니다")
-    await session.scalar(select(User).where(User.id == user.id).with_for_update())
-    member = await session.scalar(
-        select(FamilyMember).where(FamilyMember.id == invitation.member_id).with_for_update()
-    )
-    if member is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 구성원을 찾을 수 없습니다")
-    if member.user_id and member.user_id != user.id:
-        raise HTTPException(status.HTTP_409_CONFLICT, "이미 다른 계정이 수락한 초대입니다")
-    await session.refresh(invitation)
-    if member.user_id == user.id and invitation.accepted_at is not None:
-        return {
-            "familyId": member.family_id,
-            "memberId": member.id,
-            "status": await derived_member_status(
-                session, member, invitation, settings_from(request).consent_document_version
-            ),
-        }
-    if aware(invitation.expires_at) <= datetime.now(UTC):
-        raise HTTPException(status.HTTP_410_GONE, "만료된 초대예요. 다시 초대를 요청해주세요")
-    existing = await session.scalar(
-        select(FamilyMember.id).where(
-            FamilyMember.family_id == member.family_id,
-            FamilyMember.user_id == user.id,
-            FamilyMember.id != member.id,
-        )
-    )
-    if existing is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "이미 가입한 가족입니다")
-    assigned = await session.execute(
-        update(FamilyMember)
-        .where(FamilyMember.id == member.id, FamilyMember.user_id.is_(None))
-        .values(user_id=user.id)
-    )
-    if assigned.rowcount != 1:
-        raise HTTPException(status.HTTP_409_CONFLICT, "이미 수락한 초대입니다")
-    invitation.accepted_at = datetime.now(UTC)
-    await session.commit()
-    return {"familyId": member.family_id, "memberId": member.id, "status": "AWAITING_CONSENT"}
-
-
-# Consent
-@router.get("/consents/document", tags=["Consent"])
-async def consent_document(request: Request) -> dict:
-    version = settings_from(request).consent_document_version
-    return {
-        "version": version,
-        "fullText": (
-            "녹음과 AI 분석은 선택 사항임. 두 참여자가 모두 동의한 통화에서만 음성을 녹음함. "
-            "거절해도 가족 통화 이용 가능함. Deepgram에 부모와 자녀의 통화 음성을 보내 "
-            "대화를 글로 변환함. Google Gemini에 두 참여자의 전사문과 그 안의 증상, 복약, "
-            "활동, 수면 정보를 보내 건강 기록을 생성함. ElevenLabs에는 질문 문장을 보내 "
-            "질문 음성을 생성하며, 아이폰 직접 요청 시 IP 주소가 전달됨. "
-            "이름, 전화번호, Apple 로그인 토큰은 AI 요청에 포함하지 않지만 대화에 말한 "
-            "개인정보는 음성과 전사문에 포함될 수 있음. 해외 제공사 서버에서 처리될 수 있음. "
-            "부모의 건강 기록과 음성 특징값은 가족 자녀에게 제공함. "
-            "의료 진단이나 치료 용도가 아님. "
-            "콜록 원본 음성은 분석 후 삭제하며 실패하거나 남은 파일은 자동 정리함. "
-            "전사문과 건강 기록은 계정 삭제 시까지 보관함. 외부 제공사의 보관 기간과 "
-            "삭제 처리는 해당 계약 및 정책에 따르며 콜록 서버 삭제와 별개임. "
-            "Deepgram 요청에는 모델 개선 참여 제외 옵션을 사용함. Google의 유료 서비스 "
-            "데이터 처리 조건을 운영자가 확인하기 전에는 녹음과 건강 분석을 비활성화함. "
-            "ElevenLabs는 모델 학습 이용을 제외한 계정 설정으로 사용함. "
-            "외부 음성 서비스를 사용할 수 없으면 아이폰 기본 음성으로 재생함. "
-            "설정에서 동의를 변경할 수 있으며 거절하면 이후 녹음과 AI 분석을 중단함."
-        ),
-        "collectedItems": [
-            "통화 음성", "화자별 전사문", "증상", "복약", "활동", "수면", "음성 특징값",
-            "질문 문장", "질문 음성 요청 시 IP 주소",
-        ],
-        "purpose": "가족 통화 기반 건강 변화 기록과 리포트 제공",
-        "retentionPeriod": "전사문과 건강 기록은 계정 삭제 시까지 보관함",
-        "rawAudioPolicy": "콜록 원본 음성은 분석 후 삭제함. 외부 서비스 보관 정책은 별도임",
-        "requiredItems": CONSENT_ITEMS,
-    }
-
-
-@router.post("/consents", status_code=201, tags=["Consent"])
-async def submit_consent(
-    payload: ConsentSubmit, request: Request, user: CurrentUser, session: SessionDep
-) -> dict:
-    async with request.app.state.container.calls.reserve_participants([user.id]):
-        await session.execute(select(User.id).where(User.id == user.id).with_for_update())
-        return await save_consent(payload, request, user, session)
-
-
-async def save_consent(
-    payload: ConsentSubmit, request: Request, user: CurrentUser, session: SessionDep
-) -> dict:
-    busy = await session.scalar(select(CallRecord.id).where(
-        or_(CallRecord.parent_id == user.id, CallRecord.child_id == user.id),
-        CallRecord.state.in_([
-            CallState.CREATED.value, CallState.RINGING.value, CallState.ACTIVE.value,
-        ]),
-        CallRecord.ended_at.is_(None),
-    ).limit(1))
-    if busy is not None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "통화를 종료한 뒤 동의를 변경해주세요")
-    settings = settings_from(request)
-    if payload.document_version != settings.consent_document_version:
-        raise HTTPException(status.HTTP_409_CONFLICT, "최신 동의 안내를 다시 확인해주세요")
-    if payload.decision == "GRANT" and not payload.scrolled_to_end:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "안내 내용을 끝까지 확인해주세요")
-    if payload.decision == "GRANT" and not set(CONSENT_ITEMS).issubset(payload.agreed_items):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "필수 항목에 모두 동의해야 시작할 수 있어요"
-        )
-    record = ConsentRecord(
-        user_id=user.id,
-        document_version=payload.document_version,
-        decision=(
-            ConsentDecision.GRANTED.value
-            if payload.decision == "GRANT"
-            else ConsentDecision.DENIED.value
-        ),
-        agreed_items=payload.agreed_items if payload.decision == "GRANT" else [],
-        agreed_at=datetime.now(UTC),
-    )
-    session.add(record)
-    await session.commit()
-    return consent_dict(record, settings.consent_document_version)
-
-
-def consent_dict(record: ConsentRecord, version: str) -> dict:
-    return {
-        "consentId": record.id,
-        "userId": record.user_id,
-        "documentVersion": record.document_version,
-        "status": record.decision,
-        "agreedItems": record.agreed_items,
-        "agreedAt": record.agreed_at,
-        "isCurrent": consent_is_current(record, version),
-        "currentDocumentVersion": version,
-    }
-
-
-@router.get("/consents/me", tags=["Consent"])
-async def my_consent(request: Request, user: CurrentUser, session: SessionDep) -> dict:
-    record = await latest_consent(session, user.id)
-    if record is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "동의 기록이 없습니다")
-    return consent_dict(record, settings_from(request).consent_document_version)
-
-
-# Profile and questions
-@router.get("/parents/{parentId}/profile", tags=["Profile"])
-async def get_profile(
-    parent_id: Annotated[str, Path(alias="parentId")],
-    user: CurrentUser,
-    session: SessionDep,
-) -> dict:
-    await ensure_report_access(session, user, parent_id)
-    profile = await session.get(ParentProfile, parent_id)
-    if profile is None:
-        return {"parentId": parent_id, "conditions": [], "updatedAt": None, "isCompleted": False}
-    return {
-        "parentId": profile.parent_id,
-        "conditions": profile.conditions,
-        "updatedAt": profile.updated_at,
-        "isCompleted": True,
-    }
-
-
-@router.put("/parents/{parentId}/profile", tags=["Profile"])
-async def put_profile(
-    parent_id: Annotated[str, Path(alias="parentId")],
-    payload: ProfilePut,
-    request: Request,
-    user: CurrentUser,
-    session: SessionDep,
-) -> dict:
-    if user.role == UserRole.CHILD.value:
-        await ensure_child_can_access_parent(session, user, parent_id)
-    elif user.id != parent_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "프로필 접근 권한이 없습니다")
-    if not await has_consent(session, parent_id, settings_from(request).consent_document_version):
-        raise HTTPException(status.HTTP_409_CONFLICT, "부모님 동의가 완료되어야 등록할 수 있어요")
-    profile = await session.get(ParentProfile, parent_id)
-    if profile is None:
-        profile = ParentProfile(parent_id=parent_id, conditions=payload.conditions)
-        session.add(profile)
-    else:
-        profile.conditions = payload.conditions
-        profile.updated_at = datetime.now(UTC)
-    await session.commit()
-    return {
-        "parentId": profile.parent_id,
-        "conditions": profile.conditions,
-        "updatedAt": profile.updated_at,
-        "isCompleted": True,
-    }
-
-
 @router.get("/parents/{parentId}/daily-questions", tags=["Question"])
 async def get_daily_questions(
     parent_id: Annotated[str, Path(alias="parentId")],
@@ -636,7 +118,6 @@ async def get_daily_questions(
     return {"source": source, "questions": [item.model_dump(by_alias=True) for item in questions]}
 
 
-# Call
 @router.post("/calls", status_code=201, tags=["Call"])
 async def create_call(
     payload: CallCreate,
@@ -1179,7 +660,6 @@ async def list_calls(
     return {"calls": [call_to_dict(call) for call in calls]}
 
 
-# Analysis
 @router.get("/calls/{callId}/transcript", tags=["Analysis"])
 async def get_transcript(
     call_id: Annotated[str, Path(alias="callId")],
@@ -1289,7 +769,6 @@ async def get_acoustic_features(
     }
 
 
-# Signal and reports
 @router.get("/parents/{parentId}/baseline", tags=["Signal"])
 async def get_baselines(
     parent_id: Annotated[str, Path(alias="parentId")],
@@ -1338,7 +817,6 @@ async def get_report(
     return await request.app.state.container.reports.get_or_issue(session, parent_id, period, date_)
 
 
-# LiveKit webhook and local health
 @router.post("/webhooks/livekit", status_code=204, tags=["Webhook"])
 async def livekit_webhook(
     request: Request,
