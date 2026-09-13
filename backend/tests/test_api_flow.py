@@ -57,6 +57,17 @@ def onboard_family(client: TestClient):
         },
     )
     assert consented.status_code == 201, consented.text
+    child_consent = client.post(
+        "/v1/consents",
+        headers=auth(child_token),
+        json={
+            "documentVersion": document["version"],
+            "decision": "GRANT",
+            "scrolledToEnd": True,
+            "agreedItems": document["requiredItems"],
+        },
+    )
+    assert child_consent.status_code == 201, child_consent.text
     return child_token, child, parent_token, parent
 
 

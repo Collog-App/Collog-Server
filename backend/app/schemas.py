@@ -168,6 +168,7 @@ class CallCreated(ApiModel):
 
 class CallAccepted(ApiModel):
     call_id: str
+    recording_enabled: bool
     livekit_url: str
     room_name: str
     access_token: str

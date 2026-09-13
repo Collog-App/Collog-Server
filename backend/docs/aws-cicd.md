@@ -60,6 +60,12 @@ QUESTION_TTS_PROVIDER=elevenlabs_direct
 Leave S3 access and secret keys empty in instance-role mode.
 Set the remaining provider credentials, independent DB/JWT/LiveKit secrets and `APNS_KEY_FILE`.
 The APNs key must be readable by container UID `10001`.
+Set `APPLE_TEAM_ID`, `APPLE_KEY_ID` and `APPLE_KEY_FILE` for a Sign in with Apple key.
+It is mounted read-only at `/run/secrets/apple-signin.p8` and must also be readable by UID `10001`.
+Account deletion reauthorizes the user and revokes Apple's token before deleting the account.
+Set `GEMINI_DATA_PROCESSING_APPROVED=true` only after verifying paid API data-processing terms.
+Set `ELEVENLABS_DATA_PROCESSING_APPROVED=true` only after verifying its data-use settings.
+Until approved, calls remain available without analysis and question speech uses the device voice.
 Keep secrets on EC2. Do not put them in the repository, build arguments or workflow logs.
 
 ## Deployment

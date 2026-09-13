@@ -49,6 +49,8 @@ class CallLifecycle:
             yield
 
     async def start_recordings(self, call_id: str, tracks: dict[str, str] | None = None) -> None:
+        from app.services.domain import participants_consented
+
         if self.settings.allow_raw_only_analysis:
             return
         async with self.database.sessions() as session:
@@ -56,6 +58,15 @@ class CallLifecycle:
                 select(CallRecord).where(CallRecord.id == call_id).with_for_update()
             )
             if call is None or call.state != CallState.ACTIVE.value or not call.recording_enabled:
+                return
+            if (
+                not self.settings.mock_external_services
+                and not self.settings.gemini_data_processing_approved
+            ) or not await participants_consented(
+                session, call.parent_id, call.child_id, self.settings.consent_document_version
+            ):
+                call.recording_enabled = False
+                await session.commit()
                 return
             assets = list(
                 await session.scalars(

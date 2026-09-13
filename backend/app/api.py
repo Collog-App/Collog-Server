@@ -21,6 +21,7 @@ from sqlalchemy import func, or_, select, update
 
 from app.auth_router import router as auth_router
 from app.config import Settings
+from app.consent import CONSENT_ITEMS
 from app.container import AppContainer
 from app.models import (
     AcousticAnalysisRun,
@@ -62,6 +63,7 @@ from app.schemas import (
 )
 from app.security import CurrentUser, SessionDep, require_role
 from app.services.domain import (
+    consent_is_current,
     derived_member_status,
     ensure_child_can_access_parent,
     ensure_report_access,
@@ -69,6 +71,7 @@ from app.services.domain import (
     has_consent,
     latest_consent,
     latest_invitation,
+    participants_consented,
 )
 from app.services.livekit import LiveKitError
 from app.services.notifications import (
@@ -86,14 +89,6 @@ from app.services.tts import ElevenLabsDirectTtsGateway, QuestionTtsError
 router = APIRouter()
 router.include_router(auth_router)
 logger = logging.getLogger(__name__)
-
-CONSENT_ITEMS = [
-    "SENSITIVE_HEALTH_COLLECTION",
-    "VOICE_FEATURE_EXTRACTION",
-    "CALL_RECORDING",
-    "REPORT_SHARING_WITH_CHILD",
-]
-
 
 def settings_from(request: Request) -> Settings:
     return request.app.state.container.settings
@@ -116,6 +111,7 @@ def call_to_dict(call: CallRecord) -> dict:
         "endedAt": call.ended_at,
         "durationSec": call.duration_sec,
         "recorded": call.recording_enabled,
+        "recordingEnabled": call.recording_enabled,
         "parentSpeechSec": call.parent_speech_sec,
         "askedQuestionIds": call.asked_question_ids,
         "rawAudioPurgedAt": call.raw_audio_purged_at,
@@ -139,12 +135,18 @@ async def recent_question_exclusions(session: SessionDep, parent_id: str) -> set
     return {question_id for call in calls for question_id in call.asked_question_ids}
 
 
-async def questions_for_parent(request: Request, session: SessionDep, parent_id: str):
+async def questions_for_parent(
+    request: Request, session: SessionDep, parent_id: str, requester_id: str
+):
     profile = await session.get(ParentProfile, parent_id)
     conditions = profile.conditions if profile else []
     excluded = await recent_question_exclusions(session, parent_id)
     source, questions = daily_questions(settings_from(request), conditions, excluded, parent_id)
-    questions = await request.app.state.container.question_tts.attach_audio(questions)
+    version = settings_from(request).consent_document_version
+    if await has_consent(session, parent_id, version) and await has_consent(
+        session, requester_id, version
+    ):
+        questions = await request.app.state.container.question_tts.attach_audio(questions)
     return source, questions
 
 
@@ -282,6 +284,7 @@ def invitation_dict(invitation: Invitation) -> dict:
 @router.get("/families/{familyId}/members", tags=["Family"])
 async def get_members(
     family_id: Annotated[str, Path(alias="familyId")],
+    request: Request,
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
@@ -303,7 +306,9 @@ async def get_members(
     for member in members:
         member_user = await session.get(User, member.user_id) if member.user_id else None
         invitation = await latest_invitation(session, member.id)
-        member_status = await derived_member_status(session, member, invitation)
+        member_status = await derived_member_status(
+            session, member, invitation, settings_from(request).consent_document_version
+        )
         output.append(
             {
                 "memberId": member.id,
@@ -328,7 +333,9 @@ async def get_members(
         )
     owner = await session.get(User, family.created_by)
     if owner:
-        owner_consent = await has_consent(session, owner.id)
+        owner_consent = await has_consent(
+            session, owner.id, settings_from(request).consent_document_version
+        )
         output.append(
             {
                 "memberId": owner.id,
@@ -387,7 +394,7 @@ async def resend_invitation(
 
 @router.post("/invitations/accept", tags=["Family"])
 async def accept_invitation(
-    payload: InvitationAccept, user: CurrentUser, session: SessionDep
+    payload: InvitationAccept, request: Request, user: CurrentUser, session: SessionDep
 ) -> dict:
     require_role(user, UserRole.PARENT)
     invitation = await session.scalar(
@@ -410,7 +417,9 @@ async def accept_invitation(
         return {
             "familyId": member.family_id,
             "memberId": member.id,
-            "status": await derived_member_status(session, member, invitation),
+            "status": await derived_member_status(
+                session, member, invitation, settings_from(request).consent_document_version
+            ),
         }
     if aware(invitation.expires_at) <= datetime.now(UTC):
         raise HTTPException(status.HTTP_410_GONE, "만료된 초대예요. 다시 초대를 요청해주세요")
@@ -442,14 +451,31 @@ async def consent_document(request: Request) -> dict:
     return {
         "version": version,
         "fullText": (
-            "통화 중 증상·복약·활동·수면 및 음성 특징값을 수집해 개인의 과거 기록과 "
-            "비교합니다. 원본 오디오는 분석 직후 즉시 폐기하며 특징값과 구조화 텍스트만 "
-            "저장합니다. 결과는 의료 진단이나 치료 지시가 아닙니다."
+            "녹음과 AI 분석은 선택 사항임. 두 참여자가 모두 동의한 통화에서만 음성을 녹음함. "
+            "거절해도 가족 통화 이용 가능함. Deepgram에 부모와 자녀의 통화 음성을 보내 "
+            "대화를 글로 변환함. Google Gemini에 두 참여자의 전사문과 그 안의 증상, 복약, "
+            "활동, 수면 정보를 보내 건강 기록을 생성함. ElevenLabs에는 질문 문장을 보내 "
+            "질문 음성을 생성하며, 아이폰 직접 요청 시 IP 주소가 전달됨. "
+            "이름, 전화번호, Apple 로그인 토큰은 AI 요청에 포함하지 않지만 대화에 말한 "
+            "개인정보는 음성과 전사문에 포함될 수 있음. 해외 제공사 서버에서 처리될 수 있음. "
+            "부모의 건강 기록과 음성 특징값은 가족 자녀에게 제공함. "
+            "의료 진단이나 치료 용도가 아님. "
+            "콜록 원본 음성은 분석 후 삭제하며 실패하거나 남은 파일은 자동 정리함. "
+            "전사문과 건강 기록은 계정 삭제 시까지 보관함. 외부 제공사의 보관 기간과 "
+            "삭제 처리는 해당 계약 및 정책에 따르며 콜록 서버 삭제와 별개임. "
+            "Deepgram 요청에는 모델 개선 참여 제외 옵션을 사용함. Google의 유료 서비스 "
+            "데이터 처리 조건을 운영자가 확인하기 전에는 녹음과 건강 분석을 비활성화함. "
+            "ElevenLabs는 모델 학습 이용을 제외한 계정 설정으로 사용함. "
+            "외부 음성 서비스를 사용할 수 없으면 아이폰 기본 음성으로 재생함. "
+            "설정에서 동의를 변경할 수 있으며 거절하면 이후 녹음과 AI 분석을 중단함."
         ),
-        "collectedItems": ["증상", "복약", "활동", "수면", "음성 특징값"],
+        "collectedItems": [
+            "통화 음성", "화자별 전사문", "증상", "복약", "활동", "수면", "음성 특징값",
+            "질문 문장", "질문 음성 요청 시 IP 주소",
+        ],
         "purpose": "가족 통화 기반 건강 변화 기록과 리포트 제공",
-        "retentionPeriod": "동의 철회 시까지",
-        "rawAudioPolicy": "원본 오디오는 분석 직후 즉시 폐기합니다",
+        "retentionPeriod": "전사문과 건강 기록은 계정 삭제 시까지 보관함",
+        "rawAudioPolicy": "콜록 원본 음성은 분석 후 삭제함. 외부 서비스 보관 정책은 별도임",
         "requiredItems": CONSENT_ITEMS,
     }
 
@@ -458,11 +484,27 @@ async def consent_document(request: Request) -> dict:
 async def submit_consent(
     payload: ConsentSubmit, request: Request, user: CurrentUser, session: SessionDep
 ) -> dict:
-    require_role(user, UserRole.PARENT)
+    async with request.app.state.container.calls.reserve_participants([user.id]):
+        await session.execute(select(User.id).where(User.id == user.id).with_for_update())
+        return await save_consent(payload, request, user, session)
+
+
+async def save_consent(
+    payload: ConsentSubmit, request: Request, user: CurrentUser, session: SessionDep
+) -> dict:
+    busy = await session.scalar(select(CallRecord.id).where(
+        or_(CallRecord.parent_id == user.id, CallRecord.child_id == user.id),
+        CallRecord.state.in_([
+            CallState.CREATED.value, CallState.RINGING.value, CallState.ACTIVE.value,
+        ]),
+        CallRecord.ended_at.is_(None),
+    ).limit(1))
+    if busy is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "통화를 종료한 뒤 동의를 변경해주세요")
     settings = settings_from(request)
     if payload.document_version != settings.consent_document_version:
         raise HTTPException(status.HTTP_409_CONFLICT, "최신 동의 안내를 다시 확인해주세요")
-    if not payload.scrolled_to_end:
+    if payload.decision == "GRANT" and not payload.scrolled_to_end:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "안내 내용을 끝까지 확인해주세요")
     if payload.decision == "GRANT" and not set(CONSENT_ITEMS).issubset(payload.agreed_items):
         raise HTTPException(
@@ -481,10 +523,10 @@ async def submit_consent(
     )
     session.add(record)
     await session.commit()
-    return consent_dict(record)
+    return consent_dict(record, settings.consent_document_version)
 
 
-def consent_dict(record: ConsentRecord) -> dict:
+def consent_dict(record: ConsentRecord, version: str) -> dict:
     return {
         "consentId": record.id,
         "userId": record.user_id,
@@ -492,15 +534,17 @@ def consent_dict(record: ConsentRecord) -> dict:
         "status": record.decision,
         "agreedItems": record.agreed_items,
         "agreedAt": record.agreed_at,
+        "isCurrent": consent_is_current(record, version),
+        "currentDocumentVersion": version,
     }
 
 
 @router.get("/consents/me", tags=["Consent"])
-async def my_consent(user: CurrentUser, session: SessionDep) -> dict:
+async def my_consent(request: Request, user: CurrentUser, session: SessionDep) -> dict:
     record = await latest_consent(session, user.id)
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "동의 기록이 없습니다")
-    return consent_dict(record)
+    return consent_dict(record, settings_from(request).consent_document_version)
 
 
 # Profile and questions
@@ -525,6 +569,7 @@ async def get_profile(
 async def put_profile(
     parent_id: Annotated[str, Path(alias="parentId")],
     payload: ProfilePut,
+    request: Request,
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
@@ -532,7 +577,7 @@ async def put_profile(
         await ensure_child_can_access_parent(session, user, parent_id)
     elif user.id != parent_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "프로필 접근 권한이 없습니다")
-    if not await has_consent(session, parent_id):
+    if not await has_consent(session, parent_id, settings_from(request).consent_document_version):
         raise HTTPException(status.HTTP_409_CONFLICT, "부모님 동의가 완료되어야 등록할 수 있어요")
     profile = await session.get(ParentProfile, parent_id)
     if profile is None:
@@ -557,7 +602,7 @@ async def get_daily_questions(
     session: SessionDep,
 ) -> dict:
     await ensure_report_access(session, user, parent_id)
-    source, questions = await questions_for_parent(request, session, parent_id)
+    source, questions = await questions_for_parent(request, session, parent_id, user.id)
     return {"source": source, "questions": [item.model_dump(by_alias=True) for item in questions]}
 
 
@@ -629,13 +674,21 @@ async def create_reserved_call(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "상대방의 통화 수신 기기가 등록되지 않았습니다"
             )
-    source, questions = await questions_for_parent(request, session, parent.id)
+    source, questions = await questions_for_parent(request, session, parent.id, child.id)
     del source
-    recording_enabled = await has_consent(session, parent.id)
+    recording_enabled = await participants_consented(
+        session, parent.id, child.id, settings_from(request).consent_document_version
+    )
     latest = await latest_consent(session, parent.id)
     disabled_reason = None
     if not recording_enabled:
         disabled_reason = "CONSENT_DENIED" if latest else "CONSENT_PENDING"
+    if (
+        not settings_from(request).mock_external_services
+        and not settings_from(request).gemini_data_processing_approved
+    ):
+        recording_enabled = False
+        disabled_reason = "PROVIDER_PRIVACY_PENDING"
     call = CallRecord(
         parent_id=parent.id,
         child_id=child.id,
@@ -698,7 +751,7 @@ async def create_reserved_call(
         access_token=token,
         recording_enabled=recording_enabled,
         recording_disabled_reason=disabled_reason,
-        recording_disabled_message="동의가 완료되면 기록할 수 있어요" if disabled_reason else None,
+        recording_disabled_message="녹음과 AI 분석 없이 통화해요" if disabled_reason else None,
         questions=questions,
         audio_constraints=AudioConstraints(),
     )
@@ -726,6 +779,10 @@ async def create_question_tts_token(
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "발신자만 질문 음성을 요청할 수 있습니다"
             )
+        if not await participants_consented(
+            session, call.parent_id, call.child_id, container.settings.consent_document_version
+        ):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "두 참여자의 AI 처리 동의가 필요해요")
         if call.state != CallState.RINGING.value or call.ended_at is not None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "수신 대기 중에만 질문 음성을 요청할 수 있습니다"
@@ -737,6 +794,11 @@ async def create_question_tts_token(
         if question_id not in call.asked_question_ids:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "통화 질문을 찾을 수 없습니다")
         gateway = container.question_tts
+        if (
+            not container.settings.mock_external_services
+            and not container.settings.elevenlabs_data_processing_approved
+        ):
+            raise HTTPException(status.HTTP_409_CONFLICT, "아이폰 기본 음성으로 재생해주세요")
         if not isinstance(gateway, ElevenLabsDirectTtsGateway):
             raise HTTPException(status.HTTP_409_CONFLICT, "직접 음성 재생이 설정되지 않았습니다")
         question_count = await session.scalar(
@@ -784,9 +846,14 @@ async def accept_call(
         datetime.now(UTC) - aware(call.started_at)
     ).total_seconds() >= settings.incoming_call_ttl_seconds:
         raise HTTPException(status.HTTP_410_GONE, "수신 대기 시간이 만료되었습니다")
-    if call.recording_enabled and not await has_consent(session, call.parent_id):
+    if call.recording_enabled and not await participants_consented(
+        session, call.parent_id, call.child_id, settings.consent_document_version
+    ):
         call.recording_enabled = False
         call.recording_disabled_reason = "CONSENT_DENIED"
+    if not settings.mock_external_services and not settings.gemini_data_processing_approved:
+        call.recording_enabled = False
+        call.recording_disabled_reason = "PROVIDER_PRIVACY_PENDING"
     call.state = CallState.ACTIVE.value
     call.accepted_at = datetime.now(UTC)
     settings = settings_from(request)
@@ -810,6 +877,7 @@ async def accept_call(
         background.add_task(request.app.state.container.calls.start_recordings, call.id)
     response = CallAccepted(
         call_id=call.id,
+        recording_enabled=call.recording_enabled,
         livekit_url=settings.livekit_url,
         room_name=call.room_name,
         access_token=token,

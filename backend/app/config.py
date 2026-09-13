@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     apple_login_enabled: bool = True
     apple_client_id: str = "com.dohyeoplim.collog-ios"
     apple_challenge_ttl_seconds: int = Field(default=300, ge=30, le=600)
+    apple_team_id: str = ""
+    apple_key_id: str = ""
+    apple_private_key_path: Path | None = None
 
     schema_auto_reset: bool = False
 
@@ -60,12 +63,14 @@ class Settings(BaseSettings):
     deepgram_base_url: str = "https://api.deepgram.com"
 
     gemini_api_key: str = ""
+    gemini_data_processing_approved: bool = False
     gemini_model: str = "gemini-3.6-flash"
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_max_output_tokens: int = 2048
 
     question_tts_provider: Literal["ios_local", "elevenlabs", "elevenlabs_direct"] = "ios_local"
     elevenlabs_api_key: str = ""
+    elevenlabs_data_processing_approved: bool = False
     elevenlabs_voice_id: str = ""
     elevenlabs_model: str = "eleven_flash_v2_5"
     elevenlabs_output_format: str = "mp3_44100_128"
@@ -84,7 +89,7 @@ class Settings(BaseSettings):
     s3_use_instance_role: bool = False
     s3_force_path_style: bool = True
 
-    consent_document_version: str = "2026-08-01.v3"
+    consent_document_version: str = "2026-09-13.v4"
     parent_min_speech_seconds: int = 20
     raw_audio_wait_seconds: int = 30
     egress_wait_seconds: int = Field(default=120, ge=1)

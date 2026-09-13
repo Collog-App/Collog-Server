@@ -23,6 +23,7 @@ from app.models import (
 )
 from app.services.acoustics import AcousticAnalysisInput, AcousticAnalyzer
 from app.services.deepgram import SttGateway, SttResult
+from app.services.domain import participants_consented
 from app.services.gemini import ExtractionGateway
 from app.services.repeat_detector import detect_repeat_events
 from app.services.signals import SignalService
@@ -32,6 +33,24 @@ logger = logging.getLogger(__name__)
 
 
 class ProcessingPipeline:
+    async def processing_allowed(self, call_id: str) -> bool:
+        async with self.database.sessions() as session:
+            call = await session.get(CallRecord, call_id)
+            allowed = call is not None and call.recording_enabled and (
+                self.settings.mock_external_services
+                or self.settings.gemini_data_processing_approved
+            ) and await participants_consented(
+                session, call.parent_id, call.child_id, self.settings.consent_document_version
+            )
+            if allowed:
+                return True
+            if call is not None:
+                call.state = CallState.ANALYSIS_EXCLUDED.value
+                call.processing_claimed_at = None
+                await session.commit()
+        await self.purge_call_audio(call_id)
+        return False
+
     def log_stt_result(self, call_id: str, speaker: str, result: SttResult) -> None:
         logger.info(
             "STT %s call=%s provider=%s speech=%.1fs segments=%d words=%d",
@@ -107,6 +126,17 @@ class ProcessingPipeline:
             }:
                 return
             if not call.recording_enabled or call.ended_at is None:
+                return
+            if (
+                not self.settings.mock_external_services
+                and not self.settings.gemini_data_processing_approved
+            ) or not await participants_consented(
+                session, call.parent_id, call.child_id, self.settings.consent_document_version
+            ):
+                call.state = CallState.ANALYSIS_EXCLUDED.value
+                call.recording_enabled = False
+                await session.commit()
+                await self.purge_call_audio(call_id)
                 return
             assets = (
                 await session.scalars(select(AudioAsset).where(AudioAsset.call_id == call_id))
@@ -218,11 +248,15 @@ class ProcessingPipeline:
         # 자녀 음성이 없으므로 transcript에는 부모 발화만 남는다.
         parent_source = parent_egress or raw_asset
         parent_audio = await self.storage.read(parent_source.uri)
+        if not await self.processing_allowed(call_id):
+            return
         parent_stt = await self.stt.transcribe(parent_audio, parent_source.content_type, "PARENT")
         self.log_stt_result(call_id, "PARENT", parent_stt)
         stt_results = [("PARENT", parent_stt)]
         if child_egress:
             child_audio = await self.storage.read(child_egress.uri)
+            if not await self.processing_allowed(call_id):
+                return
             child_stt = await self.stt.transcribe(child_audio, child_egress.content_type, "CHILD")
             self.log_stt_result(call_id, "CHILD", child_stt)
             stt_results.append(("CHILD", child_stt))
@@ -303,6 +337,8 @@ class ProcessingPipeline:
             return
 
         transcript_text = "\n".join(f"{item['speaker']}: {item['text']}" for item in segments)
+        if not await self.processing_allowed(call_id):
+            return
         try:
             extracted = await self.extraction.extract(segments)
             extraction_values = extracted.model_dump()

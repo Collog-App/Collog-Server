@@ -168,7 +168,11 @@ class ElevenLabsDirectTtsGateway(QuestionTtsGateway):
 def create_question_tts_gateway(
     settings: Settings, storage: StorageGateway
 ) -> QuestionTtsGateway:
-    if settings.question_tts_provider == "ios_local" or settings.mock_external_services:
+    if (
+        settings.question_tts_provider == "ios_local"
+        or settings.mock_external_services
+        or not settings.elevenlabs_data_processing_approved
+    ):
         return QuestionTtsGateway()
     try:
         if settings.question_tts_provider == "elevenlabs_direct":
