@@ -81,7 +81,10 @@ class User(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     role: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(80))
-    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
+    apple_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -99,14 +102,41 @@ class OtpChallenge(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class AppleLoginChallenge(Base):
+    __tablename__ = "apple_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class Device(Base):
     __tablename__ = "devices"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    auth_session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("refresh_sessions.id"), nullable=True, index=True
+    )
     platform: Mapped[str] = mapped_column(String(16))
     token: Mapped[str] = mapped_column(Text)
     voip_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    apns_environment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    call_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    push_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_notifications_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -165,6 +195,7 @@ class CallRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     parent_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
     child_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    caller_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=CallState.CREATED.value, index=True)
     room_name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     recording_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -180,7 +211,34 @@ class CallRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_claimed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    room_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    report_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    @property
+    def effective_caller_id(self) -> str:
+        return self.caller_id or self.child_id
+
+    @property
+    def callee_id(self) -> str:
+        return self.child_id if self.effective_caller_id == self.parent_id else self.parent_id
+
+
+class QuestionTtsGrant(Base):
+    __tablename__ = "question_tts_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    question_id: Mapped[str] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
 
 
 class AudioAsset(Base):

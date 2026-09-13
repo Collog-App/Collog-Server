@@ -8,7 +8,7 @@ from urllib.parse import quote
 import httpx
 
 from app.config import Settings
-from app.schemas import QuestionView
+from app.schemas import QuestionTtsToken, QuestionView
 from app.services.http import request_with_retry
 from app.services.storage import StorageGateway
 
@@ -125,12 +125,54 @@ class ElevenLabsQuestionTtsGateway(QuestionTtsGateway):
         return f"tts/questions/{question.question_id}-{digest}.mp3"
 
 
+class ElevenLabsDirectTtsGateway(QuestionTtsGateway):
+    provider = "elevenlabs-direct"
+
+    def __init__(self, settings: Settings) -> None:
+        if not settings.elevenlabs_api_key or not settings.elevenlabs_voice_id:
+            raise QuestionTtsError("ElevenLabs API key와 voice ID가 필요합니다")
+        if not settings.elevenlabs_output_format.startswith("mp3_"):
+            raise QuestionTtsError("iOS 직접 재생에는 MP3 output이 필요합니다")
+        if settings.elevenlabs_model == "eleven_v3":
+            raise QuestionTtsError("직접 질문 재생에는 Flash 또는 Multilingual 모델이 필요합니다")
+        self.settings = settings
+
+    async def attach_audio(self, questions: list[QuestionView]) -> list[QuestionView]:
+        return [
+            question.model_copy(update={"tts_mode": "ELEVENLABS_DIRECT", "tts_asset_url": None})
+            for question in questions
+        ]
+
+    async def issue_token(self) -> QuestionTtsToken:
+        url = f"{self.settings.elevenlabs_base_url.rstrip('/')}/v1/single-use-token/tts_websocket"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    url, headers={"xi-api-key": self.settings.elevenlabs_api_key}
+                )
+                response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise QuestionTtsError("ElevenLabs 음성 토큰을 발급하지 못했습니다") from exc
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            raise QuestionTtsError("ElevenLabs 음성 토큰 응답이 올바르지 않습니다")
+        return QuestionTtsToken(
+            token=token,
+            voice_id=self.settings.elevenlabs_voice_id,
+            model_id=self.settings.elevenlabs_model,
+            output_format=self.settings.elevenlabs_output_format,
+        )
+
+
 def create_question_tts_gateway(
     settings: Settings, storage: StorageGateway
 ) -> QuestionTtsGateway:
-    if settings.question_tts_provider != "elevenlabs" or settings.mock_external_services:
+    if settings.question_tts_provider == "ios_local" or settings.mock_external_services:
         return QuestionTtsGateway()
     try:
+        if settings.question_tts_provider == "elevenlabs_direct":
+            return ElevenLabsDirectTtsGateway(settings)
         return ElevenLabsQuestionTtsGateway(settings, storage)
     except QuestionTtsError as exc:
         logger.warning("ElevenLabs TTS is not configured; using iOS local voice: %s", exc)

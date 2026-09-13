@@ -25,6 +25,9 @@ class LiveKitGateway:
     async def create_room(self, room_name: str) -> None:
         raise NotImplementedError
 
+    async def delete_room(self, room_name: str) -> None:
+        raise NotImplementedError
+
     def participant_token(self, room_name: str, identity: str, name: str) -> str:
         raise NotImplementedError
 
@@ -45,6 +48,9 @@ class LiveKitGateway:
 
 class MockLiveKitGateway(LiveKitGateway):
     async def create_room(self, room_name: str) -> None:
+        del room_name
+
+    async def delete_room(self, room_name: str) -> None:
         del room_name
 
     def participant_token(self, room_name: str, identity: str, name: str) -> str:
@@ -97,6 +103,20 @@ class RealLiveKitGateway(LiveKitGateway):
                     max_participants=4,
                 )
             )
+        except Exception as exc:
+            raise LiveKitError("LiveKit room creation failed") from exc
+        finally:
+            await client.aclose()
+
+    async def delete_room(self, room_name: str) -> None:
+        client = self._client()
+        try:
+            await client.room.delete_room(api.DeleteRoomRequest(room=room_name))
+        except api.TwirpError as exc:
+            if exc.code != "not_found":
+                raise LiveKitError("LiveKit room cleanup failed") from exc
+        except Exception as exc:
+            raise LiveKitError("LiveKit room cleanup failed") from exc
         finally:
             await client.aclose()
 

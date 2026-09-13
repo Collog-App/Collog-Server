@@ -1,0 +1,234 @@
+name: collog-local
+
+x-backend: &backend
+  image: collog-local-backend
+  build: .
+
+x-storage: &storage
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_REGION: us-east-1
+  S3_BUCKET: ${S3_BUCKET:-collog}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: collog
+      POSTGRES_USER: collog
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collog -d collog"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+    ports:
+      - "9000:9000"
+    volumes:
+      - minio-data:/data
+
+  storage-init:
+    <<: *backend
+    depends_on:
+      minio:
+        condition: service_started
+    environment: *storage
+    command:
+      - python
+      - -c
+      - |
+        import os
+        import time
+        import boto3
+        from botocore.exceptions import ClientError, EndpointConnectionError
+        s3 = boto3.client(
+            "s3", endpoint_url=os.environ["S3_ENDPOINT_URL"], region_name="us-east-1",
+            aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
+        )
+        bucket = os.environ["S3_BUCKET"]
+        for attempt in range(30):
+            try:
+                s3.head_bucket(Bucket=bucket)
+                break
+            except ClientError as error:
+                if error.response["Error"]["Code"] not in ("404", "NoSuchBucket"):
+                    raise
+                s3.create_bucket(Bucket=bucket)
+                break
+            except EndpointConnectionError:
+                if attempt == 29:
+                    raise
+                time.sleep(2)
+        print("Storage bucket ready")
+
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      LIVEKIT_CONFIG: |
+        port: 7880
+        bind_addresses: ["0.0.0.0"]
+        rtc:
+          tcp_port: 7881
+          udp_port: 7882
+          use_external_ip: false
+          node_ip: ${LOCAL_HOST:?Set LOCAL_HOST to your desktop LAN IPv4 address}
+        redis:
+          address: redis:6379
+        keys:
+          "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}": "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}"
+        webhook:
+          api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}"
+          urls: ["http://backend:8080/v1/webhooks/livekit"]
+        room:
+          empty_timeout: 60
+          departure_timeout: 20
+        logging:
+          level: info
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7880/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  egress:
+    image: livekit/egress:v1.12.0
+    restart: unless-stopped
+    shm_size: 1gb
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_healthy
+    environment:
+      EGRESS_CONFIG_BODY: |
+        api_key: "${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}"
+        api_secret: "${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}"
+        ws_url: ws://livekit:7880
+        insecure: true
+        redis:
+          address: redis:6379
+        health_port: 8081
+        log_level: info
+        enable_chrome_sandbox: false
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  migrate:
+    <<: *backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://collog:${DB_PASSWORD:?Set DB_PASSWORD}@postgres:5432/collog
+    command: ["alembic", "upgrade", "head"]
+
+  backend:
+    <<: *backend
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      storage-init:
+        condition: service_completed_successfully
+      egress:
+        condition: service_healthy
+    environment:
+      <<: *storage
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://collog:${DB_PASSWORD:?Set DB_PASSWORD}@postgres:5432/collog
+      SCHEMA_AUTO_RESET: "false"
+      MOCK_EXTERNAL_SERVICES: "false"
+      ALLOW_RAW_ONLY_ANALYSIS: "false"
+      LOG_STT_TRANSCRIPT: "false"
+      TEAM_PORTAL_ENABLED: "false"
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      PUBLIC_BASE_URL: http://${LOCAL_HOST:?Set LOCAL_HOST}:8080
+      LIVEKIT_URL: ws://${LOCAL_HOST:?Set LOCAL_HOST}:7880
+      LIVEKIT_INTERNAL_URL: http://livekit:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}
+      STORAGE_BACKEND: s3
+      S3_PUBLIC_ENDPOINT_URL: http://${LOCAL_HOST:?Set LOCAL_HOST}:9000
+      S3_FORCE_PATH_STYLE: "true"
+      SMS_PROVIDER: solapi
+      SOLAPI_API_KEY: ${SOLAPI_API_KEY:-}
+      SOLAPI_API_SECRET: ${SOLAPI_API_SECRET:-}
+      SOLAPI_SENDER: ${SOLAPI_SENDER:-}
+      APPLE_LOGIN_ENABLED: "true"
+      APPLE_CLIENT_ID: ${APPLE_CLIENT_ID:-com.dohyeoplim.collog-ios}
+      APNS_VOIP_ENABLED: "true"
+      APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:-sandbox}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:?Set APNS_TEAM_ID}
+      APNS_KEY_ID: ${APNS_KEY_ID:?Set APNS_KEY_ID}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-com.dohyeoplim.collog-ios}
+      APNS_PRIVATE_KEY_PATH: /run/secrets/apns.p8
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?Set DEEPGRAM_API_KEY}
+      DEEPGRAM_MODEL: ${DEEPGRAM_MODEL:-nova-3}
+      DEEPGRAM_LANGUAGE: ko
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?Set GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.6-flash}
+      QUESTION_TTS_PROVIDER: ${QUESTION_TTS_PROVIDER:-elevenlabs_direct}
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:?Set ELEVENLABS_API_KEY}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:?Set ELEVENLABS_VOICE_ID}
+      ELEVENLABS_MODEL: ${ELEVENLABS_MODEL:-eleven_flash_v2_5}
+      COUGH_DETECTOR_VALIDATED: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: ${APNS_KEY_FILE:?Set APNS_KEY_FILE}
+        target: /run/secrets/apns.p8
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/health')
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:

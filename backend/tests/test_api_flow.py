@@ -147,7 +147,7 @@ def test_complete_call_pipeline(client: TestClient) -> None:
         "autoGainControl": False,
         "dtx": False,
         "audioBitrate": 48000,
-        "rawCaptureSampleRate": 48000,
+        "rawCaptureSampleRate": 16000,
     }
 
     accepted = client.post(f"/v1/calls/{call_id}/accept", headers=auth(parent_token))

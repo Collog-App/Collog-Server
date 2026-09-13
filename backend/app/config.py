@@ -25,13 +25,17 @@ class Settings(BaseSettings):
     refresh_ttl_days: int = 30
     otp_ttl_seconds: int = 180
     dev_otp_code: str = "000000"
-    mock_external_services: bool = True
+    mock_external_services: bool = False
+    sms_provider: Literal["solapi", "mock"] = "solapi"
+    solapi_api_key: str = ""
+    solapi_api_secret: str = ""
+    solapi_sender: str = ""
+    otp_max_attempts: int = Field(default=5, ge=1, le=10)
+    apple_login_enabled: bool = True
+    apple_client_id: str = "com.dohyeoplim.collog-ios"
+    apple_challenge_ttl_seconds: int = Field(default=300, ge=30, le=600)
 
-    # 기동 시 모델과 DB 스키마가 어긋나면 개발 DB를 재생성한다. 배포 서버는 false로 두어
-    # guard가 스키마를 수정하지 못하게 한다. 그 환경의 스키마는 Alembic이 소유한다.
-    # app_env로 분기하지 않는다. app_env="production"은 dev OTP를 막아 로그인을 불가능하게
-    # 만들므로, 배포 서버도 development로 뜬다.
-    schema_auto_reset: bool = True
+    schema_auto_reset: bool = False
 
     livekit_url: str = "ws://localhost:7880"
     livekit_internal_url: str | None = None
@@ -60,7 +64,7 @@ class Settings(BaseSettings):
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_max_output_tokens: int = 2048
 
-    question_tts_provider: Literal["ios_local", "elevenlabs"] = "ios_local"
+    question_tts_provider: Literal["ios_local", "elevenlabs", "elevenlabs_direct"] = "ios_local"
     elevenlabs_api_key: str = ""
     elevenlabs_voice_id: str = ""
     elevenlabs_model: str = "eleven_flash_v2_5"
@@ -82,6 +86,10 @@ class Settings(BaseSettings):
     consent_document_version: str = "2026-08-01.v3"
     parent_min_speech_seconds: int = 20
     raw_audio_wait_seconds: int = 30
+    egress_wait_seconds: int = Field(default=120, ge=1)
+    processing_timeout_seconds: int = Field(default=600, ge=1)
+    processing_lease_seconds: int = Field(default=900, ge=2)
+    maintenance_interval_seconds: int = Field(default=10, ge=1)
     baseline_required_samples: int = 4
     baseline_window_weeks: int = 4
     robust_z_threshold: float = 1.5
@@ -145,6 +153,68 @@ class Settings(BaseSettings):
                 Path(database_path).parent.mkdir(parents=True, exist_ok=True)
         if self.storage_backend == "local":
             self.local_storage_path.mkdir(parents=True, exist_ok=True)
+
+    def validate_runtime(self) -> None:
+        if self.processing_lease_seconds <= self.processing_timeout_seconds:
+            raise ValueError("PROCESSING_LEASE_SECONDS must exceed PROCESSING_TIMEOUT_SECONDS")
+        if self.app_env != "production":
+            return
+        if self.mock_external_services or self.sms_provider != "solapi":
+            raise ValueError("Production requires real external services and SMS")
+        if self.schema_auto_reset or self.allow_raw_only_analysis:
+            raise ValueError("Production requires migrations and Track Egress")
+        if self.storage_backend != "s3" or not self.database_url.startswith(
+            "postgresql+asyncpg://"
+        ):
+            raise ValueError("Production requires PostgreSQL and S3 storage")
+        if not self.public_base_url.startswith("https://") or not self.livekit_url.startswith(
+            "wss://"
+        ):
+            raise ValueError("Production requires HTTPS and WSS public URLs")
+        if not (self.s3_public_endpoint_url or "").startswith("https://"):
+            raise ValueError("Production requires an HTTPS storage URL")
+        required = {
+            "JWT_SECRET": self.jwt_secret,
+            "LIVEKIT_API_KEY": self.livekit_api_key,
+            "LIVEKIT_API_SECRET": self.livekit_api_secret,
+            "S3_BUCKET": self.s3_bucket,
+            "S3_ACCESS_KEY_ID": self.s3_access_key_id,
+            "S3_SECRET_ACCESS_KEY": self.s3_secret_access_key,
+            "DEEPGRAM_API_KEY": self.deepgram_api_key,
+            "GEMINI_API_KEY": self.gemini_api_key,
+            "APNS_TEAM_ID": self.apns_team_id,
+            "APNS_KEY_ID": self.apns_key_id,
+            "APNS_BUNDLE_ID": self.apns_bundle_id,
+        }
+        if self.apple_login_enabled:
+            required["APPLE_CLIENT_ID"] = self.apple_client_id
+        sms_settings = {
+            "SOLAPI_API_KEY": self.solapi_api_key,
+            "SOLAPI_API_SECRET": self.solapi_api_secret,
+            "SOLAPI_SENDER": self.solapi_sender,
+        }
+        if not self.apple_login_enabled or any(sms_settings.values()):
+            required.update(sms_settings)
+        missing = [key for key, value in required.items() if not value.strip()]
+        if missing:
+            raise ValueError(f"Missing production settings: {', '.join(missing)}")
+        for name, value in (
+            ("JWT_SECRET", self.jwt_secret),
+            ("LIVEKIT_API_SECRET", self.livekit_api_secret),
+            ("S3_SECRET_ACCESS_KEY", self.s3_secret_access_key),
+        ):
+            if len(value) < 32 or any(
+                word in value.lower() for word in ("development", "local", "change")
+            ):
+                raise ValueError(f"{name} must be a unique secret of at least 32 characters")
+        if not self.apns_voip_enabled or self.apns_private_key_path is None:
+            raise ValueError("Production requires APNs VoIP credentials")
+        if not self.apns_private_key_path.is_file():
+            raise ValueError("APNS_PRIVATE_KEY_PATH must point to a readable key file")
+        if self.question_tts_provider in {"elevenlabs", "elevenlabs_direct"} and not (
+            self.elevenlabs_api_key and self.elevenlabs_voice_id
+        ):
+            raise ValueError("ElevenLabs requires an API key and voice ID")
 
 
 @lru_cache

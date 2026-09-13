@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,18 +10,31 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from app.account_router import router as account_router
 from app.api import router
 from app.config import Settings, get_settings
 from app.container import AppContainer
 from app.team_portal import build_team_status, render_team_portal
 
 
+async def run_maintenance(operation: Callable[[], Awaitable[object]], interval: int) -> None:
+    while True:
+        try:
+            await operation()
+        except Exception:
+            logging.getLogger(__name__).exception("Maintenance operation failed and will retry")
+        await asyncio.sleep(interval)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
+    settings.validate_runtime()
     settings.ensure_local_directories()
     # uvicorn은 자신의 로거에만 핸들러를 붙이므로 app.* 로거의 INFO는 어디에도 출력되지
     # 않는다. STT 같은 파이프라인 로그를 서버 로그에서 보려면 루트 핸들러가 필요하다.
     logging.getLogger("app").setLevel(logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=logging.INFO,
@@ -34,20 +47,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await container.database.ensure_schema(auto_reset=settings.schema_auto_reset)
         await container.pipeline.release_stale_claims()
 
-        async def cleanup_loop() -> None:
-            while True:
-                await asyncio.sleep(10)
-                await container.pipeline.process_pending()
-                await container.pipeline.purge_expired_audio()
-
-        cleanup = asyncio.create_task(cleanup_loop())
+        tasks = [
+            asyncio.create_task(run_maintenance(operation, settings.maintenance_interval_seconds))
+            for operation in (
+                container.calls.maintain,
+                container.pipeline.process_pending,
+                container.pipeline.purge_expired_audio,
+                container.report_notifications.maintain,
+            )
+        ]
+        app.state.maintenance_tasks = tasks
         try:
             yield
         finally:
-            cleanup.cancel()
-            with suppress(asyncio.CancelledError):
-                await cleanup
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
             await container.voip_push.close()
+            await container.report_push.close()
+            await container.apple_identity.close()
             await container.database.close()
 
     app = FastAPI(
@@ -66,6 +86,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(router, prefix=settings.api_prefix)
+    app.include_router(account_router, prefix=settings.api_prefix)
 
     @app.get("/team", include_in_schema=False, response_class=HTMLResponse)
     async def team_portal(request: Request) -> HTMLResponse:

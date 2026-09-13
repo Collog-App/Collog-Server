@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from app.models import BaselineKind, CallState, Metric, TimeSlot, UserRole
 
@@ -27,22 +27,54 @@ class ErrorResponse(ApiModel):
     message: str
 
 
+def normalize_phone(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    phone = value.replace("-", "").replace(" ", "")
+    if phone.startswith("+82"):
+        phone = "0" + phone[3:]
+    return phone
+
+
+PhoneNumber = Annotated[
+    str, Field(pattern=r"^01[016789][0-9]{7,8}$"), BeforeValidator(normalize_phone)
+]
+
+
 class OtpRequest(ApiModel):
-    phone: str = Field(pattern=r"^[0-9+\-]{8,20}$")
+    phone: PhoneNumber
     role: UserRole = UserRole.CHILD
     name: str = Field(default="사용자", min_length=1, max_length=80)
 
 
 class OtpVerify(ApiModel):
-    phone: str
-    code: str = Field(min_length=6, max_length=6)
+    phone: PhoneNumber
+    code: str = Field(pattern=r"^[0-9]{6}$")
+
+
+class RefreshRequest(ApiModel):
+    refresh_token: str = Field(min_length=32, max_length=512)
+
+
+class AppleLoginRequest(ApiModel):
+    identity_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    role: UserRole = UserRole.CHILD
+    name: str | None = Field(default=None, max_length=80)
+
+
+class AppleChallengeResponse(ApiModel):
+    challenge_id: str
+    nonce: str
+    expires_in: int
 
 
 class UserView(ApiModel):
     id: str
     role: str
     name: str
-    phone: str
+    phone: str | None = None
+    apple_user_id: str | None = None
     family_id: str | None = None
 
 
@@ -56,6 +88,10 @@ class DeviceCreate(ApiModel):
     platform: Literal["IOS", "ANDROID"]
     token: str
     voip_token: str | None = None
+    apns_environment: Literal["sandbox", "production"] | None = None
+    call_notifications_enabled: bool = True
+    push_token: str | None = None
+    report_notifications_enabled: bool = True
 
 
 class InvitationCreate(ApiModel):
@@ -91,7 +127,15 @@ class QuestionView(ApiModel):
     condition_code: str | None
     tts_asset_url: str | None
     duration_ms: int | None
-    tts_mode: Literal["IOS_LOCAL", "REMOTE_ASSET"] = "IOS_LOCAL"
+    tts_mode: Literal["IOS_LOCAL", "REMOTE_ASSET", "ELEVENLABS_DIRECT"] = "IOS_LOCAL"
+
+
+class QuestionTtsToken(ApiModel):
+    token: str
+    voice_id: str
+    model_id: str
+    output_format: str
+    expires_in: int = 900
 
 
 class AudioConstraints(ApiModel):
@@ -100,7 +144,7 @@ class AudioConstraints(ApiModel):
     auto_gain_control: bool = False
     dtx: bool = False
     audio_bitrate: int = 48_000
-    raw_capture_sample_rate: int = 48_000
+    raw_capture_sample_rate: int = 16_000
 
 
 class CallCreate(ApiModel):
@@ -109,6 +153,9 @@ class CallCreate(ApiModel):
 
 class CallCreated(ApiModel):
     call_id: str
+    caller_id: str
+    callee_id: str
+    raw_capture_required: bool
     livekit_url: str
     room_name: str
     access_token: str
