@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-umask 077
+umask 022
 
 [[ $(id -u) == 0 ]] || { echo 'Run as root'; exit 1; }
 source /etc/os-release
@@ -46,6 +46,7 @@ if [[ ! -e /swapfile ]] && [[ -z $(swapon --show --noheadings) ]]; then
     swapon /swapfile
     printf '/swapfile none swap sw 0 0\n' >> /etc/fstab
 fi
+umask 077
 install -d -m 0700 /etc/collog /opt/collog /opt/collog/bin /opt/collog/releases /opt/collog/backups
 install -m 0750 "$script_directory/deploy.sh" /opt/collog/bin/deploy.sh
 cat > /etc/collog/deploy.conf <<'EOF'
