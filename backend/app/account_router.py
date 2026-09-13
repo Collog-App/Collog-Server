@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import UTC, datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, HTTPException, Request, Response
-from sqlalchemy import delete, or_, select
+from pydantic import Field
+from sqlalchemy import delete, or_, select, update
 
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
+    AppleLoginChallenge,
     AssetKind,
     AudioAsset,
     Baseline,
@@ -34,6 +38,8 @@ from app.models import (
 )
 from app.schemas import ApiModel, UserView
 from app.security import CurrentUser, SessionDep
+from app.services.apple_auth import AppleIdentityError, AppleServiceError
+from app.services.apple_oauth import apple_client_secret, revoke_apple_authorization
 from app.services.domain import family_of
 from app.services.storage import StorageError
 
@@ -42,6 +48,12 @@ router = APIRouter(prefix="/account", tags=["Account"])
 
 class RoleUpdate(ApiModel):
     role: UserRole
+
+
+class AppleDeletionRequest(ApiModel):
+    challenge_id: str = Field(min_length=1, max_length=255)
+    identity_token: str = Field(min_length=1, max_length=16384)
+    authorization_code: str = Field(min_length=1, max_length=4096)
 
 
 async def lock_account(session: SessionDep, user: User, *, deleting: bool = False) -> None:
@@ -89,9 +101,47 @@ async def update_role(
 
 
 @router.delete("", status_code=204)
-async def delete_account(request: Request, user: CurrentUser, session: SessionDep) -> Response:
+async def delete_account(
+    request: Request, user: CurrentUser, session: SessionDep,
+    payload: AppleDeletionRequest | None = None,
+) -> Response:
     async with request.app.state.container.calls.reserve_participants([user.id]):
         await lock_account(session, user, deleting=True)
+        container = request.app.state.container
+        identity = None
+        client_secret = None
+        if user.apple_subject:
+            if payload is None:
+                raise HTTPException(400, "계정 삭제를 위해 Apple 인증을 다시 진행해주세요")
+            try:
+                client_secret = apple_client_secret(container.settings)
+                identity = await container.apple_identity.verify(payload.identity_token)
+            except AppleIdentityError as exc:
+                raise HTTPException(401, "Apple 인증을 다시 진행해주세요") from exc
+            except AppleServiceError as exc:
+                raise HTTPException(
+                    503, "Apple 계정 삭제를 준비 중이에요. 잠시 후 다시 시도해주세요"
+                ) from exc
+            challenge = await session.get(AppleLoginChallenge, payload.challenge_id)
+            if (
+                identity.subject != user.apple_subject or challenge is None
+                or challenge.consumed_at is not None
+                or challenge.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+                or not hmac.compare_digest(
+                    challenge.nonce_hash, hashlib.sha256(identity.nonce.encode()).hexdigest()
+                )
+            ):
+                raise HTTPException(401, "현재 계정으로 Apple 인증을 다시 진행해주세요")
+            consumed = await session.scalar(
+                update(AppleLoginChallenge).where(
+                    AppleLoginChallenge.id == payload.challenge_id,
+                    AppleLoginChallenge.consumed_at.is_(None),
+                    AppleLoginChallenge.expires_at > datetime.now(UTC),
+                ).values(consumed_at=datetime.now(UTC))
+                .execution_options(synchronize_session=False).returning(AppleLoginChallenge.id)
+            )
+            if consumed is None:
+                raise HTTPException(401, "Apple 인증을 다시 진행해주세요")
         calls = list(await session.scalars(
             select(CallRecord).where(
                 or_(CallRecord.parent_id == user.id, CallRecord.child_id == user.id)
@@ -140,5 +190,16 @@ async def delete_account(request: Request, user: CurrentUser, session: SessionDe
         if user.phone:
             await session.execute(delete(OtpChallenge).where(OtpChallenge.phone == user.phone))
         await session.execute(delete(User).where(User.id == user.id))
+        await session.flush()
+        if identity is not None and payload is not None and client_secret is not None:
+            try:
+                await revoke_apple_authorization(
+                    container.settings, container.apple_identity, code=payload.authorization_code,
+                    subject=identity.subject, nonce=identity.nonce, client_secret=client_secret,
+                )
+            except (AppleIdentityError, AppleServiceError) as exc:
+                raise HTTPException(
+                    503, "Apple 권한 해제를 완료하지 못했어요. 다시 인증 후 삭제해주세요"
+                ) from exc
         await session.commit()
         return Response(status_code=204)
