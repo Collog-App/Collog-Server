@@ -228,6 +228,27 @@ async def create_device(
 
 
 # Family
+@router.get("/families", tags=["Family"])
+async def get_families(user: CurrentUser, session: SessionDep) -> dict:
+    membership = select(FamilyMember.family_id).where(FamilyMember.user_id == user.id)
+    owned = Family.created_by == user.id
+    if user.role == UserRole.PARENT:
+        populated = select(FamilyMember.id).where(
+            FamilyMember.family_id == Family.id,
+            FamilyMember.user_id.is_not(None),
+            FamilyMember.user_id != user.id,
+        ).exists()
+        owned = owned & populated
+    rows = await session.execute(
+        select(Family, User.name)
+        .join(User, User.id == Family.created_by)
+        .where(or_(owned, Family.id.in_(membership)))
+        .order_by(Family.created_at, Family.id)
+    )
+    families = [{"familyId": family.id, "name": f"{name}의 가족"} for family, name in rows]
+    return {"families": families}
+
+
 @router.post("/families/{familyId}/invitations", status_code=201, tags=["Family"])
 async def create_invitation(
     family_id: Annotated[str, Path(alias="familyId")],
@@ -557,11 +578,12 @@ async def get_profile(
     await ensure_report_access(session, user, parent_id)
     profile = await session.get(ParentProfile, parent_id)
     if profile is None:
-        return {"parentId": parent_id, "conditions": [], "updatedAt": None}
+        return {"parentId": parent_id, "conditions": [], "updatedAt": None, "isCompleted": False}
     return {
         "parentId": profile.parent_id,
         "conditions": profile.conditions,
         "updatedAt": profile.updated_at,
+        "isCompleted": True,
     }
 
 
@@ -591,6 +613,7 @@ async def put_profile(
         "parentId": profile.parent_id,
         "conditions": profile.conditions,
         "updatedAt": profile.updated_at,
+        "isCompleted": True,
     }
 
 
