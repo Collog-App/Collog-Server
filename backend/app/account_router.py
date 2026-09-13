@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import Field
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 
 from app.models import (
     AcousticAnalysisRun,
@@ -63,12 +63,18 @@ async def lock_account(session: SessionDep, user: User, *, deleting: bool = Fals
     await session.refresh(user)
     busy_states = [CallState.CREATED.value, CallState.RINGING.value, CallState.ACTIVE.value]
     if deleting:
-        busy_states += [CallState.ENDED.value, CallState.PROCESSING.value]
+        busy_states.append(CallState.PROCESSING.value)
+    busy_condition = CallRecord.state.in_(busy_states)
+    if deleting:
+        busy_condition = or_(busy_condition, and_(
+            CallRecord.state == CallState.ENDED.value,
+            or_(CallRecord.recording_enabled.is_(True), CallRecord.ended_at.is_(None)),
+        ))
     busy = await session.scalar(
         select(CallRecord.id)
         .where(
             or_(CallRecord.parent_id == user.id, CallRecord.child_id == user.id),
-            CallRecord.state.in_(busy_states),
+            busy_condition,
         )
         .limit(1)
     )

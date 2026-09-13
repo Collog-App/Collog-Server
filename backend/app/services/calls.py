@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from weakref import WeakValueDictionary
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, update
 
 from app.config import Settings
 from app.database import Database
@@ -106,7 +106,13 @@ class CallLifecycle:
                 return
             if call.ended_at is None:
                 call.ended_at = datetime.now(UTC)
-                call.state = CallState.ENDED.value
+                if call.accepted_at is None:
+                    call.recording_enabled = False
+                    call.recording_disabled_reason = "CALL_NOT_ANSWERED"
+                call.state = (
+                    CallState.ENDED.value
+                    if call.recording_enabled else CallState.ANALYSIS_EXCLUDED.value
+                )
                 started = aware(call.accepted_at or call.started_at)
                 call.duration_sec = (
                     max(0, round((call.ended_at - started).total_seconds()))
@@ -146,6 +152,12 @@ class CallLifecycle:
     async def maintain(self) -> None:
         now = datetime.now(UTC)
         async with self.database.sessions() as session:
+            await session.execute(update(CallRecord).where(
+                CallRecord.state == CallState.ENDED.value,
+                CallRecord.recording_enabled.is_(False),
+                CallRecord.ended_at.is_not(None),
+            ).values(state=CallState.ANALYSIS_EXCLUDED.value, processing_claimed_at=None))
+            await session.commit()
             calls = list(
                 await session.scalars(
                     select(CallRecord)

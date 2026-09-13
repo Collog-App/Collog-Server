@@ -31,7 +31,7 @@ def test_decline_closes_room_and_preserves_zero_duration(client: TestClient) -> 
     declined = client.post(f"/v1/calls/{call_id}/decline", headers=auth(parent_token))
     assert declined.status_code == 200
     result = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
-    assert result["state"] == "ENDED"
+    assert result["state"] == "ANALYSIS_EXCLUDED"
     assert result["durationSec"] == 0
     assert len(closed) == 1
 
@@ -73,7 +73,7 @@ def test_expired_incoming_call_cannot_be_accepted(client: TestClient) -> None:
     assert client.post(f"/v1/calls/{call_id}/accept", headers=auth(parent_token)).status_code == 410
     client.portal.call(container.calls.maintain)
     result = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
-    assert result["state"] == "ENDED"
+    assert result["state"] == "ANALYSIS_EXCLUDED"
 
 
 def test_missing_upload_cannot_be_marked_complete(client: TestClient) -> None:
