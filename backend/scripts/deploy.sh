@@ -56,7 +56,8 @@ container_id=''
 printf 'BACKEND_IMAGE=%s\n' "$image_uri" > "$release/image.env"
 compose "$release" config --quiet
 
-busy_sql="SELECT count(*) FROM calls WHERE state IN ('CREATED','RINGING','ACTIVE','ENDED','PROCESSING');"
+busy_sql="SELECT count(*) FROM calls WHERE state IN ('CREATED','RINGING','ACTIVE','PROCESSING') "
+busy_sql+="OR (state = 'ENDED' AND (recording_enabled OR ended_at IS NULL));"
 if [[ -n "$previous" && -d "$previous" ]]; then
     busy=$(compose "$previous" exec -T postgres psql -U collog -d collog -tAc "$busy_sql")
     [[ "$busy" == 0 ]] || { echo 'Calls or analysis are active, retry deployment later'; exit 1; }

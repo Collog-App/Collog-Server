@@ -107,9 +107,43 @@ jobs:
           import pathlib
           import shlex
 
-          command = shlex.join([
-              "/opt/collog/bin/deploy.sh", os.environ["IMAGE_URI"], os.environ["GITHUB_SHA"]
-          ])
+          bootstrap = r'''
+          set -Eeuo pipefail
+          umask 077
+          source /etc/collog/deploy.conf
+          image_uri=$1
+          revision=$2
+          registry="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]] || exit 1
+          [[ "$image_uri" == "$registry/$ECR_REPOSITORY:$revision" ]] || exit 1
+          temporary=$(mktemp -d /opt/collog/bin/.deploy-update.XXXXXX)
+          export DOCKER_CONFIG="$temporary/docker"
+          container_id=''
+          cleanup() {
+              local status=$?
+              trap - EXIT
+              if [[ -n "$container_id" ]]; then docker rm -f "$container_id" >/dev/null 2>&1 || true; fi
+              rm -rf -- "$temporary"
+              exit "$status"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          aws ecr get-login-password --region "$AWS_REGION" |
+              docker login --username AWS --password-stdin "$registry"
+          docker pull "$image_uri"
+          container_id=$(docker create "$image_uri")
+          docker cp "$container_id:/app/deploy-bundle/deploy.sh" "$temporary/deploy.sh"
+          docker rm "$container_id" >/dev/null
+          container_id=''
+          [[ -s "$temporary/deploy.sh" && ! -L "$temporary/deploy.sh" ]] || exit 1
+          bash -n "$temporary/deploy.sh"
+          install -m 0750 "$temporary/deploy.sh" "$temporary/installed"
+          mv -fT "$temporary/installed" /opt/collog/bin/deploy.sh
+          /opt/collog/bin/deploy.sh "$image_uri" "$revision"
+          '''
+          command = shlex.join(["bash", "-c", bootstrap, "collog-deploy",
+                                os.environ["IMAGE_URI"], os.environ["GITHUB_SHA"]])
           parameters = {"commands": [command], "executionTimeout": ["1200"]}
           pathlib.Path(os.environ["RUNNER_TEMP"], "ssm-parameters.json").write_text(json.dumps(parameters))
           PY
