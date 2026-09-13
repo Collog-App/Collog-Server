@@ -81,6 +81,7 @@ def synthetic_environment(key: Path) -> dict[str, str]:
         LIVEKIT_DOMAIN="rtc.example.invalid",
         ACME_EMAIL="test@example.invalid",
         APNS_KEY_FILE=str(key),
+        APPLE_KEY_FILE=str(key),
         APNS_ENVIRONMENT="sandbox",
         APNS_TEAM_ID="TESTTEAM00",
         APNS_KEY_ID="TESTKEY000",
