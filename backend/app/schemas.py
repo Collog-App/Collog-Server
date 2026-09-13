@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
@@ -115,9 +116,7 @@ class ProfilePut(ApiModel):
 
     @field_validator("conditions")
     @classmethod
-    def conditions_must_not_be_empty(cls, value: list[str]) -> list[str]:
-        if not value:
-            raise ValueError("관리가 필요한 질환을 1개 이상 선택해주세요")
+    def unique_conditions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(value))
 
 
@@ -164,6 +163,10 @@ class CallCreated(ApiModel):
     recording_disabled_message: str | None = None
     questions: list[QuestionView]
     audio_constraints: AudioConstraints
+
+
+class CallAcceptRequest(ApiModel):
+    request_id: UUID
 
 
 class CallAccepted(ApiModel):

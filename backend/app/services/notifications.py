@@ -46,6 +46,7 @@ class IncomingCallPush:
     caller_name: str
     expires_at: datetime
     apns_environment: str | None = None
+    callee_id: str | None = None
 
     def payload(self) -> dict:
         # The push only contains CallKit signaling metadata. LiveKit credentials and
@@ -56,6 +57,7 @@ class IncomingCallPush:
                 "callId": self.call_id,
                 "callUUID": self.call_id,
                 "callerId": self.caller_id,
+                "calleeId": self.callee_id,
                 "callerName": self.caller_name,
                 "expiresAt": self.expires_at.astimezone(UTC).isoformat(),
             },

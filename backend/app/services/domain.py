@@ -30,13 +30,27 @@ async def family_for_parent(session: AsyncSession, parent_id: str) -> Family | N
     return await session.scalar(
         select(Family)
         .join(FamilyMember, FamilyMember.family_id == Family.id)
+        .outerjoin(Invitation, Invitation.member_id == FamilyMember.id)
         .where(FamilyMember.user_id == parent_id)
-        .order_by(FamilyMember.invited_at)
+        .order_by(Invitation.accepted_at.desc().nulls_last(), FamilyMember.invited_at.desc())
         .limit(1)
     )
 
 
 async def family_of(session: AsyncSession, user: User) -> Family | None:
+    if user.role == "PARENT":
+        joined = await family_for_parent(session, user.id)
+        if joined is not None:
+            return joined
+        owned = await family_for_child(session, user.id)
+        if owned is None:
+            return None
+        member = await session.scalar(select(FamilyMember.id).where(
+            FamilyMember.family_id == owned.id,
+            FamilyMember.user_id.is_not(None),
+            FamilyMember.user_id != user.id,
+        ).limit(1))
+        return owned if member is not None else None
     return await family_for_child(session, user.id) or await family_for_parent(session, user.id)
 
 

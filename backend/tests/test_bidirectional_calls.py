@@ -57,7 +57,7 @@ def test_parent_outgoing_call_cannot_be_self_accepted_or_declined(client: TestCl
     assert client.post(f"{path}/accept", headers=auth(parent_token)).status_code == 403
     assert client.post(f"{path}/decline", headers=auth(parent_token)).status_code == 403
     assert client.post(f"{path}/decline", headers=auth(child_token)).status_code == 200
-    assert client.get(path, headers=auth(parent_token)).json()["state"] == "ENDED"
+    assert client.get(path, headers=auth(parent_token)).json()["state"] == "ANALYSIS_EXCLUDED"
 
 
 def test_busy_participants_reject_new_calls_in_both_directions(client: TestClient) -> None:

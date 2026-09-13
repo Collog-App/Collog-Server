@@ -4,6 +4,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
+import httpx
 from sqlalchemy import delete, func, or_, select, update
 
 from app.config import Settings
@@ -47,6 +48,7 @@ class ProcessingPipeline:
             if call is not None:
                 call.state = CallState.ANALYSIS_EXCLUDED.value
                 call.processing_claimed_at = None
+                call.processing_retry_at = None
                 await session.commit()
         await self.purge_call_audio(call_id)
         return False
@@ -98,8 +100,10 @@ class ProcessingPipeline:
             try:
                 async with asyncio.timeout(self.settings.processing_timeout_seconds):
                     await self._process(call_id, claimed_at)
-            except Exception:
+            except Exception as error:
                 logger.exception("call processing failed", extra={"call_id": call_id})
+                if not await self.processing_allowed(call_id):
+                    return
                 async with self.database.sessions() as session:
                     call = await session.get(CallRecord, call_id)
                     if (
@@ -107,11 +111,22 @@ class ProcessingPipeline:
                         and call.processing_claimed_at
                         and aware_datetime(call.processing_claimed_at) == claimed_at
                     ):
-                        call.state = CallState.ANALYSIS_FAILED.value
-                        call.processing_error = "Analysis failed; inspect server logs"
+                        retry = transient_processing_error(error) and call.processing_attempts < 3
+                        call.state = (
+                            CallState.ENDED.value if retry else CallState.ANALYSIS_FAILED.value
+                        )
+                        call.processing_error = (
+                            "Analysis retry pending" if retry else "Analysis failed"
+                        )
+                        call.processing_retry_at = (
+                            datetime.now(UTC)
+                            + timedelta(seconds=30 * 2 ** (call.processing_attempts - 1))
+                            if retry else None
+                        )
                         call.processing_claimed_at = None
                         await session.commit()
-                        await self.purge_call_audio(call_id)
+                        if not retry:
+                            await self.purge_call_audio(call_id)
             finally:
                 self._locks.pop(call_id, None)
 
@@ -128,6 +143,11 @@ class ProcessingPipeline:
             if not call.recording_enabled or call.ended_at is None:
                 return
             if (
+                call.processing_retry_at
+                and aware_datetime(call.processing_retry_at) > datetime.now(UTC)
+            ):
+                return
+            if (
                 not self.settings.mock_external_services
                 and not self.settings.gemini_data_processing_approved
             ) or not await participants_consented(
@@ -142,6 +162,16 @@ class ProcessingPipeline:
                 await session.scalars(select(AudioAsset).where(AudioAsset.call_id == call_id))
             ).all()
             now = datetime.now(UTC)
+            if call.processing_attempts >= 3 or any(
+                now - aware_datetime(asset.uploaded_at or asset.created_at) >= timedelta(hours=24)
+                for asset in assets
+            ):
+                call.state = CallState.ANALYSIS_FAILED.value
+                call.processing_error = "Analysis retry limit or audio retention limit reached"
+                call.processing_retry_at = None
+                await session.commit()
+                await self.purge_call_audio(call_id)
+                return
             elapsed = (now - aware_datetime(call.ended_at)).total_seconds()
             for asset in assets:
                 if asset.status != AssetStatus.PENDING.value:
@@ -238,7 +268,13 @@ class ProcessingPipeline:
                         ]
                     ),
                 )
-                .values(state=CallState.PROCESSING.value, processing_claimed_at=claimed_at)
+                .values(
+                    state=CallState.PROCESSING.value,
+                    processing_claimed_at=claimed_at,
+                    processing_attempts=CallRecord.processing_attempts + 1,
+                    processing_retry_at=None,
+                    processing_error=None,
+                )
             )
             if claimed.rowcount == 0:
                 return
@@ -291,6 +327,8 @@ class ProcessingPipeline:
         provider = parent_stt.provider
         excluded = parent_speech_sec < self.settings.parent_min_speech_seconds
 
+        if not await self.processing_allowed(call_id):
+            return
         async with self.database.sessions() as session:
             call = await session.get(CallRecord, call_id)
             if call is None:
@@ -371,6 +409,8 @@ class ProcessingPipeline:
             )
         )
 
+        if not await self.processing_allowed(call_id):
+            return
         async with self.database.sessions() as session:
             extraction = await session.scalar(
                 select(HealthExtraction).where(HealthExtraction.call_id == call_id)
@@ -443,7 +483,8 @@ class ProcessingPipeline:
             ).all()
             for asset in assets:
                 if asset.status == AssetStatus.PURGED.value:
-                    continue
+                    if not await self.storage.exists(asset.uri):
+                        continue
                 try:
                     await self.storage.delete(asset.uri)
                 except Exception:
@@ -464,6 +505,17 @@ class ProcessingPipeline:
         # 약속은 그대로면서 아직 분석 못 한 오디오를 먼저 지우는 일이 없다.
         cutoff = datetime.now(UTC) - timedelta(hours=24)
         async with self.database.sessions() as session:
+            disabled_call_ids = list(
+                await session.scalars(
+                    select(AudioAsset.call_id)
+                    .join(CallRecord, CallRecord.id == AudioAsset.call_id)
+                    .where(
+                        CallRecord.recording_enabled.is_(False),
+                        func.coalesce(AudioAsset.uploaded_at, AudioAsset.created_at) >= cutoff,
+                    )
+                    .distinct()
+                )
+            )
             call_ids = list(
                 await session.scalars(
                     select(AudioAsset.call_id)
@@ -474,7 +526,24 @@ class ProcessingPipeline:
                     .distinct()
                 )
             )
+        for call_id in disabled_call_ids:
+            await self.purge_call_audio(call_id)
         for call_id in call_ids:
+            async with self.database.sessions() as session:
+                await session.execute(
+                    update(CallRecord)
+                    .where(
+                        CallRecord.id == call_id,
+                        CallRecord.state.in_([CallState.ENDED.value, CallState.PROCESSING.value]),
+                    )
+                    .values(
+                        state=CallState.ANALYSIS_FAILED.value,
+                        processing_error="Audio retention limit reached",
+                        processing_claimed_at=None,
+                        processing_retry_at=None,
+                    )
+                )
+                await session.commit()
             await self.purge_call_audio(call_id)
         return len(call_ids)
 
@@ -520,3 +589,11 @@ class ProcessingPipeline:
 
 def aware_datetime(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def transient_processing_error(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, httpx.TransportError)):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in {408, 429} or error.response.status_code >= 500
+    return error.__cause__ is not None and transient_processing_error(error.__cause__)
