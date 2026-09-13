@@ -16,6 +16,8 @@ COPY app ./app
 COPY scripts ./scripts
 COPY alembic ./alembic
 COPY alembic.ini ./
+COPY docker-compose.yml /app/deploy-bundle/docker-compose.yml
+COPY deploy/Caddyfile /app/deploy-bundle/deploy/Caddyfile
 RUN uv sync --locked --no-dev
 RUN mkdir -p /app/.data/audio && chown -R collog:collog /app/.data
 ENV PATH="/app/.venv/bin:$PATH"

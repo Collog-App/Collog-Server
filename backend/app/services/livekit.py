@@ -139,8 +139,8 @@ class RealLiveKitGateway(LiveKitGateway):
 
     def _s3_upload(self) -> api.S3Upload:
         return api.S3Upload(
-            access_key=self.settings.s3_access_key_id,
-            secret=self.settings.s3_secret_access_key,
+            access_key="" if self.settings.s3_use_instance_role else self.settings.s3_access_key_id,
+            secret="" if self.settings.s3_use_instance_role else self.settings.s3_secret_access_key,
             region=self.settings.s3_region,
             endpoint=self.settings.s3_endpoint_url or "",
             bucket=self.settings.s3_bucket,

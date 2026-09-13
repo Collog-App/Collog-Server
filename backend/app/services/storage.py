@@ -131,22 +131,25 @@ class S3Storage(StorageGateway):
         if not self.bucket:
             raise StorageError("STORAGE_BACKEND=s3일 때 S3_BUCKET이 필요합니다")
         boto_config = Config(
+            signature_version="s3v4",
             s3={"addressing_style": "path" if settings.s3_force_path_style else "auto"}
         )
+        access_key = None if settings.s3_use_instance_role else settings.s3_access_key_id
+        secret_key = None if settings.s3_use_instance_role else settings.s3_secret_access_key
         self.client = boto3.client(
             "s3",
             endpoint_url=settings.s3_endpoint_url,
             region_name=settings.s3_region,
-            aws_access_key_id=settings.s3_access_key_id,
-            aws_secret_access_key=settings.s3_secret_access_key,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
             config=boto_config,
         )
         self.presign_client = boto3.client(
             "s3",
             endpoint_url=settings.s3_public_endpoint_url or settings.s3_endpoint_url,
             region_name=settings.s3_region,
-            aws_access_key_id=settings.s3_access_key_id,
-            aws_secret_access_key=settings.s3_secret_access_key,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
             config=boto_config,
         )
 
