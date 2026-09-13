@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     s3_bucket: str = ""
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
+    s3_use_instance_role: bool = False
     s3_force_path_style: bool = True
 
     consent_document_version: str = "2026-08-01.v3"
@@ -155,6 +156,10 @@ class Settings(BaseSettings):
             self.local_storage_path.mkdir(parents=True, exist_ok=True)
 
     def validate_runtime(self) -> None:
+        if self.s3_use_instance_role and (
+            self.storage_backend != "s3" or self.s3_access_key_id or self.s3_secret_access_key
+        ):
+            raise ValueError("S3_USE_INSTANCE_ROLE requires S3 storage without static S3 keys")
         if self.processing_lease_seconds <= self.processing_timeout_seconds:
             raise ValueError("PROCESSING_LEASE_SECONDS must exceed PROCESSING_TIMEOUT_SECONDS")
         if self.app_env != "production":
@@ -178,14 +183,15 @@ class Settings(BaseSettings):
             "LIVEKIT_API_KEY": self.livekit_api_key,
             "LIVEKIT_API_SECRET": self.livekit_api_secret,
             "S3_BUCKET": self.s3_bucket,
-            "S3_ACCESS_KEY_ID": self.s3_access_key_id,
-            "S3_SECRET_ACCESS_KEY": self.s3_secret_access_key,
             "DEEPGRAM_API_KEY": self.deepgram_api_key,
             "GEMINI_API_KEY": self.gemini_api_key,
             "APNS_TEAM_ID": self.apns_team_id,
             "APNS_KEY_ID": self.apns_key_id,
             "APNS_BUNDLE_ID": self.apns_bundle_id,
         }
+        if not self.s3_use_instance_role:
+            required["S3_ACCESS_KEY_ID"] = self.s3_access_key_id
+            required["S3_SECRET_ACCESS_KEY"] = self.s3_secret_access_key
         if self.apple_login_enabled:
             required["APPLE_CLIENT_ID"] = self.apple_client_id
         sms_settings = {
@@ -198,11 +204,10 @@ class Settings(BaseSettings):
         missing = [key for key, value in required.items() if not value.strip()]
         if missing:
             raise ValueError(f"Missing production settings: {', '.join(missing)}")
-        for name, value in (
-            ("JWT_SECRET", self.jwt_secret),
-            ("LIVEKIT_API_SECRET", self.livekit_api_secret),
-            ("S3_SECRET_ACCESS_KEY", self.s3_secret_access_key),
-        ):
+        secrets = {"JWT_SECRET": self.jwt_secret, "LIVEKIT_API_SECRET": self.livekit_api_secret}
+        if not self.s3_use_instance_role:
+            secrets["S3_SECRET_ACCESS_KEY"] = self.s3_secret_access_key
+        for name, value in secrets.items():
             if len(value) < 32 or any(
                 word in value.lower() for word in ("development", "local", "change")
             ):

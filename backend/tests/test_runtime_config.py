@@ -79,3 +79,23 @@ def test_enabled_apple_login_requires_client_id(production: Settings) -> None:
     production.apple_client_id = ""
     with pytest.raises(ValueError, match="APPLE_CLIENT_ID"):
         production.validate_runtime()
+
+
+def test_production_accepts_instance_role_without_static_keys(production: Settings) -> None:
+    production.s3_use_instance_role = True
+    production.s3_access_key_id = ""
+    production.s3_secret_access_key = ""
+    production.validate_runtime()
+
+
+def test_production_requires_explicit_instance_role_mode(production: Settings) -> None:
+    production.s3_access_key_id = ""
+    production.s3_secret_access_key = ""
+    with pytest.raises(ValueError, match="S3_ACCESS_KEY_ID"):
+        production.validate_runtime()
+
+
+def test_instance_role_refuses_static_keys(production: Settings) -> None:
+    production.s3_use_instance_role = True
+    with pytest.raises(ValueError, match="without static S3 keys"):
+        production.validate_runtime()
