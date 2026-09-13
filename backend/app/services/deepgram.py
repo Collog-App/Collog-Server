@@ -87,6 +87,7 @@ class DeepgramSttGateway(SttGateway):
             "punctuate": True,
             "utterances": True,
             "filler_words": True,
+            "mip_opt_out": True,
         }
         headers = {
             "Authorization": f"Token {self.settings.deepgram_api_key}",

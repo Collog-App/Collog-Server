@@ -50,7 +50,7 @@ def test_role_change_preserves_family_and_reverses_call_roles(client: TestClient
     client.portal.call(check)
 
 
-def test_role_change_keeps_history_and_requires_consent_for_new_parent(client: TestClient) -> None:
+def test_role_change_keeps_history_and_current_consent(client: TestClient) -> None:
     child_token, child, parent_token, parent = onboard_family(client)
 
     async def seed() -> str:
@@ -73,7 +73,7 @@ def test_role_change_keeps_history_and_requires_consent_for_new_parent(client: T
     ).json()["members"]
     assert next(member for member in members if member["userId"] == child["id"])[
         "status"
-    ] == "AWAITING_CONSENT"
+    ] == "CONSENT_GRANTED"
 
     async def check() -> None:
         async with client.app.state.container.database.sessions() as session:

@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.consent import CONSENT_ITEMS, CONSENT_VERSION
 from app.models import (
     ConsentDecision,
     ConsentRecord,
@@ -48,9 +49,26 @@ async def latest_consent(session: AsyncSession, parent_id: str) -> ConsentRecord
     )
 
 
-async def has_consent(session: AsyncSession, parent_id: str) -> bool:
+def consent_is_current(record: ConsentRecord | None, version: str = CONSENT_VERSION) -> bool:
+    return record is not None and record.document_version == version and (
+        record.decision == ConsentDecision.DENIED.value
+        or set(CONSENT_ITEMS).issubset(record.agreed_items)
+    )
+
+
+async def has_consent(
+    session: AsyncSession, parent_id: str, version: str = CONSENT_VERSION
+) -> bool:
     record = await latest_consent(session, parent_id)
-    return record is not None and record.decision == ConsentDecision.GRANTED.value
+    return consent_is_current(record, version) and record.decision == ConsentDecision.GRANTED.value
+
+
+async def participants_consented(
+    session: AsyncSession, parent_id: str, child_id: str, version: str = CONSENT_VERSION
+) -> bool:
+    return await has_consent(session, parent_id, version) and await has_consent(
+        session, child_id, version
+    )
 
 
 async def latest_invitation(session: AsyncSession, member_id: str) -> Invitation | None:
@@ -63,11 +81,12 @@ async def latest_invitation(session: AsyncSession, member_id: str) -> Invitation
 
 
 async def derived_member_status(
-    session: AsyncSession, member: FamilyMember, invitation: Invitation | None = None
+    session: AsyncSession, member: FamilyMember, invitation: Invitation | None = None,
+    version: str = CONSENT_VERSION,
 ) -> str:
     if member.user_id:
         consent = await latest_consent(session, member.user_id)
-        if consent:
+        if consent_is_current(consent, version):
             return "CONSENT_GRANTED" if consent.decision == "GRANTED" else "CONSENT_DENIED"
         return "AWAITING_CONSENT"
     invitation = invitation or await latest_invitation(session, member.id)
