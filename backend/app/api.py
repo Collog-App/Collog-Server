@@ -51,6 +51,7 @@ from app.models import (
 from app.schemas import (
     AudioConstraints,
     CallAccepted,
+    CallAcceptRequest,
     CallCreate,
     CallCreated,
     ConsentSubmit,
@@ -112,6 +113,12 @@ def call_to_dict(call: CallRecord) -> dict:
         "durationSec": call.duration_sec,
         "recorded": call.recording_enabled,
         "recordingEnabled": call.recording_enabled,
+        "recordingDisabledReason": call.recording_disabled_reason,
+        "recordingDisabledMessage": (
+            "녹음이 중단되어 이번 통화는 분석하지 않아요"
+            if call.recording_disabled_reason == "RECORDING_INTERRUPTED"
+            else "녹음과 AI 분석 없이 통화해요" if not call.recording_enabled else None
+        ),
         "parentSpeechSec": call.parent_speech_sec,
         "askedQuestionIds": call.asked_question_ids,
         "rawAudioPurgedAt": call.raw_audio_purged_at,
@@ -743,21 +750,21 @@ async def create_reserved_call(
     await session.commit()
     delivered = False
     for device in devices:
-        delivered = await deliver_incoming_call_push(
+        device_delivered = await deliver_incoming_call_push(
             request.app.state.container.voip_push,
             device,
             IncomingCallPush(
                 call_id=call.id,
                 caller_id=user.id,
                 caller_name=user.name,
+                callee_id=callee.id,
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings_from(request).incoming_call_ttl_seconds),
                 apns_environment=device.apns_environment,
             ),
             request.app.state.container,
         )
-        if delivered:
-            break
+        delivered = delivered or device_delivered
     if not delivered and (devices or not settings_from(request).mock_external_services):
         await request.app.state.container.calls.finish(call.id)
         raise HTTPException(
@@ -854,6 +861,7 @@ async def accept_call(
     background: BackgroundTasks,
     user: CurrentUser,
     session: SessionDep,
+    payload: CallAcceptRequest | None = None,
 ) -> dict:
     call = await session.scalar(
         select(CallRecord).where(CallRecord.id == call_id).with_for_update()
@@ -862,6 +870,21 @@ async def accept_call(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     if call.callee_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "수신 권한이 없습니다")
+    request_id = str(payload.request_id) if payload else None
+    if (
+        call.state == CallState.ACTIVE.value and call.ended_at is None
+        and request_id is not None and call.accepted_request_id == request_id
+    ):
+        livekit = request.app.state.container.livekit
+        return CallAccepted(
+            call_id=call.id,
+            recording_enabled=call.recording_enabled,
+            livekit_url=settings_from(request).livekit_url,
+            room_name=call.room_name,
+            access_token=livekit.participant_token(call.room_name, user.id, user.name),
+            raw_capture_required=call.recording_enabled and user.id == call.parent_id,
+            audio_constraints=AudioConstraints(),
+        ).model_dump(by_alias=True)
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
     settings = settings_from(request)
@@ -877,8 +900,18 @@ async def accept_call(
     if not settings.mock_external_services and not settings.gemini_data_processing_approved:
         call.recording_enabled = False
         call.recording_disabled_reason = "PROVIDER_PRIVACY_PENDING"
-    call.state = CallState.ACTIVE.value
-    call.accepted_at = datetime.now(UTC)
+    accepted_at = datetime.now(UTC)
+    claimed = await session.execute(
+        update(CallRecord).where(
+            CallRecord.id == call_id,
+            CallRecord.state.in_([CallState.CREATED.value, CallState.RINGING.value]),
+            CallRecord.ended_at.is_(None),
+        ).values(
+            state=CallState.ACTIVE.value, accepted_at=accepted_at, accepted_request_id=request_id
+        )
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
     settings = settings_from(request)
     livekit = request.app.state.container.livekit
     token = livekit.participant_token(call.room_name, user.id, user.name)
@@ -925,7 +958,22 @@ async def decline_call(
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 처리된 통화입니다")
     if user.id != call.callee_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "수신자만 거절할 수 있습니다")
-    await session.rollback()
+    declined = await session.execute(
+        update(CallRecord).where(
+            CallRecord.id == call_id,
+            CallRecord.state.in_([CallState.CREATED.value, CallState.RINGING.value]),
+            CallRecord.ended_at.is_(None),
+        ).values(
+            state=CallState.ANALYSIS_EXCLUDED.value,
+            ended_at=datetime.now(UTC),
+            duration_sec=0,
+            recording_enabled=False,
+            recording_disabled_reason="CALL_NOT_ANSWERED",
+        )
+    )
+    if declined.rowcount != 1:
+        raise HTTPException(status.HTTP_409_CONFLICT, "이미 처리된 통화입니다")
+    await session.commit()
     await request.app.state.container.calls.finish(call_id)
     return {"status": "DECLINED"}
 
@@ -957,7 +1005,9 @@ async def raw_audio_upload_url(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    call = await session.get(CallRecord, call_id)
+    call = await session.scalar(
+        select(CallRecord).where(CallRecord.id == call_id).with_for_update()
+    )
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     if user.id != call.parent_id or not call.recording_enabled:
@@ -968,6 +1018,25 @@ async def raw_audio_upload_url(
         settings_from(request).upload_url_ttl_seconds
     ):
         raise HTTPException(status.HTTP_410_GONE, "오디오 업로드 시간이 지났습니다")
+    existing = await session.scalar(select(AudioAsset).where(
+        AudioAsset.call_id == call.id,
+        AudioAsset.kind == AssetKind.DEVICE_RAW.value,
+        AudioAsset.status == AssetStatus.PENDING.value,
+        AudioAsset.created_at >= datetime.now(UTC) - timedelta(
+            seconds=settings_from(request).upload_url_ttl_seconds
+        ),
+    ).order_by(AudioAsset.created_at.desc()).limit(1))
+    if existing is not None:
+        upload_url = await request.app.state.container.storage.create_upload_url(
+            request.app.state.container.storage.object_key(existing.uri), existing.content_type
+        )
+        return {
+            "uploadUrl": upload_url,
+            "assetId": existing.id,
+            "expiresIn": max(0, settings_from(request).upload_url_ttl_seconds - int(
+                (datetime.now(UTC) - aware(existing.created_at)).total_seconds()
+            )),
+        }
     key = f"calls/{call.id}/raw/parent-{random.randrange(10**10):010d}.wav"
     asset = AudioAsset(
         call_id=call.id,
@@ -1040,12 +1109,18 @@ async def raw_audio_complete(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    call = await session.get(CallRecord, call_id)
+    call = await session.scalar(
+        select(CallRecord).where(CallRecord.id == call_id).with_for_update()
+    )
     asset = await session.get(AudioAsset, payload.asset_id)
     if call is None or asset is None or asset.call_id != call.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "오디오 자산을 찾을 수 없습니다")
     if user.id != call.parent_id or asset.kind != AssetKind.DEVICE_RAW.value:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "오디오 자산 접근 권한이 없습니다")
+    if not call.recording_enabled:
+        await session.rollback()
+        await request.app.state.container.pipeline.purge_call_audio(call_id)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "이번 통화의 녹음과 분석이 중단되었습니다")
     if asset.uploaded_at is not None and asset.status in {
         AssetStatus.UPLOADED.value,
         AssetStatus.PURGED.value,
@@ -1315,6 +1390,21 @@ async def livekit_webhook(
         return Response(status_code=204)
     asset = await session.scalar(select(AudioAsset).where(AudioAsset.egress_id == egress_id))
     if asset is None:
+        return Response(status_code=204)
+    call = await session.scalar(
+        select(CallRecord).where(CallRecord.id == asset.call_id).with_for_update()
+    )
+    if call is None:
+        return Response(status_code=204)
+    if call.state == CallState.ACTIVE.value and call.recording_enabled:
+        call.recording_enabled = False
+        call.recording_disabled_reason = "RECORDING_INTERRUPTED"
+    if not call.recording_enabled:
+        asset.status = AssetStatus.UPLOADED.value
+        asset.uploaded_at = datetime.now(UTC)
+        await session.commit()
+        background.add_task(request.app.state.container.calls.stop_recordings, call.id)
+        background.add_task(request.app.state.container.pipeline.purge_call_audio, call.id)
         return Response(status_code=204)
     if asset.status in {AssetStatus.UPLOADED.value, AssetStatus.PURGED.value}:
         return Response(status_code=204)

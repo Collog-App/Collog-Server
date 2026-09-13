@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
@@ -162,6 +163,10 @@ class CallCreated(ApiModel):
     recording_disabled_message: str | None = None
     questions: list[QuestionView]
     audio_constraints: AudioConstraints
+
+
+class CallAcceptRequest(ApiModel):
+    request_id: UUID
 
 
 class CallAccepted(ApiModel):
