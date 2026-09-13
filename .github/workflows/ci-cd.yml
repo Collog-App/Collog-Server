@@ -62,14 +62,15 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
       EC2_INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+      AWS_DEPLOY_ROLE_ARN: >-
+        ${{ vars.AWS_DEPLOY_ROLE_ARN ||
+        'arn:aws:iam::534545247934:role/collog-cicd-DeployRole-K8z6jdWHMNw5' }}
       AWS_PAGER: ""
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Validate deployment settings
-        env:
-          AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
         run: |
           latest=$(git ls-remote origin refs/heads/main | cut -f1)
           [[ "$latest" == "$GITHUB_SHA" ]] || { echo "A newer main commit exists, deploy that revision"; exit 1; }
@@ -79,7 +80,7 @@ jobs:
           [[ "$AWS_DEPLOY_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/[^[:space:]]+$ ]]
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: collog-github-deploy
       - name: Build and publish immutable image

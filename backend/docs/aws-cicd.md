@@ -26,7 +26,10 @@ Set repository Actions variables using the stack outputs.
 | `AWS_REGION` | `ap-northeast-2` |
 | `ECR_REPOSITORY` | `collog-server` |
 | `EC2_INSTANCE_ID` | `i-0c3ec9275c7d3aa53` |
-| `AWS_DEPLOY_ROLE_ARN` | Stack output `DeployRoleArn` |
+| `AWS_DEPLOY_ROLE_ARN` | Optional override using stack output `DeployRoleArn` |
+
+The workflow defaults to the role from the initial stack setup. If that stack is recreated,
+set `AWS_DEPLOY_ROLE_ARN` to its new output or update the workflow default.
 
 ## EC2 setup
 
