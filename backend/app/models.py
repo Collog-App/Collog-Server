@@ -202,6 +202,7 @@ class CallRecord(Base):
     recording_disabled_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_request_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     time_slot: Mapped[str | None] = mapped_column(String(32), nullable=True)
     duration_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -211,6 +212,10 @@ class CallRecord(Base):
         DateTime(timezone=True), nullable=True
     )
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    processing_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    processing_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     processing_claimed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -253,6 +258,7 @@ class AudioAsset(Base):
     sample_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default=AssetStatus.PENDING.value)
     egress_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    track_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
