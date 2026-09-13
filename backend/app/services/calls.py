@@ -36,6 +36,7 @@ class CallLifecycle:
         self.livekit = livekit
         self.storage = storage
         self._participant_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
+        self._missing_peer_since: dict[str, datetime] = {}
 
     @asynccontextmanager
     async def reserve_participants(self, user_ids: list[str]) -> AsyncIterator[None]:
@@ -73,8 +74,6 @@ class CallLifecycle:
                     select(AudioAsset).where(
                         AudioAsset.call_id == call_id,
                         AudioAsset.kind != AssetKind.DEVICE_RAW.value,
-                        AudioAsset.egress_id.is_(None),
-                        AudioAsset.status == AssetStatus.PENDING.value,
                     )
                 )
             )
@@ -88,14 +87,38 @@ class CallLifecycle:
                     track_id = (tracks or {}).get(identity)
                     if track_id is None:
                         track_id = await self.livekit.find_audio_track_id(call.room_name, identity)
+                    if asset.egress_id is not None:
+                        if track_id and asset.track_id and track_id != asset.track_id:
+                            call.recording_enabled = False
+                            call.recording_disabled_reason = "RECORDING_INTERRUPTED"
+                            await session.commit()
+                            await self.stop_recordings(call_id)
+                            return
+                        continue
+                    if asset.status != AssetStatus.PENDING.value:
+                        continue
                     if track_id:
                         started = await self.livekit.start_track_egress(
                             call.room_name, track_id, self.storage.object_key(asset.uri)
                         )
                         asset.egress_id = started.egress_id
+                        asset.track_id = track_id
                 except LiveKitError:
                     logger.exception("Recording startup will retry", extra={"call_id": call_id})
             await session.commit()
+
+    async def stop_recordings(self, call_id: str) -> None:
+        async with self.database.sessions() as session:
+            egress_ids = list(await session.scalars(select(AudioAsset.egress_id).where(
+                AudioAsset.call_id == call_id,
+                AudioAsset.egress_id.is_not(None),
+                AudioAsset.uploaded_at.is_(None),
+            )))
+        for egress_id in egress_ids:
+            try:
+                await self.livekit.stop_egress(egress_id)
+            except LiveKitError:
+                logger.exception("Recording stop will retry", extra={"call_id": call_id})
 
     async def finish(self, call_id: str) -> None:
         async with self.database.sessions() as session:
@@ -205,3 +228,33 @@ class CallLifecycle:
             )
         for call_id in recording_ids:
             await self.start_recordings(call_id)
+        async with self.database.sessions() as session:
+            disabled_ids = list(await session.scalars(select(CallRecord.id).where(
+                CallRecord.state == CallState.ACTIVE.value,
+                CallRecord.recording_enabled.is_(False),
+            ).limit(100)))
+        for call_id in disabled_ids:
+            await self.stop_recordings(call_id)
+        async with self.database.sessions() as session:
+            active_calls = list(await session.scalars(select(CallRecord).where(
+                CallRecord.state == CallState.ACTIVE.value,
+                CallRecord.ended_at.is_(None),
+            )))
+        active_ids = {call.id for call in active_calls}
+        self._missing_peer_since = {
+            call_id: since for call_id, since in self._missing_peer_since.items()
+            if call_id in active_ids
+        }
+        for call in active_calls:
+            try:
+                identities = await self.livekit.participant_identities(call.room_name)
+            except LiveKitError:
+                self._missing_peer_since.pop(call.id, None)
+                continue
+            if identities is None or {call.parent_id, call.child_id} <= identities:
+                self._missing_peer_since.pop(call.id, None)
+                continue
+            missing_since = self._missing_peer_since.setdefault(call.id, now)
+            if now - missing_since >= timedelta(seconds=60):
+                await self.finish(call.id)
+                self._missing_peer_since.pop(call.id, None)

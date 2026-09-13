@@ -22,6 +22,9 @@ class EgressStarted:
 
 
 class LiveKitGateway:
+    async def participant_identities(self, room_name: str) -> set[str] | None:
+        raise NotImplementedError
+
     async def create_room(self, room_name: str) -> None:
         raise NotImplementedError
 
@@ -47,6 +50,9 @@ class LiveKitGateway:
 
 
 class MockLiveKitGateway(LiveKitGateway):
+    async def participant_identities(self, room_name: str) -> set[str] | None:
+        return None
+
     async def create_room(self, room_name: str) -> None:
         del room_name
 
@@ -91,6 +97,18 @@ class RealLiveKitGateway(LiveKitGateway):
             self.settings.livekit_api_key,
             self.settings.livekit_api_secret,
         )
+
+    async def participant_identities(self, room_name: str) -> set[str] | None:
+        client = self._client()
+        try:
+            response = await client.room.list_participants(
+                api.ListParticipantsRequest(room=room_name)
+            )
+            return {participant.identity for participant in response.participants}
+        except Exception as exc:
+            raise LiveKitError("LiveKit participant lookup failed") from exc
+        finally:
+            await client.aclose()
 
     async def create_room(self, room_name: str) -> None:
         client = self._client()
