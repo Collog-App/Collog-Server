@@ -166,7 +166,11 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
   Google Cloud에 Web OAuth 클라이언트(이 값)와 Android OAuth 클라이언트(패키지 이름·서명
   SHA-1)를 같은 프로젝트에 만들어야 한다. 같은 사람이 iOS(Apple)와 Android(Google)로
   가입하면 계정이 따로 생기며 병합하지 않는다. Google 계정 삭제는 OTP 계정처럼 재인증 없이
-  진행한다. Android 앱의 수신 통화(FCM)는 아직 서버에 없다.
+  진행한다.
+- **Android 통화·리포트 알림은 `FCM_SERVICE_ACCOUNT_PATH`를 설정해야 나간다.** Firebase 서비스
+  계정 키 JSON을 컨테이너에 읽기 전용으로 넣고 그 경로를 준다. 값이 비면 Android 기기가 받을 통화는
+  APNs와 같은 규칙으로 502가 된다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
+  `token`·`voipToken`·`pushToken`에 같이 등록한다.
 - **새 피그마와 현재 백엔드의 건강 주체 모델이 다르다.** 현재 API는 자녀 발신·부모 분석,
   부모 질환 코드 배열에 고정돼 있다. 부모/자녀 양방향 통화와 양 참여자 동시 분석,
   복용약·걱정·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 완료됐다.
@@ -303,6 +307,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | 파일 | 역할 |
 |---|---|
 | `services/livekit.py` | self-host LiveKit room/token/audio-track 조회/Track Egress/webhook adapter와 mock |
+| `services/fcm.py` | Android FCM HTTP v1 발송. 서비스 계정 JWT로 OAuth 토큰 발급·재사용, 수신 통화·리포트 데이터 메시지, 만료 토큰 판정 |
 | `services/google_auth.py` | Google ID 토큰 JWKS 검증(iss 두 값, aud=Web client ID, nonce), 키 cache·실패 backoff |
 | `services/notifications.py` | APNs ES256 provider JWT와 HTTP/2 VoIP push, mock/disabled adapter |
 | `services/storage.py` | 로컬/S3 저장, presigned upload/download, TTS write/cache/read/delete |
@@ -561,6 +566,7 @@ Compose는 ignored `backend/private/`를 `/run/secrets/collog`에 read-only moun
 | `HF_TOKEN` | Hugging Face 계정에서 HAI-DEF 약관 수락 후 발급 | HeAR detector artifact를 처음 받을 때만 필요 | gated model download. 앱/런타임 API key가 아니며 Git에 넣지 않음 |
 | `LIVEKIT_API_KEY/SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | self-hosted room token, server API, Egress, webhook 서명 |
 | `JWT_SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | 콜록 사용자 인증 JWT |
+| `FCM_SERVICE_ACCOUNT_PATH` | Firebase Console 프로젝트 설정의 서비스 계정 키(JSON) | Android 통화 수신 시 필수 | FCM 발송. 비밀값이며 Git에 넣지 않음 |
 | `GOOGLE_CLIENT_ID` | Google Cloud Console의 Web OAuth 클라이언트 ID | Android Google 로그인 시 필수 | ID 토큰 `aud` 검증. 비밀값 아님 |
 | APNs `.p8`/Key ID/Team ID/Bundle ID | Apple Developer 발급·확인 | 실기기 백그라운드 수신 시 필수 | PushKit VoIP push |
 | MinIO access key/secret | 우리가 직접 생성 | Egress 녹음 시 필수 | self-hosted S3 호환 오디오 저장 |
@@ -927,3 +933,5 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
   동기 함수로 분리했다. 브랜치를 머지할 때 `ruff`를 다시 돌려야 한다.
 - 2026-10-24: Android 포팅을 위해 Google 로그인 엔드포인트, `google_subject` 컬럼과
   `google_login_challenges` 테이블(migration 0011), 검증기·라우트 테스트 40개를 추가했다.
+- 2026-10-24: Android 기기로 수신 통화·리포트 알림을 FCM HTTP v1으로 보내는 발송기와 플랫폼별 발송
+  분기, 테스트 12개를 추가했다.

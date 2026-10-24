@@ -129,7 +129,7 @@ async def create_reserved_call(
         select(Device)
         .where(
             Device.user_id == callee.id,
-            Device.platform == "IOS",
+            Device.platform.in_(["IOS", "ANDROID"]),
             Device.voip_token.is_not(None),
             Device.call_notifications_enabled.is_(True),
         )
@@ -138,8 +138,9 @@ async def create_reserved_call(
     await session.commit()
     delivered = False
     for device in devices:
+        container = request.app.state.container
         device_delivered = await deliver_incoming_call_push(
-            request.app.state.container.voip_push,
+            container.android_voip_push if device.platform == "ANDROID" else container.voip_push,
             device,
             IncomingCallPush(
                 call_id=call.id,

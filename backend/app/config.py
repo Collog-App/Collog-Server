@@ -55,6 +55,9 @@ class Settings(BaseSettings):
     apns_key_id: str = ""
     apns_bundle_id: str = ""
     apns_private_key_path: Path | None = None
+    # Android 통화·리포트 알림(FCM HTTP v1). Firebase 서비스 계정 키 JSON 경로이며,
+    # 비워두면 Android 기기로는 보내지 않는다.
+    fcm_service_account_path: Path | None = None
     incoming_call_ttl_seconds: int = 45
 
     # Track Egress worker가 없는 개발 환경에서 기기의 분석용 PCM만으로 파이프라인을 돌린다.

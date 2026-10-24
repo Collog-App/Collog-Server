@@ -20,9 +20,15 @@ logger = logging.getLogger(__name__)
 
 
 class ReportNotifications:
-    def __init__(self, database: Database, gateway: ReportPushGateway) -> None:
+    def __init__(
+        self,
+        database: Database,
+        gateway: ReportPushGateway,
+        android_gateway: ReportPushGateway | None = None,
+    ) -> None:
         self.database = database
         self.gateway = gateway
+        self.android_gateway = android_gateway
         self._lock = asyncio.Lock()
 
     async def notify(self, call_id: str) -> None:
@@ -49,7 +55,9 @@ class ReportNotifications:
                 select(Device)
                 .where(
                     Device.user_id.in_([call.parent_id, call.child_id]),
-                    Device.platform == "IOS",
+                    Device.platform.in_(
+                        ["IOS", "ANDROID"] if self.android_gateway is not None else ["IOS"]
+                    ),
                     Device.report_notifications_enabled.is_(True),
                     Device.push_token.is_not(None),
                     Device.push_token != "",
@@ -67,7 +75,12 @@ class ReportNotifications:
                         device.apns_environment = delivered[token]
                     continue
                 try:
-                    environment = await self.gateway.send_report(
+                    gateway = (
+                        self.android_gateway
+                        if device.platform == "ANDROID" and self.android_gateway is not None
+                        else self.gateway
+                    )
+                    environment = await gateway.send_report(
                         token, replace(push, apns_environment=device.apns_environment)
                     )
                     if environment:
