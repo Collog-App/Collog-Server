@@ -18,7 +18,6 @@ from app.services.notifications import (
     PushNotificationError,
     ReportPushGateway,
     ReportReadyPush,
-    UnavailableReportPushGateway,
     UnregisteredPushToken,
     UnregisteredVoipToken,
     VoipPushGateway,
@@ -64,6 +63,8 @@ class FcmClient:
         self._private_key: str = credentials["private_key"]
         self._key_id: str | None = credentials.get("private_key_id")
         self._token_uri: str = credentials.get("token_uri") or DEFAULT_TOKEN_URI
+        if self._token_uri != DEFAULT_TOKEN_URI:
+            raise PushNotificationError("FCM 서비스 계정 키의 token_uri가 Google 기본값이 아닙니다")
         self._client = client or httpx.AsyncClient(timeout=10)
         self._owns_client = client is None
         self._clock = clock
@@ -116,7 +117,9 @@ class FcmClient:
             self._expires_at = now + expires_in
             return token
 
-    async def send(self, token: str, data: dict[str, str], ttl_seconds: int) -> None:
+    async def send(
+        self, token: str, data: dict[str, str], ttl_seconds: int, collapse_key: str | None = None
+    ) -> None:
         if not token:
             raise FcmUnregistered("FCM 토큰이 비어 있습니다")
         url = f"https://fcm.googleapis.com/v1/projects/{self.project_id}/messages:send"
@@ -127,6 +130,8 @@ class FcmClient:
                 "android": {"priority": "HIGH", "ttl": f"{max(0, ttl_seconds)}s"},
             }
         }
+        if collapse_key:
+            message["message"]["android"]["collapse_key"] = collapse_key
         try:
             response = await self._client.post(
                 url,
@@ -138,10 +143,33 @@ class FcmClient:
         if response.status_code == 200:
             return
         code = self.error_code(response)
-        # 고정된 데이터 메시지만 보내므로 INVALID_ARGUMENT는 토큰 형식 문제로 본다.
-        if response.status_code == 404 or code in {"UNREGISTERED", "INVALID_ARGUMENT"}:
+        if response.status_code == 401:
+            # 캐시한 접근 토큰이 무효가 됐을 수 있다. 다음 발송에서 새로 받는다.
+            self._access_token = None
+        if self.is_dead_token(response, code):
             raise FcmUnregistered(code or "UNREGISTERED")
         raise PushNotificationError(f"FCM 발송 실패 HTTP {response.status_code}: {code or '-'}")
+
+    @staticmethod
+    def is_dead_token(response: httpx.Response, code: str | None) -> bool:
+        """기기 행에서 지워도 되는 토큰인지. INVALID_ARGUMENT는 크기·키·TTL 문제일 수도 있어서
+        Google이 `message.token` 필드를 지목했을 때만 죽은 토큰으로 본다."""
+        if code == "UNREGISTERED":
+            return True
+        if code != "INVALID_ARGUMENT":
+            return False
+        try:
+            details = response.json().get("error", {}).get("details") or []
+        except (ValueError, AttributeError):
+            return False
+        return any(
+            isinstance(detail, dict)
+            and any(
+                isinstance(violation, dict) and violation.get("field") == "message.token"
+                for violation in detail.get("fieldViolations") or []
+            )
+            for detail in details
+        )
 
     @staticmethod
     def error_code(response: httpx.Response) -> str | None:
@@ -207,17 +235,28 @@ class FcmReportPushGateway(ReportPushGateway):
 
     async def send_report(self, token: str, push: ReportReadyPush) -> None:
         try:
-            await self.client.send(token, report_ready_data(push), seconds_until(push.expires_at))
+            await self.client.send(
+                token,
+                report_ready_data(push),
+                seconds_until(push.expires_at),
+                collapse_key=push.call_id,
+            )
         except FcmUnregistered as exc:
             raise UnregisteredPushToken(str(exc)) from exc
         return None
 
 
-def create_android_push_gateways(settings: Settings) -> tuple[VoipPushGateway, ReportPushGateway]:
-    """Android 통화·리포트 발송기. 둘은 FCM 접근 토큰을 같이 쓴다."""
+def create_android_push_gateways(
+    settings: Settings,
+) -> tuple[VoipPushGateway, ReportPushGateway | None]:
+    """Android 통화·리포트 발송기. 둘은 FCM 접근 토큰을 같이 쓴다.
+
+    FCM을 설정하지 않으면 리포트 발송기는 None이다. 그러면 리포트 알림이 Android 기기를
+    아예 대상에서 빼서, 실패한 Android 행 때문에 리포트가 계속 재시도되지 않는다.
+    """
     if settings.mock_external_services:
         return MockVoipPushGateway(), MockReportPushGateway()
     if settings.fcm_service_account_path is None:
-        return DisabledVoipPushGateway(), UnavailableReportPushGateway()
+        return DisabledVoipPushGateway(), None
     client = FcmClient(settings)
     return FcmVoipPushGateway(client), FcmReportPushGateway(client)

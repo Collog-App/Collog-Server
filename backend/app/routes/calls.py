@@ -80,10 +80,15 @@ async def create_reserved_call(
     if busy is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "본인 또는 상대방이 이미 통화 중입니다")
     if not settings_from(request).mock_external_services:
+        platforms = (
+            ["IOS", "ANDROID"]
+            if settings_from(request).fcm_service_account_path is not None
+            else ["IOS"]
+        )
         receiver = await session.scalar(
             select(Device.id).where(
                 Device.user_id == callee.id,
-                Device.platform == "IOS",
+                Device.platform.in_(platforms),
                 Device.voip_token.is_not(None),
                 Device.call_notifications_enabled.is_(True),
             )

@@ -5,6 +5,11 @@
 *-env.txt
 *.p8
 secrets/
+# Firebase·Google 서비스 계정 키(JSON). backend/private에는 README만 둔다.
+backend/private/*
+!backend/private/README.md
+*firebase-adminsdk*.json
+*service-account*.json
 .data/
 *.db
 

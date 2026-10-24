@@ -168,9 +168,11 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
   가입하면 계정이 따로 생기며 병합하지 않는다. Google 계정 삭제는 OTP 계정처럼 재인증 없이
   진행한다.
 - **Android 통화·리포트 알림은 `FCM_SERVICE_ACCOUNT_PATH`를 설정해야 나간다.** Firebase 서비스
-  계정 키 JSON을 컨테이너에 읽기 전용으로 넣고 그 경로를 준다. 값이 비면 Android 기기가 받을 통화는
-  APNs와 같은 규칙으로 502가 된다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
-  `token`·`voipToken`·`pushToken`에 같이 등록한다.
+  계정 키 JSON을 컨테이너에 읽기 전용으로 넣고 컨테이너 안 경로를 준다. compose에는 아직 이 키의
+  bind가 없으므로 배포할 때 APNs 키처럼 `/run/secrets/fcm.json` bind를 추가해야 한다. 값이 비면
+  Android 기기는 수신 기기로 치지 않아 Android만 가진 상대에게 거는 통화는 409(수신 기기 없음)이고,
+  리포트 알림도 Android 기기를 대상에서 뺀다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
+  `token`·`voipToken`·`pushToken`에 같이 등록한다. 키 JSON은 `.gitignore`가 막는다.
 - **새 피그마와 현재 백엔드의 건강 주체 모델이 다르다.** 현재 API는 자녀 발신·부모 분석,
   부모 질환 코드 배열에 고정돼 있다. 부모/자녀 양방향 통화와 양 참여자 동시 분석,
   복용약·걱정·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 완료됐다.
@@ -935,3 +937,6 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
   `google_login_challenges` 테이블(migration 0011), 검증기·라우트 테스트 40개를 추가했다.
 - 2026-10-24: Android 기기로 수신 통화·리포트 알림을 FCM HTTP v1으로 보내는 발송기와 플랫폼별 발송
   분기, 테스트 12개를 추가했다.
+- 2026-10-24: FCM 보안 리뷰 반영. 빈 키 경로를 미설정으로 처리(기동 실패 방지), 리포트 재시도 때
+  이미 받은 기기 재발송 방지, 수신 기기 사전 검사에 ANDROID 포함, 죽은 토큰 판정을 `message.token`
+  지목 시로 한정, 토큰 정리를 해당 기기 행으로 한정, token_uri 고정, 서비스 계정 JSON gitignore.

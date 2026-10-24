@@ -30,7 +30,6 @@ from app.services.notifications import (
     PushNotificationError,
     ReportPushGateway,
     ReportReadyPush,
-    UnavailableReportPushGateway,
     UnregisteredPushToken,
     UnregisteredVoipToken,
     VoipPushGateway,
@@ -154,7 +153,12 @@ async def test_access_token_is_renewed_before_expiry(key) -> None:
             "@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
             "errorCode": "UNREGISTERED",
         }]}}),
-        (400, {"error": {"status": "INVALID_ARGUMENT"}}),
+        (400, {"error": {"status": "INVALID_ARGUMENT", "details": [
+            {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+             "errorCode": "INVALID_ARGUMENT"},
+            {"@type": "type.googleapis.com/google.rpc.BadRequest",
+             "fieldViolations": [{"field": "message.token", "description": "invalid"}]},
+        ]}}),
     ],
 )
 async def test_dead_tokens_are_reported_as_unregistered(key, status, body) -> None:
@@ -195,11 +199,14 @@ async def test_report_message_carries_no_health_data(key) -> None:
 
 
 def test_missing_service_account_disables_android_push(tmp_path: Path, key) -> None:
-    voip, report = create_android_push_gateways(
-        Settings(_env_file=None, mock_external_services=False, fcm_service_account_path=None)
-    )
-    assert isinstance(voip, DisabledVoipPushGateway)
-    assert isinstance(report, UnavailableReportPushGateway)
+    for unset in (None, "", "  "):
+        settings = Settings(
+            _env_file=None, mock_external_services=False, fcm_service_account_path=unset
+        )
+        assert settings.fcm_service_account_path is None
+        voip, report = create_android_push_gateways(settings)
+        assert isinstance(voip, DisabledVoipPushGateway)
+        assert report is None
     broken = tmp_path / "broken.json"
     broken.write_text("{}")
     with pytest.raises(PushNotificationError):
@@ -255,5 +262,128 @@ async def test_report_routes_android_devices_to_fcm(tmp_path: Path) -> None:
         await ReportNotifications(database, ios, android).notify(call_id)
         assert [token for token, _ in ios.sent] == ["a" * 64]
         assert [token for token, _ in android.sent] == ["fcm-token"]
+    finally:
+        await database.close()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": {"status": "INVALID_ARGUMENT"}},
+        {"error": {"status": "INVALID_ARGUMENT", "details": [
+            {"@type": "type.googleapis.com/google.rpc.BadRequest",
+             "fieldViolations": [{"field": "message.data", "description": "too big"}]},
+        ]}},
+    ],
+)
+async def test_other_invalid_arguments_keep_the_token(key, body) -> None:
+    google = FakeGoogle(key, send_status=400, send_body=body)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as http:
+        client = FcmClient(Settings(_env_file=None), client=http, credentials=credentials(key))
+        with pytest.raises(PushNotificationError) as raised:
+            await FcmVoipPushGateway(client).send_incoming_call("token", push())
+        assert not isinstance(raised.value, UnregisteredVoipToken)
+
+
+async def test_unauthorized_send_drops_the_cached_access_token(key) -> None:
+    google = FakeGoogle(key, send_status=401, send_body={"error": {"status": "UNAUTHENTICATED"}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as http:
+        client = FcmClient(Settings(_env_file=None), client=http, credentials=credentials(key))
+        for _ in range(2):
+            with pytest.raises(PushNotificationError):
+                await client.send("token", {"type": "x"}, 30)
+    assert google.token_requests == 2
+
+
+def test_unexpected_token_uri_is_rejected(key) -> None:
+    with pytest.raises(PushNotificationError):
+        FcmClient(
+            Settings(_env_file=None),
+            credentials={**credentials(key), "token_uri": "https://attacker.example/token"},
+        )
+
+
+async def test_report_messages_collapse_per_call(key) -> None:
+    google = FakeGoogle(key)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(google)) as http:
+        client = FcmClient(Settings(_env_file=None), client=http, credentials=credentials(key))
+        await FcmReportPushGateway(client).send_report(
+            "token", ReportReadyPush("call-1", datetime.now(UTC) + timedelta(days=1))
+        )
+    assert google.messages[0]["message"]["android"]["collapse_key"] == "call-1"
+
+
+def test_android_only_callee_passes_the_receiver_check(client: TestClient, tmp_path: Path) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    client.post("/v1/devices", headers=auth(parent_token), json={
+        "platform": "ANDROID", "token": "fcm-token",
+        "voipToken": "fcm-token", "pushToken": "fcm-token",
+    })
+
+    class Recorder(VoipPushGateway):
+        sent: list[str] = []
+
+        async def send_incoming_call(self, token: str, push: IncomingCallPush) -> None:
+            self.sent.append(token)
+
+    container = client.app.state.container
+    container.settings.mock_external_services = False
+    container.settings.fcm_service_account_path = tmp_path / "fcm.json"
+    container.android_voip_push = Recorder()
+    created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert created.status_code == 201, created.text
+    assert Recorder.sent == ["fcm-token"]
+
+
+async def test_failed_android_report_does_not_resend_to_ios(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'resend.db'}")
+    await database.ensure_schema(auto_reset=True)
+    try:
+        call_id, parent_id, child_id = await seed_call(database)
+        async with database.sessions() as session:
+            session.add_all([
+                Device(user_id=parent_id, platform="IOS", token="ios", push_token="a" * 64),
+                Device(
+                    user_id=child_id, platform="ANDROID", token="android", push_token="fcm-token"
+                ),
+            ])
+            await session.commit()
+
+        class FailingAndroid(MockReportPushGateway):
+            async def send_report(self, token: str, push: ReportReadyPush) -> None:
+                raise PushNotificationError("FCM 403")
+
+        ios = MockReportPushGateway()
+        notifications = ReportNotifications(database, ios, FailingAndroid())
+        for _ in range(3):
+            await notifications.maintain()
+        assert [token for token, _ in ios.sent] == ["a" * 64]
+    finally:
+        await database.close()
+
+
+async def test_dead_android_token_only_clears_its_own_row(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'scoped.db'}")
+    await database.ensure_schema(auto_reset=True)
+    try:
+        call_id, parent_id, child_id = await seed_call(database)
+        shared = "a" * 64
+        async with database.sessions() as session:
+            ios = Device(user_id=parent_id, platform="IOS", token="ios", push_token=shared)
+            android = Device(
+                user_id=child_id, platform="ANDROID", token="android", push_token=shared
+            )
+            session.add_all([ios, android])
+            await session.commit()
+            ios_id, android_id = ios.id, android.id
+
+        class GoneAndroid(MockReportPushGateway):
+            async def send_report(self, token: str, push: ReportReadyPush) -> None:
+                raise UnregisteredPushToken("INVALID_ARGUMENT")
+
+        await ReportNotifications(database, MockReportPushGateway(), GoneAndroid()).notify(call_id)
+        async with database.sessions() as session:
+            assert (await session.get(Device, ios_id)).push_token == shared
+            assert (await session.get(Device, android_id)).push_token is None
     finally:
         await database.close()

@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     team_portal_enabled: bool = True
     team_portal_repository_url: str = "https://github.com/Collog-App/14th-hackathon"
+
+    @field_validator("fcm_service_account_path", mode="before")
+    @classmethod
+    def empty_fcm_path_is_unset(cls, value: object) -> object:
+        # compose의 `${FCM_SERVICE_ACCOUNT_PATH:-}`는 빈 문자열을 넘기고,
+        # pydantic은 그걸 Path(".")로 바꾼다. 빈 값은 "설정 안 됨"으로 본다.
+        return None if isinstance(value, str) and not value.strip() else value
 
     @property
     def livekit_http_url(self) -> str:
