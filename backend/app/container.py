@@ -7,6 +7,7 @@ from app.services.apple_auth import AppleIdentityVerifier
 from app.services.calls import CallLifecycle
 from app.services.deepgram import create_stt_gateway
 from app.services.gemini import create_extraction_gateway
+from app.services.google_auth import GoogleIdentityVerifier
 from app.services.livekit import create_livekit_gateway
 from app.services.notifications import create_report_push_gateway, create_voip_push_gateway
 from app.services.pipeline import ProcessingPipeline
@@ -21,6 +22,7 @@ class AppContainer:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.apple_identity = AppleIdentityVerifier(settings)
+        self.google_identity = GoogleIdentityVerifier(settings)
         self.database = Database(settings.database_url)
         self.storage = create_storage(settings)
         self.question_tts = create_question_tts_gateway(settings, self.storage)

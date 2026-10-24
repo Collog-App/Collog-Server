@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     apple_team_id: str = ""
     apple_key_id: str = ""
     apple_private_key_path: Path | None = None
+    # Android Sign in with Google. ID 토큰의 aud가 되는 Web OAuth 클라이언트 ID이며
+    # 비워두면 Google 로그인 엔드포인트는 503을 반환한다. nonce 유효 시간은
+    # apple_challenge_ttl_seconds를 같이 쓴다.
+    google_client_id: str = ""
 
     schema_auto_reset: bool = False
 

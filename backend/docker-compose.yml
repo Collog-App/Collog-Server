@@ -30,6 +30,7 @@ x-backend-environment: &backend-environment
   APPLE_TEAM_ID: ${APPLE_TEAM_ID:-}
   APPLE_KEY_ID: ${APPLE_KEY_ID:-}
   APPLE_PRIVATE_KEY_PATH: /run/secrets/apple-signin.p8
+  GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
   APNS_VOIP_ENABLED: "true"
   APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:?Set APNS_ENVIRONMENT}
   APNS_TEAM_ID: ${APNS_TEAM_ID:?Set APNS_TEAM_ID}

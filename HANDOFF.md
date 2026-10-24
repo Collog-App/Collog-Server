@@ -1,6 +1,6 @@
 # 콜록(Collog) 개발 HANDOFF
 
-마지막 갱신: 2026-08-18 (Asia/Seoul)
+마지막 갱신: 2026-10-24 (Asia/Seoul)
 
 이 문서는 콜록 개발의 단일 인수인계 기준이다. 구현, 계약, 검증 결과, 미완료 항목이 바뀌면
 코드와 같은 커밋에서 반드시 이 문서를 갱신한다. 비밀키와 실제 건강정보는 기록하지 않는다.
@@ -132,6 +132,8 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
 - iOS PushKit용 APNs HTTP/2 provider와 `/devices` idempotent 등록
 - PushKit → CallKit → `/accept` → LiveKit iOS 계약 문서
 - `/team` 모바일 웹 포털과 `/team/status.json` 비밀값 없는 연동 상태 endpoint
+- Android용 Google 로그인 `/v1/auth/google/challenge`·`/v1/auth/google`. Apple 로그인과 같은
+  서버 nonce challenge 1회 소비 구조이며 `users.google_subject`로 계정을 찾는다
 - 연결 대기 질문 ElevenLabs provider, MP3 cache, local/S3 만료 download URL과 iOS 로컬 폴백
 - ElevenLabs voice 목록/한국어 MP3 preview CLI. provider key는 backend에만 보관
 - APNs 자격증명 점검·실기기 발송 CLI와 sandbox 실기기 CallKit 수신 검증
@@ -160,6 +162,11 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
 
 ### 의도적으로 미완료
 
+- **Google 로그인은 `GOOGLE_CLIENT_ID`를 설정해야 켜진다.** 값이 비면 두 엔드포인트가 503이다.
+  Google Cloud에 Web OAuth 클라이언트(이 값)와 Android OAuth 클라이언트(패키지 이름·서명
+  SHA-1)를 같은 프로젝트에 만들어야 한다. 같은 사람이 iOS(Apple)와 Android(Google)로
+  가입하면 계정이 따로 생기며 병합하지 않는다. Google 계정 삭제는 OTP 계정처럼 재인증 없이
+  진행한다. Android 앱의 수신 통화(FCM)는 아직 서버에 없다.
 - **새 피그마와 현재 백엔드의 건강 주체 모델이 다르다.** 현재 API는 자녀 발신·부모 분석,
   부모 질환 코드 배열에 고정돼 있다. 부모/자녀 양방향 통화와 양 참여자 동시 분석,
   복용약·걱정·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 완료됐다.
@@ -296,6 +303,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | 파일 | 역할 |
 |---|---|
 | `services/livekit.py` | self-host LiveKit room/token/audio-track 조회/Track Egress/webhook adapter와 mock |
+| `services/google_auth.py` | Google ID 토큰 JWKS 검증(iss 두 값, aud=Web client ID, nonce), 키 cache·실패 backoff |
 | `services/notifications.py` | APNs ES256 provider JWT와 HTTP/2 VoIP push, mock/disabled adapter |
 | `services/storage.py` | 로컬/S3 저장, presigned upload/download, TTS write/cache/read/delete |
 | `services/tts.py` | ElevenLabs 한국어 질문 합성·cache key·만료 URL과 질문별 iOS 폴백 |
@@ -553,6 +561,7 @@ Compose는 ignored `backend/private/`를 `/run/secrets/collog`에 read-only moun
 | `HF_TOKEN` | Hugging Face 계정에서 HAI-DEF 약관 수락 후 발급 | HeAR detector artifact를 처음 받을 때만 필요 | gated model download. 앱/런타임 API key가 아니며 Git에 넣지 않음 |
 | `LIVEKIT_API_KEY/SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | self-hosted room token, server API, Egress, webhook 서명 |
 | `JWT_SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | 콜록 사용자 인증 JWT |
+| `GOOGLE_CLIENT_ID` | Google Cloud Console의 Web OAuth 클라이언트 ID | Android Google 로그인 시 필수 | ID 토큰 `aud` 검증. 비밀값 아님 |
 | APNs `.p8`/Key ID/Team ID/Bundle ID | Apple Developer 발급·확인 | 실기기 백그라운드 수신 시 필수 | PushKit VoIP push |
 | MinIO access key/secret | 우리가 직접 생성 | Egress 녹음 시 필수 | self-hosted S3 호환 오디오 저장 |
 
@@ -916,3 +925,5 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
 - 2026-08-20: 통합 직후 main이 lint 실패 상태였던 것을 고쳤다. `pipeline.py`의 로그 한 줄이
   E501, `seed_narrative_history.py`가 async 안에서 `pathlib`을 써 ASYNC240이었다. 파일 읽기를
   동기 함수로 분리했다. 브랜치를 머지할 때 `ruff`를 다시 돌려야 한다.
+- 2026-10-24: Android 포팅을 위해 Google 로그인 엔드포인트, `google_subject` 컬럼과
+  `google_login_challenges` 테이블(migration 0011), 검증기·라우트 테스트 40개를 추가했다.

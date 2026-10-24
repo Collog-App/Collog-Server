@@ -70,6 +70,19 @@ class AppleChallengeResponse(ApiModel):
     expires_in: int
 
 
+class GoogleLoginRequest(ApiModel):
+    id_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    role: UserRole = UserRole.CHILD
+    name: str | None = Field(default=None, max_length=80)
+
+
+class GoogleChallengeResponse(ApiModel):
+    challenge_id: str
+    nonce: str
+    expires_in: int
+
+
 class UserView(ApiModel):
     id: str
     role: str
