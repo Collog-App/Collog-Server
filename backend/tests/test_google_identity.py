@@ -85,6 +85,15 @@ async def test_accepts_both_google_issuers(signing_key, claims, issuer):
         assert (await verifier.verify(encode(signing_key, claims))).subject == claims["sub"]
 
 
+@pytest.mark.parametrize("seconds_ahead", [5, 55])
+async def test_tolerates_server_clock_behind_google(signing_key, claims, seconds_ahead):
+    # 서버 시계가 Google보다 몇 초 느리면 막 발급된 토큰의 iat가 미래로 보인다.
+    claims["iat"] = int(time.time()) + seconds_ahead
+    async with keys_client(signing_key) as client:
+        verifier = GoogleIdentityVerifier(settings(), client=client)
+        assert (await verifier.verify(encode(signing_key, claims))).subject == claims["sub"]
+
+
 @pytest.mark.parametrize(
     ("claim", "value"),
     [

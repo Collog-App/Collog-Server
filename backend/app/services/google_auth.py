@@ -12,6 +12,8 @@ from app.config import Settings
 
 GOOGLE_KEYS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+# 서버 시계가 Google보다 몇 초만 느려도 막 발급된 토큰의 iat가 미래가 된다.
+CLOCK_SKEW_SECONDS = 60
 
 
 class GoogleIdentityError(Exception):
@@ -105,6 +107,7 @@ class GoogleIdentityVerifier:
                 algorithms=["RS256"],
                 audience=self._audience,
                 issuer=GOOGLE_ISSUERS,
+                leeway=CLOCK_SKEW_SECONDS,
                 options={"require": ["exp", "iat", "sub", "nonce", "iss", "aud"]},
             )
             subject = claims["sub"]
