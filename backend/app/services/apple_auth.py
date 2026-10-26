@@ -10,6 +10,9 @@ import jwt
 
 from app.config import Settings
 
+# 서버 시계가 Apple보다 몇 초만 느려도 막 발급된 토큰의 iat가 미래가 된다.
+CLOCK_SKEW_SECONDS = 60
+
 
 class AppleIdentityError(Exception):
     pass
@@ -97,6 +100,7 @@ class AppleIdentityVerifier:
                 algorithms=["RS256"],
                 audience=self._audience,
                 issuer="https://appleid.apple.com",
+                leeway=CLOCK_SKEW_SECONDS,
                 options={"require": ["exp", "iat", "sub", "nonce", "iss", "aud"]},
             )
             subject = claims["sub"]
