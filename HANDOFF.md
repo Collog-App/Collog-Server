@@ -167,9 +167,10 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
   SHA-1)를 같은 프로젝트에 만들어야 한다. 같은 사람이 iOS(Apple)와 Android(Google)로
   가입하면 계정이 따로 생기며 병합하지 않는다. Google 계정 삭제는 OTP 계정처럼 재인증 없이
   진행한다.
-- **Android 통화·리포트 알림은 `FCM_SERVICE_ACCOUNT_PATH`를 설정해야 나간다.** Firebase 서비스
-  계정 키 JSON을 컨테이너에 읽기 전용으로 넣고 컨테이너 안 경로를 준다. compose에는 아직 이 키의
-  bind가 없으므로 배포할 때 APNs 키처럼 `/run/secrets/fcm.json` bind를 추가해야 한다. 값이 비면
+- **Android 통화·리포트 알림은 Firebase 서비스 계정 키가 있어야 나간다.** compose에서는 APNs 키처럼
+  `FCM_KEY_FILE`에 호스트 절대 경로를 주면 `/run/secrets/fcm-service-account.json`으로 읽기 전용
+  bind되고 `FCM_SERVICE_ACCOUNT_PATH`가 그 경로로 채워진다. compose 없이 직접 실행할 때만
+  `FCM_SERVICE_ACCOUNT_PATH`에 키 경로를 준다. 값이 비면
   Android 기기는 수신 기기로 치지 않아 Android만 가진 상대에게 거는 통화는 409(수신 기기 없음)이고,
   리포트 알림도 Android 기기를 대상에서 뺀다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
   `token`·`voipToken`·`pushToken`에 같이 등록한다. 키 JSON은 `.gitignore`가 막는다.
@@ -568,7 +569,7 @@ Compose는 ignored `backend/private/`를 `/run/secrets/collog`에 read-only moun
 | `HF_TOKEN` | Hugging Face 계정에서 HAI-DEF 약관 수락 후 발급 | HeAR detector artifact를 처음 받을 때만 필요 | gated model download. 앱/런타임 API key가 아니며 Git에 넣지 않음 |
 | `LIVEKIT_API_KEY/SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | self-hosted room token, server API, Egress, webhook 서명 |
 | `JWT_SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | 콜록 사용자 인증 JWT |
-| `FCM_SERVICE_ACCOUNT_PATH` | Firebase Console 프로젝트 설정의 서비스 계정 키(JSON) | Android 통화 수신 시 필수 | FCM 발송. 비밀값이며 Git에 넣지 않음 |
+| `FCM_KEY_FILE`(compose) / `FCM_SERVICE_ACCOUNT_PATH`(직접 실행) | Firebase Console 프로젝트 설정의 서비스 계정 키(JSON) | Android 통화 수신 시 필수 | FCM 발송. 비밀값이며 Git에 넣지 않음 |
 | `GOOGLE_CLIENT_ID` | Google Cloud Console의 Web OAuth 클라이언트 ID | Android Google 로그인 시 필수 | ID 토큰 `aud` 검증. 비밀값 아님 |
 | APNs `.p8`/Key ID/Team ID/Bundle ID | Apple Developer 발급·확인 | 실기기 백그라운드 수신 시 필수 | PushKit VoIP push |
 | MinIO access key/secret | 우리가 직접 생성 | Egress 녹음 시 필수 | self-hosted S3 호환 오디오 저장 |
@@ -942,6 +943,19 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
   지목 시로 한정, 토큰 정리를 해당 기기 행으로 한정, token_uri 고정, 서비스 계정 JSON gitignore.
 - 2026-10-25: 실기기(에뮬레이터) Google 로그인이 401이었다. 맥 시계가 Google보다 약 4초 느려 막 발급된
   ID 토큰의 `iat`가 미래로 보였고, 검증이 시계 오차를 0초 허용했다. Google 검증에 60초 leeway를
-  두고 테스트를 추가했다. Apple 검증(`apple_auth.py`)도 leeway가 0이라 같은 위험이 있으나 손대지 않았다.
+  두고 테스트를 추가했다.
   `backend/.env`가 있으면 pytest도 그 값을 읽어 Apple·팀 포털 테스트가 실패한다. 로컬 실행용 값은
   `backend/private/`에 두고 실행할 때만 불러온다.
+- 2026-10-26: 에뮬레이터 자녀 → Android 휴대폰 부모 통화에서 양방향 음성까지 로컬 E2E로 확인했다
+  (Google 로그인, FCM 수신, 받기, 음성, 끊으면 양쪽 종료).
+- 2026-10-26: compose에 FCM 키 bind가 없어, 운영 env에 호스트 경로를 넣으면 컨테이너가 키를 못 읽고
+  `AppContainer` 생성에서 기동 실패하던 문제를 고쳤다. `FCM_KEY_FILE` → `/run/secrets/fcm-service-account.json`,
+  비우면 `/dev/null`을 bind하고 Android 발송을 끈다(운영·로컬 compose 모두).
+- 2026-10-26: 동의 문서를 Android에도 맞게 고치고 버전을 `2026-10-26.v5`로 올렸다. "아이폰 직접 요청"·
+  "아이폰 기본 음성"을 "휴대폰"으로, 로그인 토큰을 "Apple·Google"로 바꿨다. Android도 질문 음성을
+  ElevenLabs에 직접 요청하므로 IP 전달 문구가 Android 사용자에게도 사실이어야 한다. 버전이 바뀌므로
+  배포 후 기존 사용자는 다시 동의해야 녹음·AI 분석이 켜진다(통화는 그대로 된다).
+- 2026-10-26: Apple 신원 토큰 검증에도 Google과 같은 60초 leeway를 두고 테스트를 추가했다.
+- 2026-10-26: 알려진 취약점이 있던 의존성을 잠금 파일에서 올렸다. pyjwt 2.13.0→2.15.1,
+  aiohttp 3.14.3→3.14.5, urllib3 2.7.0→2.8.0, certifi→2026.10.23, multidict 6.7.1→6.9.1(yarl 1.25.1 따라옴).
+  올린 뒤 `pip-audit` 0건.
