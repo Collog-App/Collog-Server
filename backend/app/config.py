@@ -153,7 +153,7 @@ class Settings(BaseSettings):
     @field_validator("fcm_service_account_path", mode="before")
     @classmethod
     def empty_fcm_path_is_unset(cls, value: object) -> object:
-        # compose의 `${FCM_SERVICE_ACCOUNT_PATH:-}`는 빈 문자열을 넘기고,
+        # compose의 `${FCM_KEY_FILE:+...}`는 키 파일이 없으면 빈 문자열을 넘기고,
         # pydantic은 그걸 Path(".")로 바꾼다. 빈 값은 "설정 안 됨"으로 본다.
         return None if isinstance(value, str) and not value.strip() else value
 

@@ -31,7 +31,7 @@ x-backend-environment: &backend-environment
   APPLE_KEY_ID: ${APPLE_KEY_ID:-}
   APPLE_PRIVATE_KEY_PATH: /run/secrets/apple-signin.p8
   GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
-  FCM_SERVICE_ACCOUNT_PATH: ${FCM_SERVICE_ACCOUNT_PATH:-}
+  FCM_SERVICE_ACCOUNT_PATH: ${FCM_KEY_FILE:+/run/secrets/fcm-service-account.json}
   APNS_VOIP_ENABLED: "true"
   APNS_ENVIRONMENT: ${APNS_ENVIRONMENT:?Set APNS_ENVIRONMENT}
   APNS_TEAM_ID: ${APNS_TEAM_ID:?Set APNS_TEAM_ID}
@@ -172,6 +172,12 @@ services:
       - type: bind
         source: ${APPLE_KEY_FILE:?Set APPLE_KEY_FILE}
         target: /run/secrets/apple-signin.p8
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FCM_KEY_FILE:-/dev/null}
+        target: /run/secrets/fcm-service-account.json
         read_only: true
         bind:
           create_host_path: false
