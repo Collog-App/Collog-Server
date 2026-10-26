@@ -96,7 +96,7 @@ class Settings(BaseSettings):
     s3_use_instance_role: bool = False
     s3_force_path_style: bool = True
 
-    consent_document_version: str = "2026-09-13.v4"
+    consent_document_version: str = "2026-10-26.v5"
     parent_min_speech_seconds: int = 20
     raw_audio_wait_seconds: int = 30
     egress_wait_seconds: int = Field(default=120, ge=1)
