@@ -76,6 +76,22 @@ JSON 은 기존처럼 camelCase, 경로 접두어 `/v1`.
   가족이 아직 없는 사람의 첫 초대를 위해 `POST /v1/families` → `{"familyId"}`(이미 있으면 그 가족) 추가.
 - `GET/PUT /v1/parents/{userId}/profile` 은 누구나 자기 것·같은 가족 것(질환 `conditions` + `concerns`).
 
+### 구현에서 정한 세부(2026-10-30, S1·S2·S4 반영)
+위 약속이 비워 둔 곳을 이렇게 채웠다. 안드로이드는 이 값에 맞춘다.
+
+- `POST /v1/families`: 새로 만들면 201, 이미 있으면 200. 둘 다 `{"familyId"}`.
+- 로그인: Google 로그인에 `role`을 안 보내면 가족을 만들지 않는다(`familyId: null`, 저장 역할은 `CHILD`).
+  Google 로그인에 `role`을 보내거나 OTP·Apple 로그인(역할 기본값 `CHILD`)이면 예전처럼 자녀 계정에 가족이 바로 생긴다.
+- 구성원 목록: 만든 사람의 `relation`은 빈 문자열 `""`(iOS·안드로이드 모델이 non-null 문자열이라 null 대신),
+  `acceptedAt`은 가족을 만든 시각, `canRemove: false`. 대기 중 초대는 `acceptedAt: null`. 초대 코드(`invitation`)는
+  구성원 모두에게 보인다. 순서는 예전처럼 초대받은 구성원들 다음에 만든 사람.
+- `POST /v1/invitations/accept` 의 `status` 는 수락한 사람의 동의 상태(`CONSENT_GRANTED` 등)다.
+- 닉네임: `^[가-힣A-Za-z0-9]{2,10}$`(한글은 완성형 음절만, 공백 불가), 대소문자 구분. 자기 닉네임을 다시 확인하면
+  `available: true`. `birthDate`는 1900-01-01 ~ 오늘(KST).
+- `PUT /v1/account/sharing`: 보낸 줄만 바뀐다. 같은 가족의 연결된 구성원이 아닌 `viewerUserId`가 있으면 422.
+- `DELETE .../members/{memberId}`: 만든 사람(`memberId` = 만든 사람의 userId) 은 409, 다른 가족·없는 id 는 404,
+  권한 없음 403. 나간 사람과 남은 구성원 사이의 공유 행은 지워진다(다시 들어오면 모두 공개부터).
+
 ## 안드로이드 (Collog-Android `main`)
 | 단계 | 내용 | 필요한 서버 |
 |---|---|---|
