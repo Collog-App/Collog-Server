@@ -8,7 +8,7 @@ from sqlalchemy import select
 
 from app.models import Baseline, ChangeSignal
 from app.security import CurrentUser, SessionDep
-from app.services.domain import ensure_report_access
+from app.services.domain import ensure_subject_access
 from app.services.signals import baseline_to_dict, signal_to_dict
 
 router = APIRouter()
@@ -22,7 +22,7 @@ async def get_baselines(
     session: SessionDep,
     kind: Literal["ANCHOR", "ROLLING"] | None = None,
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id)
     await request.app.state.container.signals.rebuild_baselines(session, parent_id)
     await session.commit()
     statement = select(Baseline).where(Baseline.parent_id == parent_id)
@@ -39,7 +39,7 @@ async def get_signals(
     session: SessionDep,
     filter: Literal["ALL", "PROMOTED", "ACUTE"] = "ALL",
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id)
     statement = select(ChangeSignal).where(ChangeSignal.parent_id == parent_id)
     if filter == "PROMOTED":
         statement = statement.where(ChangeSignal.promoted.is_(True))
@@ -58,5 +58,5 @@ async def get_report(
     period: Literal["WEEKLY", "MONTHLY"],
     date_: Annotated[date | None, Query(alias="date")] = None,
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id)
     return await request.app.state.container.reports.get_or_issue(session, parent_id, period, date_)

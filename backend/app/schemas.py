@@ -73,7 +73,8 @@ class AppleChallengeResponse(ApiModel):
 class GoogleLoginRequest(ApiModel):
     id_token: str = Field(min_length=1, max_length=16_384)
     challenge_id: str = Field(min_length=36, max_length=36)
-    role: UserRole = UserRole.CHILD
+    # 새 Android 가입은 역할을 보내지 않는다. 저장은 응답 호환용 CHILD.
+    role: UserRole | None = None
     name: str | None = Field(default=None, max_length=80)
 
 

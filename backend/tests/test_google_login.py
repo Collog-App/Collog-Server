@@ -180,3 +180,26 @@ def test_google_account_can_be_deleted_without_apple_reauthentication(
             return list(await session.scalars(select(User.google_subject)))
 
     assert client.portal.call(remaining) == []
+
+
+def test_signup_without_role_has_no_family_until_the_first_invite(
+    client: TestClient, sign_google
+) -> None:
+    payload = google_payload(client, sign_google)
+    del payload["role"]
+    signed_in = client.post("/v1/auth/google", json=payload)
+    assert signed_in.status_code == 200, signed_in.text
+    user = signed_in.json()["user"]
+    assert user["role"] == "CHILD"
+    assert user["familyId"] is None
+    token = signed_in.json()["accessToken"]
+    created = client.post("/v1/families", headers=auth(token))
+    assert created.status_code == 201
+    invitation = client.post(
+        f"/v1/families/{created.json()['familyId']}/invitations",
+        headers=auth(token),
+        json={"name": "어머니", "relation": "MOTHER"},
+    )
+    assert invitation.status_code == 201
+    again = client.post("/v1/auth/google", json=google_payload(client, sign_google))
+    assert again.json()["user"]["familyId"] == created.json()["familyId"]

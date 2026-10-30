@@ -5,11 +5,11 @@ from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Request, status
 
-from app.models import ParentProfile, UserRole
+from app.models import ParentProfile
 from app.routes.shared import settings_from
 from app.schemas import ProfilePut
 from app.security import CurrentUser, SessionDep
-from app.services.domain import ensure_child_can_access_parent, ensure_report_access, has_consent
+from app.services.domain import ensure_subject_access, has_consent
 
 router = APIRouter()
 
@@ -20,7 +20,7 @@ async def get_profile(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id)
     profile = await session.get(ParentProfile, parent_id)
     if profile is None:
         return {
@@ -41,12 +41,12 @@ async def put_profile(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    if user.role == UserRole.CHILD.value:
-        await ensure_child_can_access_parent(session, user, parent_id)
-    elif user.id != parent_id:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "프로필 접근 권한이 없습니다")
+    # 누구나 자기 프로필을 갖고, 같은 가족 구성원도 고칠 수 있다. 저장은 대상 본인이 동의한 뒤에만.
+    await ensure_subject_access(session, user, parent_id)
     if not await has_consent(session, parent_id, settings_from(request).consent_document_version):
-        raise HTTPException(status.HTTP_409_CONFLICT, "부모님 동의가 완료되어야 등록할 수 있어요")
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "프로필 주인의 분석 동의가 완료되어야 등록할 수 있어요"
+        )
     profile = await session.get(ParentProfile, parent_id)
     if profile is None:
         profile = ParentProfile(parent_id=parent_id, conditions=payload.conditions)

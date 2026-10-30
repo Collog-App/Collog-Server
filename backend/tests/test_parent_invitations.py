@@ -32,10 +32,17 @@ def test_parent_role_change_ignores_empty_owned_family(client: TestClient) -> No
     assert signed_in["user"]["familyId"] != original["familyId"]
 
 
-def test_parent_uses_most_recently_accepted_family_after_signing_in(client: TestClient) -> None:
+def test_parent_in_a_family_cannot_join_another(client: TestClient) -> None:
     _, old_child, parent_token, _ = onboard_family(client)
     child_token, child = create_user(client, "01099998888", "CHILD", "다른 자녀")
-    join_family(client, parent_token, child_token, child["familyId"])
+    invitation = client.post(
+        f"/v1/families/{child['familyId']}/invitations",
+        headers=auth(child_token), json={"name": "부모", "relation": "MOTHER"},
+    )
+    rejected = client.post(
+        "/v1/invitations/accept", headers=auth(parent_token),
+        json={"code": invitation.json()["code"]},
+    )
+    assert rejected.status_code == 409
     signed_in = login(client, "01033334444")
-    assert signed_in["user"]["familyId"] == child["familyId"]
-    assert signed_in["user"]["familyId"] != old_child["familyId"]
+    assert signed_in["user"]["familyId"] == old_child["familyId"]

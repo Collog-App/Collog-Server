@@ -1,6 +1,6 @@
 # 콜록(Collog) 개발 HANDOFF
 
-마지막 갱신: 2026-10-24 (Asia/Seoul)
+마지막 갱신: 2026-10-30 (Asia/Seoul)
 
 이 문서는 콜록 개발의 단일 인수인계 기준이다. 구현, 계약, 검증 결과, 미완료 항목이 바뀌면
 코드와 같은 커밋에서 반드시 이 문서를 갱신한다. 비밀키와 실제 건강정보는 기록하지 않는다.
@@ -174,9 +174,12 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
   Android 기기는 수신 기기로 치지 않아 Android만 가진 상대에게 거는 통화는 409(수신 기기 없음)이고,
   리포트 알림도 Android 기기를 대상에서 뺀다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
   `token`·`voipToken`·`pushToken`에 같이 등록한다. 키 JSON은 `.gitignore`가 막는다.
-- **새 피그마와 현재 백엔드의 건강 주체 모델이 다르다.** 현재 API는 자녀 발신·부모 분석,
-  부모 질환 코드 배열에 고정돼 있다. 부모/자녀 양방향 통화와 양 참여자 동시 분석,
-  복용약·걱정·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 완료됐다.
+- **가족은 대칭 구조로 바뀌었지만 분석은 아직 한 사람만 한다.** `feat/family-symmetric`
+  (`backend/docs/family-symmetric-plan.md` S1)에서 초대·수락·통화·프로필·리포트 접근의 역할 검사를
+  없앴다. 한 사람은 한 가족에만 속하고, 같은 가족 구성원 둘이면 누구나 통화한다. `calls.parent_id`는
+  S3 전까지 **분석 대상**이다(PARENT 역할이 정확히 하나면 그 사람, 아니면 받는 사람). 두 참여자 동시
+  분석(`CallParticipant`), 복용약·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 있다.
+  `users.role`은 응답 호환용과 위 분석 대상 선택에만 쓴다.
 - **전체 STT segment 보관과 동의 문구가 불일치할 수 있다.** 성공 통화도 `transcripts.segments`에
   전체 전사를 저장하지만 화면은 구조화 항목만 기록한다고 안내한다. 보관 기간과 최소 evidence
   정책을 결정하고 코드/동의 문서를 함께 맞춰야 한다.
@@ -344,6 +347,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/docs/acoustic-design.md` | 음향 4종 정의, 품질 gate, model, worker와 검증 기준 |
 | `backend/docs/voice-health-model-research.md` | HeAR/기침 detector 판정, 유사 서비스 비교, 되묻기·난청 한계와 검증 설계 |
 | `backend/docs/profile-question-report-design.md` | 피그마 기준 건강 프로필→질문→통화 자기보고→주·월간 리포트 계약과 현재 코드 차이 |
+| `backend/docs/family-symmetric-plan.md` | 가족 대칭 구조(B안) 이행 단계 S1~S6과 안드로이드가 맞출 API 약속 |
 | `backend/docs/implementation-plan-v2.md` | 승인된 권장 기본값, Phase 0~7 구현 순서·완료 조건, 실제 질문이 필요한 외부 조건 |
 | `backend/docs/schema-management-design.md` | 로컬 schema guard와 배포 Alembic의 두 축, 판정 규칙, 가비아 서버 배포 제약 |
 | `backend/docs/service-proposal-outline.md` | 초기 서비스 기획안을 개조식으로 재구성하고 현재 제품·구현·검증 상태에 맞춰 정정한 문서 |
@@ -366,6 +370,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/deploy/livekit-local.yaml` | Docker 없이 실행하는 단일 노드 LiveKit 설정. Egress 없음 |
 | `backend/docs/calibration-todo.md` | 보정되지 않은 상수와 측정 계획. 근거와 완료 기준 |
 | `backend/tests/test_api_flow.py` | 온보딩부터 분석·폐기·리포트까지 E2E API test |
+| `backend/tests/test_family_symmetric.py` | 역할 없는 초대·수락(혼자뿐인 가족 정리, 409), 형제 통화, 분석 대상 선택, 프로필·리포트 접근 test |
 | `backend/tests/test_providers.py` | Deepgram/Gemini/APNs provider unit test |
 | `backend/tests/test_ai_pipeline.py` | prompt/repeat/acoustic/calendar-week deterministic test |
 | `backend/tests/test_tts.py` | ElevenLabs 요청 계약, cache/서명 URL, 장애 local 폴백 test |
@@ -959,3 +964,9 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
 - 2026-10-26: 알려진 취약점이 있던 의존성을 잠금 파일에서 올렸다. pyjwt 2.13.0→2.15.1,
   aiohttp 3.14.3→3.14.5, urllib3 2.7.0→2.8.0, certifi→2026.10.23, multidict 6.7.1→6.9.1(yarl 1.25.1 따라옴).
   올린 뒤 `pip-audit` 0건.
+- 2026-10-30: 가족 대칭 구조 S1. 초대 생성·재발송은 가족 구성원 누구나, 수락은 가족이 없거나 혼자뿐인
+  가족에 있는 사람 누구나(그 가족은 정리), 다른 사람이 있는 가족에 이미 있으면 409. `POST /v1/families`가
+  내 가족을 주거나 만든다. 구성원 목록에 `acceptedAt`·`consentGranted`·`isCreator`를 더하고 만든 사람도
+  같은 모양(`relation` 빈 문자열)으로 주며 `canInvite`는 누구나 true, 초대 코드도 구성원 모두에게 보인다.
+  통화는 같은 가족 둘이면 누구나, `/parents/{id}/...`는 본인 또는 같은 가족이면 허용한다. Google 로그인은
+  역할을 안 보내도 되고, 그때는 로그인 때 가족을 만들지 않는다(iOS처럼 역할을 보내면 예전대로).

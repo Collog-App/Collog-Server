@@ -66,8 +66,12 @@ async def token_response(
     )
 
 
-async def create_session(session: SessionDep, user: User, settings: Settings) -> TokenResponse:
-    if user.role == UserRole.CHILD.value and await family_of(session, user) is None:
+async def create_session(
+    session: SessionDep, user: User, settings: Settings, *, role_sent: bool = True
+) -> TokenResponse:
+    # 역할을 보내는 클라이언트(iOS)의 자녀는 로그인 직후 초대할 가족이 있어야 한다.
+    # 역할을 보내지 않는 가입은 첫 초대 때 `POST /families`로 가족을 만든다.
+    if role_sent and user.role == UserRole.CHILD.value and await family_of(session, user) is None:
         session.add(Family(created_by=user.id))
         await session.flush()
     refresh_token = secrets.token_urlsafe(48)
@@ -237,7 +241,7 @@ async def google_login(
                 user = User(
                     google_subject=identity.subject,
                     phone=None,
-                    role=payload.role,
+                    role=payload.role or UserRole.CHILD.value,
                     name=(payload.name or "").strip() or "사용자",
                 )
                 session.add(user)
@@ -250,7 +254,7 @@ async def google_login(
                 raise HTTPException(
                     status.HTTP_409_CONFLICT, "Google 로그인을 다시 시도해주세요"
                 ) from None
-    return await create_session(session, user, settings)
+    return await create_session(session, user, settings, role_sent=payload.role is not None)
 
 
 @router.post("/otp/request", status_code=202)

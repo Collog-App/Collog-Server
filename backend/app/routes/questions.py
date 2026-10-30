@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from app.models import CallRecord, CallState, ParentProfile, QuestionTtsGrant, User
 from app.routes.shared import aware, settings_from
 from app.security import CurrentUser, SessionDep
-from app.services.domain import ensure_report_access, has_consent, participants_consented
+from app.services.domain import ensure_subject_access, has_consent, participants_consented
 from app.services.questions import daily_questions
 from app.services.storage import LocalStorage
 from app.services.tts import ElevenLabsDirectTtsGateway, QuestionTtsError
@@ -53,7 +53,7 @@ async def get_daily_questions(
     user: CurrentUser,
     session: SessionDep,
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id)
     source, questions = await questions_for_parent(request, session, parent_id, user.id)
     return {"source": source, "questions": [item.model_dump(by_alias=True) for item in questions]}
 
