@@ -58,6 +58,24 @@
 ### S6 PASS 본인인증 (대행사 계약 뒤)
 - 계약 전까지 앱의 PASS 화면은 꺼 둔다.
 
+## API 약속 (S1·S2·S4, 안드로이드 A3·A4 가 이것에 맞춘다)
+JSON 은 기존처럼 camelCase, 경로 접두어 `/v1`.
+
+- `UserView`(로그인·`/account/*` 응답의 사용자)에 추가: `nickname: str|null`, `gender: "MALE"|"FEMALE"|null`,
+  `birthDate: "YYYY-MM-DD"|null`, `email: str|null`, `marketingOptIn: bool`, `signupCompleted: bool`(닉네임 있음).
+- `GET /v1/account/nickname-availability?nickname=X` → `{"available": bool, "reason": "TAKEN"|"INVALID"|null}`.
+- `PATCH /v1/account/profile` `{"nickname", "gender", "birthDate"}`(모두 필수) → `UserView`. 중복 409, 형식 오류 422.
+- `PATCH /v1/account/preferences` `{"marketingOptIn": bool}` → `UserView`.
+- `GET /v1/account/sharing` → `{"shares": [{"viewerUserId", "viewerName", "relation", "report": bool, "timeline": bool}]}`
+  (같은 가족의 연결된 구성원마다 한 줄, 기본값 true). `PUT /v1/account/sharing` 같은 모양의 `shares` → 같은 응답.
+- `GET /v1/families/{familyId}/members` 각 구성원에 추가: `acceptedAt: datetime|null`, `consentGranted: bool`,
+  `nickname: str|null`, `birthDate: str|null`, `canRemove: bool`. `canInvite` = 가족 구성원 누구나 true.
+  만든 사람도 다른 구성원과 같은 형식(`relation` 은 초대 때 적은 값, 만든 사람은 `"SELF"` 아님 — 만든 사람의 relation 은 비워 두고 `isCreator: true`).
+- `DELETE /v1/families/{familyId}/members/{memberId}` → 204. 권한은 S4 규칙.
+- `POST /v1/families/{familyId}/invitations`·`POST /v1/invitations/accept`·`POST /v1/calls` 는 모양 그대로, 역할 검사만 없앤다.
+  가족이 아직 없는 사람의 첫 초대를 위해 `POST /v1/families` → `{"familyId"}`(이미 있으면 그 가족) 추가.
+- `GET/PUT /v1/parents/{userId}/profile` 은 누구나 자기 것·같은 가족 것(질환 `conditions` + `concerns`).
+
 ## 안드로이드 (Collog-Android `main`)
 | 단계 | 내용 | 필요한 서버 |
 |---|---|---|
