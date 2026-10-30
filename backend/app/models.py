@@ -85,6 +85,9 @@ class User(Base):
     apple_subject: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    google_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -104,6 +107,15 @@ class OtpChallenge(Base):
 
 class AppleLoginChallenge(Base):
     __tablename__ = "apple_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class GoogleLoginChallenge(Base):
+    __tablename__ = "google_login_challenges"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
@@ -186,6 +198,7 @@ class ParentProfile(Base):
 
     parent_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     conditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    concerns: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

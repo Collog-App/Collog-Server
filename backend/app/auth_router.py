@@ -14,6 +14,7 @@ from app.models import (
     AppleLoginChallenge,
     Device,
     Family,
+    GoogleLoginChallenge,
     OtpChallenge,
     RefreshSession,
     User,
@@ -22,6 +23,8 @@ from app.models import (
 from app.schemas import (
     AppleChallengeResponse,
     AppleLoginRequest,
+    GoogleChallengeResponse,
+    GoogleLoginRequest,
     OtpRequest,
     OtpVerify,
     RefreshRequest,
@@ -31,6 +34,7 @@ from app.schemas import (
 from app.security import SessionDep, issue_token, otp_hash
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.domain import family_of
+from app.services.google_auth import GoogleIdentityError, GoogleServiceError
 from app.services.sms import SmsDeliveryError, send_otp
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -158,6 +162,93 @@ async def apple_login(
             if user is None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT, "Apple 로그인을 다시 시도해주세요"
+                ) from None
+    return await create_session(session, user, settings)
+
+
+def require_google_login(settings: Settings) -> None:
+    if not settings.google_client_id:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Google 로그인을 사용할 수 없습니다"
+        )
+
+
+@router.post("/google/challenge", response_model=GoogleChallengeResponse)
+async def google_challenge(request: Request, session: SessionDep) -> GoogleChallengeResponse:
+    settings: Settings = request.app.state.container.settings
+    require_google_login(settings)
+    now = datetime.now(UTC)
+    await session.execute(
+        delete(GoogleLoginChallenge).where(GoogleLoginChallenge.expires_at < now)
+    )
+    nonce = secrets.token_urlsafe(32)
+    challenge = GoogleLoginChallenge(
+        nonce_hash=hashlib.sha256(nonce.encode()).hexdigest(),
+        expires_at=now + timedelta(seconds=settings.apple_challenge_ttl_seconds),
+    )
+    session.add(challenge)
+    await session.commit()
+    return GoogleChallengeResponse(
+        challenge_id=challenge.id, nonce=nonce, expires_in=settings.apple_challenge_ttl_seconds
+    )
+
+
+@router.post("/google", response_model=TokenResponse)
+async def google_login(
+    payload: GoogleLoginRequest, request: Request, session: SessionDep
+) -> TokenResponse:
+    settings: Settings = request.app.state.container.settings
+    require_google_login(settings)
+    challenge = await session.get(GoogleLoginChallenge, payload.challenge_id)
+    if challenge is None or challenge.consumed_at is not None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Google 로그인을 다시 시작해주세요")
+    if challenge.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Google 로그인 요청이 만료되었습니다")
+    try:
+        identity = await request.app.state.container.google_identity.verify(payload.id_token)
+    except GoogleIdentityError as exc:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "Google 로그인 정보를 확인할 수 없습니다"
+        ) from exc
+    except GoogleServiceError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Google 로그인 확인을 잠시 후 다시 시도해주세요"
+        ) from exc
+    nonce_hash = hashlib.sha256(identity.nonce.encode()).hexdigest()
+    if not hmac.compare_digest(challenge.nonce_hash, nonce_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Google 로그인 요청이 일치하지 않습니다")
+    consumed = await session.scalar(
+        update(GoogleLoginChallenge)
+        .where(
+            GoogleLoginChallenge.id == payload.challenge_id,
+            GoogleLoginChallenge.consumed_at.is_(None),
+            GoogleLoginChallenge.expires_at > datetime.now(UTC),
+        )
+        .values(consumed_at=datetime.now(UTC))
+        .execution_options(synchronize_session=False)
+        .returning(GoogleLoginChallenge.id)
+    )
+    if consumed is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "이미 사용한 Google 로그인 요청입니다")
+    user = await session.scalar(select(User).where(User.google_subject == identity.subject))
+    if user is None:
+        try:
+            async with session.begin_nested():
+                user = User(
+                    google_subject=identity.subject,
+                    phone=None,
+                    role=payload.role,
+                    name=(payload.name or "").strip() or "사용자",
+                )
+                session.add(user)
+                await session.flush()
+        except IntegrityError:
+            user = await session.scalar(
+                select(User).where(User.google_subject == identity.subject)
+            )
+            if user is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "Google 로그인을 다시 시도해주세요"
                 ) from None
     return await create_session(session, user, settings)
 

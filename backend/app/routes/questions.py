@@ -98,7 +98,7 @@ async def create_question_tts_token(
             not container.settings.mock_external_services
             and not container.settings.elevenlabs_data_processing_approved
         ):
-            raise HTTPException(status.HTTP_409_CONFLICT, "아이폰 기본 음성으로 재생해주세요")
+            raise HTTPException(status.HTTP_409_CONFLICT, "휴대폰 기본 음성으로 재생해주세요")
         if not isinstance(gateway, ElevenLabsDirectTtsGateway):
             raise HTTPException(status.HTTP_409_CONFLICT, "직접 음성 재생이 설정되지 않았습니다")
         question_count = await session.scalar(

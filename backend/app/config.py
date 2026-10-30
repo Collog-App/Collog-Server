@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     apple_team_id: str = ""
     apple_key_id: str = ""
     apple_private_key_path: Path | None = None
+    # Android Sign in with Google. ID 토큰의 aud가 되는 Web OAuth 클라이언트 ID이며
+    # 비워두면 Google 로그인 엔드포인트는 503을 반환한다. nonce 유효 시간은
+    # apple_challenge_ttl_seconds를 같이 쓴다.
+    google_client_id: str = ""
 
     schema_auto_reset: bool = False
 
@@ -51,6 +55,9 @@ class Settings(BaseSettings):
     apns_key_id: str = ""
     apns_bundle_id: str = ""
     apns_private_key_path: Path | None = None
+    # Android 통화·리포트 알림(FCM HTTP v1). Firebase 서비스 계정 키 JSON 경로이며,
+    # 비워두면 Android 기기로는 보내지 않는다.
+    fcm_service_account_path: Path | None = None
     incoming_call_ttl_seconds: int = 45
 
     # Track Egress worker가 없는 개발 환경에서 기기의 분석용 PCM만으로 파이프라인을 돌린다.
@@ -89,7 +96,7 @@ class Settings(BaseSettings):
     s3_use_instance_role: bool = False
     s3_force_path_style: bool = True
 
-    consent_document_version: str = "2026-09-13.v4"
+    consent_document_version: str = "2026-10-26.v5"
     parent_min_speech_seconds: int = 20
     raw_audio_wait_seconds: int = 30
     egress_wait_seconds: int = Field(default=120, ge=1)
@@ -142,6 +149,13 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     team_portal_enabled: bool = True
     team_portal_repository_url: str = "https://github.com/Collog-App/14th-hackathon"
+
+    @field_validator("fcm_service_account_path", mode="before")
+    @classmethod
+    def empty_fcm_path_is_unset(cls, value: object) -> object:
+        # compose의 `${FCM_KEY_FILE:+...}`는 키 파일이 없으면 빈 문자열을 넘기고,
+        # pydantic은 그걸 Path(".")로 바꾼다. 빈 값은 "설정 안 됨"으로 본다.
+        return None if isinstance(value, str) and not value.strip() else value
 
     @property
     def livekit_http_url(self) -> str:
