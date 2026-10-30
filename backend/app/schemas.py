@@ -165,7 +165,8 @@ class DeviceCreate(ApiModel):
 
 class InvitationCreate(ApiModel):
     name: str = Field(min_length=1, max_length=80)
-    relation: Literal["MOTHER", "FATHER"]
+    # Display label only. Anyone can invite anyone in the symmetric family model.
+    relation: Literal["MOTHER", "FATHER", "SPOUSE", "CHILD", "SIBLING", "GRANDPARENT", "OTHER"]
 
 
 class InvitationAccept(ApiModel):

@@ -193,3 +193,15 @@ def test_ios_login_with_a_role_keeps_working(client: TestClient) -> None:
             return await session.scalar(select(func.count(Family.id)))
 
     assert client.portal.call(count) == 1
+
+
+def test_invitations_accept_any_family_relation(client: TestClient) -> None:
+    _, child, parent_token, _ = onboard_family(client)
+    for relation in ("SPOUSE", "CHILD", "SIBLING", "GRANDPARENT", "OTHER"):
+        assert invite(client, parent_token, child["familyId"], relation)["status"] == "PENDING"
+    unknown = client.post(
+        f"/v1/families/{child['familyId']}/invitations",
+        headers=auth(parent_token),
+        json={"name": "가족", "relation": "COUSIN"},
+    )
+    assert unknown.status_code == 422
