@@ -146,6 +146,8 @@ async def get_members(
                     else None
                 ),
                 "consentGranted": member_status == "CONSENT_GRANTED",
+                "nickname": member_user.nickname if member_user else None,
+                "birthDate": member_user.birth_date if member_user else None,
                 "isCreator": False,
                 # 누구나 초대할 수 있으므로 대기 중 초대 코드도 구성원 모두에게 보인다.
                 "invitation": invitation_dict(invitation) if invitation else None,
@@ -167,6 +169,8 @@ async def get_members(
                 "expiresAt": None,
                 "acceptedAt": aware(family.created_at),
                 "consentGranted": owner_status == "CONSENT_GRANTED",
+                "nickname": owner.nickname,
+                "birthDate": owner.birth_date,
                 "isCreator": True,
                 "invitation": None,
             }

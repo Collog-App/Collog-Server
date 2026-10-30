@@ -28,6 +28,7 @@ class GoogleServiceError(Exception):
 class GoogleIdentity:
     subject: str
     nonce: str
+    email: str | None = None
 
 
 class GoogleIdentityVerifier:
@@ -116,7 +117,12 @@ class GoogleIdentityVerifier:
                 raise GoogleIdentityError("Invalid Google subject")
             if not isinstance(nonce, str) or not nonce or len(nonce) > 255:
                 raise GoogleIdentityError("Invalid Google nonce")
-            return GoogleIdentity(subject=subject, nonce=nonce)
+            # 계정 정보에 보여 줄 이메일. Google이 확인한 주소만 받는다.
+            email = claims.get("email")
+            verified = claims.get("email_verified") in (True, "true")
+            if not isinstance(email, str) or not verified or not 0 < len(email) <= 320:
+                email = None
+            return GoogleIdentity(subject=subject, nonce=nonce, email=email)
         # 깊게 중첩된 헤더 JSON은 PyJWT 안에서 RecursionError가 된다(PYSEC-2026-4142).
         except (jwt.PyJWTError, TypeError, ValueError, RecursionError) as exc:
             raise GoogleIdentityError("Invalid Google ID token") from exc

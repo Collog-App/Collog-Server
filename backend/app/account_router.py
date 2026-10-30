@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from datetime import UTC, datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import Field
 from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     AcousticAnalysisRun,
@@ -36,7 +38,7 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import ApiModel, UserView
+from app.schemas import NICKNAME_PATTERN, AccountProfileUpdate, ApiModel, UserView
 from app.security import CurrentUser, SessionDep
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.apple_oauth import apple_client_secret, revoke_apple_authorization
@@ -94,16 +96,40 @@ async def update_role(
             family = Family(created_by=user.id)
             session.add(family)
             await session.flush()
-        result = UserView(
-            id=user.id,
-            role=user.role,
-            name=user.name,
-            phone=user.phone,
-            apple_user_id=user.apple_subject,
-            family_id=family.id if family else None,
-        )
+        result = UserView.of(user, family.id if family else None)
         await session.commit()
         return result
+
+
+@router.get("/nickname-availability")
+async def nickname_availability(nickname: str, user: CurrentUser, session: SessionDep) -> dict:
+    if re.fullmatch(NICKNAME_PATTERN, nickname) is None:
+        return {"available": False, "reason": "INVALID"}
+    owner = await session.scalar(select(User.id).where(User.nickname == nickname))
+    if owner is not None and owner != user.id:
+        return {"available": False, "reason": "TAKEN"}
+    return {"available": True, "reason": None}
+
+
+@router.patch("/profile", response_model=UserView)
+async def update_profile(
+    payload: AccountProfileUpdate, user: CurrentUser, session: SessionDep
+) -> UserView:
+    taken = await session.scalar(
+        select(User.id).where(User.nickname == payload.nickname, User.id != user.id)
+    )
+    if taken is not None:
+        raise HTTPException(409, "이미 사용 중인 닉네임이에요")
+    user.nickname = payload.nickname
+    user.gender = payload.gender
+    user.birth_date = payload.birth_date
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(409, "이미 사용 중인 닉네임이에요") from None
+    family = await family_of(session, user)
+    return UserView.of(user, family.id if family else None)
 
 
 @router.delete("", status_code=204)

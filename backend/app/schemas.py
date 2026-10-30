@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
-from app.models import BaselineKind, CallState, Metric, TimeSlot, UserRole
+from app.models import BaselineKind, CallState, Metric, TimeSlot, User, UserRole
+
+# 닉네임: 한글 음절·영문·숫자 2~10자.
+NICKNAME_PATTERN = r"^[가-힣A-Za-z0-9]{2,10}$"
 
 
 def to_camel(value: str) -> str:
@@ -91,6 +95,40 @@ class UserView(ApiModel):
     phone: str | None = None
     apple_user_id: str | None = None
     family_id: str | None = None
+    nickname: str | None = None
+    gender: Literal["MALE", "FEMALE"] | None = None
+    birth_date: date | None = None
+    email: str | None = None
+    signup_completed: bool = False
+
+    @classmethod
+    def of(cls, user: User, family_id: str | None) -> UserView:
+        return cls(
+            id=user.id,
+            role=user.role,
+            name=user.name,
+            phone=user.phone,
+            apple_user_id=user.apple_subject,
+            family_id=family_id,
+            nickname=user.nickname,
+            gender=user.gender,
+            birth_date=user.birth_date,
+            email=user.email,
+            signup_completed=user.nickname is not None,
+        )
+
+
+class AccountProfileUpdate(ApiModel):
+    nickname: str = Field(pattern=NICKNAME_PATTERN)
+    gender: Literal["MALE", "FEMALE"]
+    birth_date: date
+
+    @field_validator("birth_date")
+    @classmethod
+    def plausible_birth_date(cls, value: date) -> date:
+        if not date(1900, 1, 1) <= value <= datetime.now(ZoneInfo("Asia/Seoul")).date():
+            raise ValueError("생년월일을 확인해주세요")
+        return value
 
 
 class TokenResponse(ApiModel):

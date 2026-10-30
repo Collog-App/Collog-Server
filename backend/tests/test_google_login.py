@@ -19,7 +19,7 @@ CLIENT_ID = "test-web-client.apps.googleusercontent.com"
 
 
 @pytest.fixture
-def sign_google(client: TestClient) -> Iterator[Callable[[str, str], str]]:
+def sign_google(client: TestClient) -> Iterator[Callable[..., str]]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     jwk = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
     jwk.update(kid="test-google", alg="RS256", use="sig")
@@ -30,7 +30,7 @@ def sign_google(client: TestClient) -> Iterator[Callable[[str, str], str]]:
     client.portal.call(container.google_identity.close)
     container.google_identity = GoogleIdentityVerifier(container.settings, client=http)
 
-    def sign(nonce: str, subject: str = "google-user") -> str:
+    def sign(nonce: str, subject: str = "google-user", **claims: object) -> str:
         now = datetime.now(UTC)
         return jwt.encode(
             {
@@ -40,6 +40,7 @@ def sign_google(client: TestClient) -> Iterator[Callable[[str, str], str]]:
                 "aud": CLIENT_ID,
                 "iat": now,
                 "exp": now + timedelta(minutes=5),
+                **claims,
             },
             key,
             algorithm="RS256",
@@ -203,3 +204,20 @@ def test_signup_without_role_has_no_family_until_the_first_invite(
     assert invitation.status_code == 201
     again = client.post("/v1/auth/google", json=google_payload(client, sign_google))
     assert again.json()["user"]["familyId"] == created.json()["familyId"]
+
+
+def test_verified_google_email_is_saved_on_the_account(client: TestClient, sign_google) -> None:
+    def signed_in(**claims: object) -> dict:
+        challenge = client.post("/v1/auth/google/challenge").json()
+        payload = {
+            "challengeId": challenge["challengeId"],
+            "idToken": sign_google(challenge["nonce"], "google-user", **claims),
+        }
+        response = client.post("/v1/auth/google", json=payload)
+        assert response.status_code == 200, response.text
+        return response.json()["user"]
+
+    assert signed_in(email="unverified@example.com", email_verified=False)["email"] is None
+    assert signed_in(email="mom@example.com", email_verified=True)["email"] == "mom@example.com"
+    assert signed_in()["email"] == "mom@example.com"
+    assert signed_in(email="new@example.com", email_verified=True)["email"] == "new@example.com"

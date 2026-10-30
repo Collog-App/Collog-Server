@@ -88,6 +88,13 @@ class User(Base):
     google_subject: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    # 가입 정보. 기존 사용자를 위해 비울 수 있고, 닉네임이 있으면 가입을 마친 것으로 본다.
+    nickname: Mapped[str | None] = mapped_column(
+        String(10), unique=True, index=True, nullable=True
+    )
+    gender: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

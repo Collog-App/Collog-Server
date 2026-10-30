@@ -371,6 +371,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/docs/calibration-todo.md` | 보정되지 않은 상수와 측정 계획. 근거와 완료 기준 |
 | `backend/tests/test_api_flow.py` | 온보딩부터 분석·폐기·리포트까지 E2E API test |
 | `backend/tests/test_family_symmetric.py` | 역할 없는 초대·수락(혼자뿐인 가족 정리, 409), 형제 통화, 분석 대상 선택, 프로필·리포트 접근 test |
+| `backend/tests/test_account_profile.py` | 닉네임 확인(INVALID·TAKEN), 가입 정보 저장·중복 409·형식 422, 구성원 목록의 닉네임·생년월일 test |
 | `backend/tests/test_providers.py` | Deepgram/Gemini/APNs provider unit test |
 | `backend/tests/test_ai_pipeline.py` | prompt/repeat/acoustic/calendar-week deterministic test |
 | `backend/tests/test_tts.py` | ElevenLabs 요청 계약, cache/서명 URL, 장애 local 폴백 test |
@@ -970,3 +971,8 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
   같은 모양(`relation` 빈 문자열)으로 주며 `canInvite`는 누구나 true, 초대 코드도 구성원 모두에게 보인다.
   통화는 같은 가족 둘이면 누구나, `/parents/{id}/...`는 본인 또는 같은 가족이면 허용한다. Google 로그인은
   역할을 안 보내도 되고, 그때는 로그인 때 가족을 만들지 않는다(iOS처럼 역할을 보내면 예전대로).
+- 2026-10-30: 가족 대칭 구조 S2. `users`에 `nickname`(유일, 한글 음절·영문·숫자 2~10자)·`gender`·`birth_date`·
+  `email`을 더했다(migration 0013, 모두 nullable). `UserView`에 같은 칸과 `signupCompleted`(닉네임 있음)를
+  더하고 `GET /v1/account/nickname-availability`, `PATCH /v1/account/profile`(중복 409, 형식 422)을 추가했다.
+  Google 로그인은 Google이 확인한(`email_verified`) 이메일만 `users.email`에 저장한다. 구성원 목록에
+  `nickname`·`birthDate`가 붙는다. 닉네임은 대소문자를 구분한다.

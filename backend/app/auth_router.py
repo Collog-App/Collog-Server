@@ -55,14 +55,7 @@ async def token_response(
     return TokenResponse(
         access_token=issue_token(user, settings, auth_session.id),
         refresh_token=refresh_token,
-        user=UserView(
-            id=user.id,
-            role=user.role,
-            name=user.name,
-            phone=user.phone,
-            apple_user_id=user.apple_subject,
-            family_id=family.id if family else None,
-        ),
+        user=UserView.of(user, family.id if family else None),
     )
 
 
@@ -243,6 +236,7 @@ async def google_login(
                     phone=None,
                     role=payload.role or UserRole.CHILD.value,
                     name=(payload.name or "").strip() or "사용자",
+                    email=identity.email,
                 )
                 session.add(user)
                 await session.flush()
@@ -254,6 +248,8 @@ async def google_login(
                 raise HTTPException(
                     status.HTTP_409_CONFLICT, "Google 로그인을 다시 시도해주세요"
                 ) from None
+    if identity.email:
+        user.email = identity.email
     return await create_session(session, user, settings, role_sent=payload.role is not None)
 
 
