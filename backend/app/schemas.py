@@ -124,13 +124,33 @@ class ConsentSubmit(ApiModel):
     agreed_items: list[str]
 
 
+Condition = Literal[
+    # Figma final design (2026-10-30)
+    "FORGETFULNESS",
+    "RESPIRATORY",
+    "RHINITIS",
+    # earlier list, still sent by the iOS app
+    "DIABETES",
+    "HYPERTENSION",
+    "DYSLIPIDEMIA",
+    "ASTHMA",
+    "OBESITY",
+]
+
+
 class ProfilePut(ApiModel):
-    conditions: list[Literal["DIABETES", "HYPERTENSION", "DYSLIPIDEMIA", "ASTHMA", "OBESITY"]]
+    conditions: list[Condition]
+    concerns: str | None = Field(default=None, max_length=500)
 
     @field_validator("conditions")
     @classmethod
     def unique_conditions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(value))
+
+    @field_validator("concerns")
+    @classmethod
+    def blank_concerns(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
 
 
 class QuestionView(ApiModel):

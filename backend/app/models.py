@@ -198,6 +198,7 @@ class ParentProfile(Base):
 
     parent_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     conditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    concerns: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

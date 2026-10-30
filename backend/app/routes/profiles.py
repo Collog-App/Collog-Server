@@ -23,13 +23,14 @@ async def get_profile(
     await ensure_report_access(session, user, parent_id)
     profile = await session.get(ParentProfile, parent_id)
     if profile is None:
-        return {"parentId": parent_id, "conditions": [], "updatedAt": None, "isCompleted": False}
-    return {
-        "parentId": profile.parent_id,
-        "conditions": profile.conditions,
-        "updatedAt": profile.updated_at,
-        "isCompleted": True,
-    }
+        return {
+            "parentId": parent_id,
+            "conditions": [],
+            "concerns": None,
+            "updatedAt": None,
+            "isCompleted": False,
+        }
+    return profile_view(profile)
 
 
 @router.put("/parents/{parentId}/profile", tags=["Profile"])
@@ -53,10 +54,18 @@ async def put_profile(
     else:
         profile.conditions = payload.conditions
         profile.updated_at = datetime.now(UTC)
+    # Older clients send only conditions; keep the stored note unless the field is sent.
+    if "concerns" in payload.model_fields_set:
+        profile.concerns = payload.concerns
     await session.commit()
+    return profile_view(profile)
+
+
+def profile_view(profile: ParentProfile) -> dict:
     return {
         "parentId": profile.parent_id,
         "conditions": profile.conditions,
+        "concerns": profile.concerns,
         "updatedAt": profile.updated_at,
         "isCompleted": True,
     }
