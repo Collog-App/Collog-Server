@@ -348,7 +348,7 @@ async def list_calls(
     from_: Annotated[date | None, Query(alias="from")] = None,
     to: date | None = None,
 ) -> dict:
-    await ensure_subject_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id, "timeline")
     statement = select(CallRecord).where(CallRecord.parent_id == parent_id)
     if from_:
         statement = statement.where(

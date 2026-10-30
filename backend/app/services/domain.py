@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import HTTPException, status
 from sqlalchemy import Select, or_, select
@@ -12,6 +13,7 @@ from app.models import (
     ConsentRecord,
     Family,
     FamilyMember,
+    FamilyShare,
     Invitation,
     User,
 )
@@ -63,6 +65,16 @@ async def is_family_member(session: AsyncSession, family: Family, user_id: str) 
         ).limit(1)
     )
     return member is not None
+
+
+async def family_people(session: AsyncSession, family: Family) -> set[str]:
+    """가족을 만든 사람과 초대를 수락한 구성원의 사용자 ID."""
+    members = await session.scalars(
+        select(FamilyMember.user_id).where(
+            FamilyMember.family_id == family.id, FamilyMember.user_id.is_not(None)
+        )
+    )
+    return {family.created_by, *members}
 
 
 async def family_of(session: AsyncSession, user: User) -> Family | None:
@@ -159,8 +171,21 @@ async def ensure_same_family(session: AsyncSession, user_id: str, other_id: str)
         raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
 
 
-async def ensure_subject_access(session: AsyncSession, user: User, subject_id: str) -> None:
-    """`/parents/{id}/...`의 id를 대상 사용자로 읽는다. 본인 또는 같은 가족 구성원만 허용한다."""
+async def ensure_subject_access(
+    session: AsyncSession,
+    user: User,
+    subject_id: str,
+    scope: Literal["report", "timeline"] | None = None,
+) -> None:
+    """`/parents/{id}/...`의 id를 대상 사용자로 읽는다.
+
+    본인 또는 같은 가족 구성원만 허용하고, `scope`가 있으면 대상이 그 구성원에게 공유를 껐는지도
+    본다. 공유 행이 없으면 허용한다.
+    """
     if user.id == subject_id:
         return
     await ensure_same_family(session, user.id, subject_id)
+    if scope is not None:
+        share = await session.get(FamilyShare, (subject_id, user.id))
+        if share is not None and not getattr(share, scope):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "열람 권한이 없는 항목입니다")

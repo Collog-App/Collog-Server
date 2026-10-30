@@ -99,6 +99,7 @@ class UserView(ApiModel):
     gender: Literal["MALE", "FEMALE"] | None = None
     birth_date: date | None = None
     email: str | None = None
+    marketing_opt_in: bool = False
     signup_completed: bool = False
 
     @classmethod
@@ -114,6 +115,7 @@ class UserView(ApiModel):
             gender=user.gender,
             birth_date=user.birth_date,
             email=user.email,
+            marketing_opt_in=user.marketing_opt_in,
             signup_completed=user.nickname is not None,
         )
 
@@ -129,6 +131,20 @@ class AccountProfileUpdate(ApiModel):
         if not date(1900, 1, 1) <= value <= datetime.now(ZoneInfo("Asia/Seoul")).date():
             raise ValueError("생년월일을 확인해주세요")
         return value
+
+
+class PreferencesUpdate(ApiModel):
+    marketing_opt_in: bool
+
+
+class ShareUpdate(ApiModel):
+    viewer_user_id: str
+    report: bool
+    timeline: bool
+
+
+class SharingUpdate(ApiModel):
+    shares: list[ShareUpdate]
 
 
 class TokenResponse(ApiModel):

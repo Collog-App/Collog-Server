@@ -180,6 +180,10 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
   S3 전까지 **분석 대상**이다(PARENT 역할이 정확히 하나면 그 사람, 아니면 받는 사람). 두 참여자 동시
   분석(`CallParticipant`), 복용약·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 있다.
   `users.role`은 응답 호환용과 위 분석 대상 선택에만 쓴다.
+- **가족 대칭 구조에서 정하지 않은 것.** 가족을 만든 사람은 `DELETE /families/{id}/members/{id}`로
+  나가거나 내보내질 수 없다(409). 소유권 넘기기가 정해지면 바꾼다. 초대 관계(`relation`)는 아직
+  `MOTHER`·`FATHER`뿐이라 형제·자녀를 초대할 때 고를 값이 없다. 만든 사람이 계정을 지우면 지금처럼
+  가족 전체가 사라진다.
 - **전체 STT segment 보관과 동의 문구가 불일치할 수 있다.** 성공 통화도 `transcripts.segments`에
   전체 전사를 저장하지만 화면은 구조화 항목만 기록한다고 안내한다. 보관 기간과 최소 evidence
   정책을 결정하고 코드/동의 문서를 함께 맞춰야 한다.
@@ -372,6 +376,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/tests/test_api_flow.py` | 온보딩부터 분석·폐기·리포트까지 E2E API test |
 | `backend/tests/test_family_symmetric.py` | 역할 없는 초대·수락(혼자뿐인 가족 정리, 409), 형제 통화, 분석 대상 선택, 프로필·리포트 접근 test |
 | `backend/tests/test_account_profile.py` | 닉네임 확인(INVALID·TAKEN), 가입 정보 저장·중복 409·형식 422, 구성원 목록의 닉네임·생년월일 test |
+| `backend/tests/test_family_sharing.py` | 공유 범위 기본값·끄면 리포트/타임라인 403, 구성원 내보내기 권한, 나가면 공유 초기화, 마케팅 동의, 계정 삭제 정리 test |
 | `backend/tests/test_providers.py` | Deepgram/Gemini/APNs provider unit test |
 | `backend/tests/test_ai_pipeline.py` | prompt/repeat/acoustic/calendar-week deterministic test |
 | `backend/tests/test_tts.py` | ElevenLabs 요청 계약, cache/서명 URL, 장애 local 폴백 test |
@@ -976,3 +981,10 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
   더하고 `GET /v1/account/nickname-availability`, `PATCH /v1/account/profile`(중복 409, 형식 422)을 추가했다.
   Google 로그인은 Google이 확인한(`email_verified`) 이메일만 `users.email`에 저장한다. 구성원 목록에
   `nickname`·`birthDate`가 붙는다. 닉네임은 대소문자를 구분한다.
+- 2026-10-30: 가족 대칭 구조 S4. `family_shares(owner_id, viewer_id, report, timeline)`와
+  `users.marketing_opt_in`(migration 0014)을 더했다. `GET/PUT /v1/account/sharing`은 같은 가족의 연결된
+  구성원마다 한 줄이며 행이 없으면 모두 허용이다. 리포트·기준선·변화 신호는 `report`, 통화 목록은
+  `timeline`을 본다(프로필·오늘의 질문은 같은 가족이면 그대로). `DELETE /v1/families/{familyId}/members/{memberId}`는
+  대기 중 초대는 구성원 누구나, 연결된 구성원은 만든 사람 또는 본인만 지우고, 그 두 사람 사이의 공유 행도
+  지운다. 구성원 목록에 `canRemove`, `PATCH /v1/account/preferences`(`marketingOptIn`)를 더했다. 계정 삭제는
+  그 사용자가 들어간 공유 행을 함께 지운다. migration 0013·0014는 SQLite로만 검증했다(맥에 Postgres 없음).

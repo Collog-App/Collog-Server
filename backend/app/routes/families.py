@@ -5,9 +5,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException, Path, Request, Response, status
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 
-from app.models import Family, FamilyMember, Invitation, User, UserRole
+from app.models import Family, FamilyMember, FamilyShare, Invitation, User, UserRole
 from app.routes.shared import aware, settings_from
 from app.schemas import InvitationAccept, InvitationCreate
 from app.security import CurrentUser, SessionDep
@@ -16,6 +16,7 @@ from app.services.domain import (
     consent_status,
     derived_member_status,
     family_for_user,
+    family_people,
     is_family_member,
     latest_invitation,
 )
@@ -148,6 +149,8 @@ async def get_members(
                 "consentGranted": member_status == "CONSENT_GRANTED",
                 "nickname": member_user.nickname if member_user else None,
                 "birthDate": member_user.birth_date if member_user else None,
+                "canRemove": member.user_id is None
+                or user.id in {family.created_by, member.user_id},
                 "isCreator": False,
                 # 누구나 초대할 수 있으므로 대기 중 초대 코드도 구성원 모두에게 보인다.
                 "invitation": invitation_dict(invitation) if invitation else None,
@@ -171,11 +174,49 @@ async def get_members(
                 "consentGranted": owner_status == "CONSENT_GRANTED",
                 "nickname": owner.nickname,
                 "birthDate": owner.birth_date,
+                "canRemove": False,
                 "isCreator": True,
                 "invitation": None,
             }
         )
     return {"members": output, "canInvite": True}
+
+
+@router.delete("/families/{familyId}/members/{memberId}", status_code=204, tags=["Family"])
+async def remove_member(
+    family_id: Annotated[str, Path(alias="familyId")],
+    member_id: Annotated[str, Path(alias="memberId")],
+    user: CurrentUser,
+    session: SessionDep,
+) -> Response:
+    """대기 중 초대는 구성원 누구나, 연결된 구성원은 가족을 만든 사람이나 본인(나가기)만 지운다."""
+    family = await session.get(Family, family_id)
+    if family is None or not await is_family_member(session, family, user.id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
+    member = await session.scalar(
+        select(FamilyMember)
+        .where(FamilyMember.id == member_id, FamilyMember.family_id == family_id)
+        .with_for_update()
+    )
+    if member is None:
+        if member_id == family.created_by:
+            raise HTTPException(status.HTTP_409_CONFLICT, "가족을 만든 사람은 내보낼 수 없어요")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 구성원을 찾을 수 없습니다")
+    if member.user_id is not None:
+        if user.id not in {family.created_by, member.user_id}:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "가족을 만든 사람이나 본인만 내보낼 수 있어요"
+            )
+        # 이 가족 안에서 정한 공유 범위를 지운다. 다시 들어오면 기본값(모두 공개)부터 시작한다.
+        others = list(await family_people(session, family) - {member.user_id})
+        await session.execute(delete(FamilyShare).where(or_(
+            and_(FamilyShare.owner_id == member.user_id, FamilyShare.viewer_id.in_(others)),
+            and_(FamilyShare.viewer_id == member.user_id, FamilyShare.owner_id.in_(others)),
+        )))
+    await session.execute(delete(Invitation).where(Invitation.member_id == member.id))
+    await session.execute(delete(FamilyMember).where(FamilyMember.id == member.id))
+    await session.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/invitations/{invitationId}/resend", status_code=201, tags=["Family"])
