@@ -36,12 +36,14 @@ async def get_families(user: CurrentUser, session: SessionDep) -> dict:
         ).exists()
         owned = owned & populated
     rows = await session.execute(
-        select(Family, User.name)
+        select(Family, User)
         .join(User, User.id == Family.created_by)
         .where(or_(owned, Family.id.in_(membership)))
         .order_by(Family.created_at, Family.id)
     )
-    families = [{"familyId": family.id, "name": f"{name}의 가족"} for family, name in rows]
+    families = [
+        {"familyId": family.id, "name": f"{owner.display_name}의 가족"} for family, owner in rows
+    ]
     return {"families": families}
 
 
@@ -163,7 +165,7 @@ async def get_members(
             {
                 "memberId": owner.id,
                 "userId": owner.id,
-                "name": owner.name,
+                "name": owner.display_name,
                 "relation": "",
                 "role": owner.role,
                 "status": owner_status,

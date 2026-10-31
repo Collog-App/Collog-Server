@@ -131,7 +131,7 @@ async def create_reserved_call(
         await livekit.create_room(call.room_name)
     except LiveKitError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-    token = livekit.participant_token(call.room_name, user.id, user.name)
+    token = livekit.participant_token(call.room_name, user.id, user.display_name)
     devices = list(await session.scalars(
         select(Device)
         .where(
@@ -152,7 +152,7 @@ async def create_reserved_call(
             IncomingCallPush(
                 call_id=call.id,
                 caller_id=user.id,
-                caller_name=user.name,
+                caller_name=user.display_name,
                 callee_id=callee.id,
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings_from(request).incoming_call_ttl_seconds),
@@ -211,7 +211,7 @@ async def accept_call(
             recording_enabled=call.recording_enabled,
             livekit_url=settings_from(request).livekit_url,
             room_name=call.room_name,
-            access_token=livekit.participant_token(call.room_name, user.id, user.name),
+            access_token=livekit.participant_token(call.room_name, user.id, user.display_name),
             raw_capture_required=call.recording_enabled and user.id == call.parent_id,
             audio_constraints=AudioConstraints(),
         ).model_dump(by_alias=True)
@@ -244,7 +244,7 @@ async def accept_call(
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
     settings = settings_from(request)
     livekit = request.app.state.container.livekit
-    token = livekit.participant_token(call.room_name, user.id, user.name)
+    token = livekit.participant_token(call.room_name, user.id, user.display_name)
     if call.recording_enabled and not settings.allow_raw_only_analysis:
         for _, kind, filename in (
             (call.parent_id, AssetKind.WEBRTC_EGRESS_PARENT, "parent.ogg"),

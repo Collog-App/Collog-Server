@@ -109,6 +109,11 @@ class User(Base):
     marketing_opt_in: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    @property
+    def display_name(self) -> str:
+        """다른 가족에게 보이는 이름. 가입 때 정한 닉네임이 있으면 로그인 계정 이름 대신 쓴다."""
+        return self.nickname or self.name
+
 
 class OtpChallenge(Base):
     __tablename__ = "otp_challenges"

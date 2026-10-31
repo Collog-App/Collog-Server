@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
 from app.models import CallRecord, Family
+from app.services.notifications import IncomingCallPush, VoipPushGateway
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 from tests.test_auth import login
@@ -205,3 +206,39 @@ def test_invitations_accept_any_family_relation(client: TestClient) -> None:
         json={"name": "가족", "relation": "COUSIN"},
     )
     assert unknown.status_code == 422
+
+
+def test_family_sees_the_nickname_instead_of_the_login_name(client: TestClient) -> None:
+    first_token, first, second_token, second = siblings(client)
+    profile = client.patch(
+        "/v1/account/profile",
+        headers=auth(first_token),
+        json={"nickname": "첫째별명", "gender": "FEMALE", "birthDate": "1960-03-15"},
+    )
+    assert profile.status_code == 200, profile.text
+
+    members = client.get(
+        f"/v1/families/{first['familyId']}/members", headers=auth(second_token)
+    ).json()["members"]
+    assert [m["name"] for m in members if m["isCreator"]] == ["첫째별명"]
+    families = client.get("/v1/families", headers=auth(second_token)).json()["families"]
+    assert [f["name"] for f in families] == ["첫째별명의 가족"]
+
+    class Recorder(VoipPushGateway):
+        def __init__(self) -> None:
+            self.sent: list[IncomingCallPush] = []
+
+        async def send_incoming_call(self, token: str, push: IncomingCallPush) -> None:
+            self.sent.append(push)
+
+    device = client.post("/v1/devices", headers=auth(second_token), json={
+        "platform": "ANDROID", "token": "fcm-token",
+        "voipToken": "fcm-token", "pushToken": "fcm-token",
+    })
+    assert device.status_code == 201, device.text
+    client.app.state.container.android_voip_push = Recorder()
+    created = client.post("/v1/calls", headers=auth(first_token), json={"calleeId": second["id"]})
+    assert created.status_code == 201, created.text
+    assert [push.caller_name for push in client.app.state.container.android_voip_push.sent] == [
+        "첫째별명"
+    ]
