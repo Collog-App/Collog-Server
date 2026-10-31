@@ -223,6 +223,8 @@ def test_family_sees_the_nickname_instead_of_the_login_name(client: TestClient) 
     assert [m["name"] for m in members if m["isCreator"]] == ["첫째별명"]
     families = client.get("/v1/families", headers=auth(second_token)).json()["families"]
     assert [f["name"] for f in families] == ["첫째별명의 가족"]
+    shares = client.get("/v1/account/sharing", headers=auth(second_token)).json()["shares"]
+    assert [s["viewerName"] for s in shares] == ["첫째별명"]
 
     class Recorder(VoipPushGateway):
         def __init__(self) -> None:

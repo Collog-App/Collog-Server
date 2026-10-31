@@ -169,7 +169,7 @@ async def sharing_view(session: SessionDep, user: User) -> dict:
         people = [(row.user_id, row.name, row.relation) for row in members]
         owner = await session.get(User, family.created_by)
         if owner is not None:
-            people.append((owner.id, owner.name, ""))
+            people.append((owner.id, owner.display_name, ""))
         for viewer_id, name, relation in people:
             if viewer_id in seen:
                 continue
