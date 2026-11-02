@@ -3,6 +3,10 @@
 콜록의 P0 API, self-hosted LiveKit 통화 녹음, Deepgram Nova-3 한국어 STT,
 Gemini 건강 대화 구조화 파이프라인이다.
 
+데이터 분석 작업의 코드 진입점과 입출력·CSV 변환은 [데이터 분석 가이드](docs/data-analysis-entrypoints.md)를 참고한다.
+
+피처의 계산식과 측정 불가 조건은 [현재 피처 추출 방식](docs/feature-extraction-current.md)을 참고한다.
+
 ## 구현 범위
 
 - 휴대폰 OTP 인증, 부모 초대, append-only 민감정보 동의, 질환 프로필
