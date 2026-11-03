@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
-from app.models import FamilyShare
+from app.models import Family, FamilyShare
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 from tests.test_auth import login
@@ -104,7 +104,8 @@ def test_member_removal_permissions(client: TestClient) -> None:
     pending = invite(client, parent_token, family_id, "FATHER")
 
     creator_view = members(client, child_token, family_id)
-    assert creator_view[child["id"]]["canRemove"] is False
+    # 만든 사람은 스스로 나갈 수만 있다
+    assert creator_view[child["id"]]["canRemove"] is True
     assert creator_view[parent["id"]]["canRemove"] is True
     member_view = members(client, parent_token, family_id)
     assert member_view[parent["id"]]["canRemove"] is True
@@ -168,3 +169,38 @@ def test_marketing_preference_and_account_deletion_clear_sharing(client: TestCli
             return await session.scalar(select(func.count()).select_from(FamilyShare))
 
     assert client.portal.call(remaining) == 0
+
+
+def test_creator_leaving_hands_the_family_to_the_first_member(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    family_id = child["familyId"]
+    father_token, father = create_user(client, "01040000005", "PARENT", "아버지")
+    joined = accept(client, father_token, invite(client, child_token, family_id, "FATHER")["code"])
+    assert joined.status_code == 200
+    assert put_sharing(client, parent_token, child["id"], report=False, timeline=False) == 200
+
+    assert remove(client, child_token, family_id, child["id"]) == 204
+    view = members(client, father_token, family_id)
+    assert set(view) == {parent["id"], father["id"]}
+    assert view[parent["id"]]["isCreator"] is True
+    assert login(client, "01033334444")["user"]["familyId"] == family_id
+    left = client.get(f"/v1/families/{family_id}/members", headers=auth(child_token))
+    assert left.status_code == 403
+    assert [s["viewerUserId"] for s in sharing(client, parent_token)] == [father["id"]]
+    call = client.post("/v1/calls", headers=auth(father_token), json={"calleeId": parent["id"]})
+    assert call.status_code == 201, call.text
+
+
+def test_creator_leaving_alone_deletes_the_family(client: TestClient) -> None:
+    token, user = create_user(client, "01040000006", "CHILD", "혼자")
+    pending = invite(client, token, user["familyId"])
+    assert remove(client, token, user["familyId"], user["id"]) == 204
+    joiner_token, _ = create_user(client, "01040000007", "PARENT", "늦게")
+    assert accept(client, joiner_token, pending["code"]).status_code == 404
+
+    async def families() -> int:
+        async with client.app.state.container.database.sessions() as session:
+            return await session.scalar(select(func.count()).select_from(Family))
+
+    assert client.portal.call(families) == 0
+

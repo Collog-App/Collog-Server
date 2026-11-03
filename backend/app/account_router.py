@@ -50,7 +50,7 @@ from app.schemas import (
 from app.security import CurrentUser, SessionDep
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.apple_oauth import apple_client_secret, revoke_apple_authorization
-from app.services.domain import connected_family_ids, family_of
+from app.services.domain import connected_family_ids, family_of, hand_over_family
 from app.services.storage import StorageError
 
 router = APIRouter(prefix="/account", tags=["Account"])
@@ -284,6 +284,13 @@ async def delete_account(
         # Reports and baselines can contain summaries derived from the deleted calls.
         for model in (Report, Baseline):
             await session.execute(delete(model).where(model.parent_id.in_(parent_ids)))
+        # 만든 가족에 다른 구성원이 있으면 가족은 남기고 주인만 넘긴다.
+        # 남은 사람이 없는 가족만 아래에서 지운다.
+        for family in list(await session.scalars(
+            select(Family).where(Family.created_by == user.id)
+        )):
+            await hand_over_family(session, family)
+        await session.flush()
         owned_family_ids = select(Family.id).where(Family.created_by == user.id)
         removed_member_ids = select(FamilyMember.id).where(
             or_(FamilyMember.user_id == user.id, FamilyMember.family_id.in_(owned_family_ids))

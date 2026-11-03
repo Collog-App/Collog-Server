@@ -165,7 +165,8 @@ def test_delete_removes_private_data_and_preserves_other_user(
                 CallRecord, AudioAsset, Transcript, Report, Device, FamilyMember, Invitation,
             ):
                 assert await session.scalar(select(func.count()).select_from(model)) == 0
-            assert await session.scalar(select(func.count(Family.id))) == int(delete_parent)
+            # 누가 지워지든 남은 사람이 가족을 이어받아 가족은 남는다
+            assert await session.scalar(select(func.count(Family.id))) == 1
             for model in (RefreshSession, ConsentRecord):
                 assert await session.scalar(
                     select(func.count()).select_from(model)

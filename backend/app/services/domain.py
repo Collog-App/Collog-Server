@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import Select, or_, select
+from sqlalchemy import Select, and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.consent import CONSENT_ITEMS, CONSENT_VERSION
@@ -75,6 +75,46 @@ async def family_people(session: AsyncSession, family: Family) -> set[str]:
         )
     )
     return {family.created_by, *members}
+
+
+async def clear_family_shares(session: AsyncSession, family: Family, user_id: str) -> None:
+    """가족을 떠나는 사람과 남은 구성원 사이의 공유 범위를 지운다.
+
+    다시 들어오면 기본값(모두 공개)부터 시작한다.
+    """
+    others = list(await family_people(session, family) - {user_id})
+    await session.execute(delete(FamilyShare).where(or_(
+        and_(FamilyShare.owner_id == user_id, FamilyShare.viewer_id.in_(others)),
+        and_(FamilyShare.viewer_id == user_id, FamilyShare.owner_id.in_(others)),
+    )))
+
+
+async def hand_over_family(session: AsyncSession, family: Family) -> bool:
+    """가족을 만든 사람이 떠날 때 가장 먼저 초대받아 들어온 구성원을 새 주인으로 한다.
+
+    넘길 사람이 없으면 False.
+    """
+    heir = await session.scalar(
+        select(FamilyMember)
+        .where(FamilyMember.family_id == family.id, FamilyMember.user_id.is_not(None))
+        .order_by(FamilyMember.invited_at, FamilyMember.id)
+        .limit(1)
+    )
+    if heir is None:
+        return False
+    # 만든 사람은 구성원 줄 없이 Family.created_by 로만 연결된다
+    await session.execute(delete(Invitation).where(Invitation.member_id == heir.id))
+    await session.execute(delete(FamilyMember).where(FamilyMember.id == heir.id))
+    family.created_by = heir.user_id
+    return True
+
+
+async def delete_family(session: AsyncSession, family: Family) -> None:
+    """남은 구성원이 없는 가족을 대기 중 초대와 함께 지운다."""
+    member_ids = select(FamilyMember.id).where(FamilyMember.family_id == family.id)
+    await session.execute(delete(Invitation).where(Invitation.member_id.in_(member_ids)))
+    await session.execute(delete(FamilyMember).where(FamilyMember.family_id == family.id))
+    await session.delete(family)
 
 
 async def family_of(session: AsyncSession, user: User) -> Family | None:
