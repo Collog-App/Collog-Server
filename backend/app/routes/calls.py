@@ -123,6 +123,7 @@ async def create_reserved_call(
         recording_enabled=recording_enabled,
         recording_disabled_reason=disabled_reason,
         asked_question_ids=[item.question_id for item in questions],
+        question_target_id=parent.id,
     )
     session.add(call)
     await session.flush()
@@ -246,7 +247,7 @@ async def accept_call(
     livekit = request.app.state.container.livekit
     token = livekit.participant_token(call.room_name, user.id, user.display_name)
     if call.recording_enabled and not settings.allow_raw_only_analysis:
-        for _, kind, filename in (
+        for owner_id, kind, filename in (
             (call.parent_id, AssetKind.WEBRTC_EGRESS_PARENT, "parent.ogg"),
             (call.child_id, AssetKind.WEBRTC_EGRESS_CHILD, "child.ogg"),
         ):
@@ -256,6 +257,7 @@ async def accept_call(
                 kind=kind.value,
                 uri=request.app.state.container.storage.object_uri(key),
                 content_type="audio/ogg",
+                owner_user_id=owner_id,
             )
             session.add(asset)
     await session.commit()

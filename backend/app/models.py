@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -54,6 +55,18 @@ class CallState(StrEnum):
     ANALYZED = "ANALYZED"
     ANALYSIS_EXCLUDED = "ANALYSIS_EXCLUDED"
     ANALYSIS_FAILED = "ANALYSIS_FAILED"
+
+
+class AnalysisMode(StrEnum):
+    SINGLE = "SINGLE"
+    BOTH = "BOTH"
+
+
+class ParticipantStatus(StrEnum):
+    PENDING = "PENDING"
+    ANALYZED = "ANALYZED"
+    EXCLUDED = "EXCLUDED"
+    FAILED = "FAILED"
 
 
 class TimeSlot(StrEnum):
@@ -284,6 +297,14 @@ class CallRecord(Base):
     report_notified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # SINGLE = parent_id 한 사람만 분석, BOTH = 두 참여자를 각자 분석(call_participants).
+    analysis_mode: Mapped[str] = mapped_column(
+        String(16), default=AnalysisMode.SINGLE.value, server_default=AnalysisMode.SINGLE.value
+    )
+    # 연결 질문을 고른 프로필의 주인. SINGLE 은 parent_id, BOTH 는 받는 사람.
+    question_target_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     @property
@@ -293,6 +314,29 @@ class CallRecord(Base):
     @property
     def callee_id(self) -> str:
         return self.child_id if self.effective_caller_id == self.parent_id else self.parent_id
+
+
+class CallParticipant(Base):
+    """BOTH 통화의 참여자별 분석 상태. SINGLE 통화에는 행이 없다."""
+
+    __tablename__ = "call_participants"
+    __table_args__ = (
+        Index("uq_call_participants_call_user", "call_id", "user_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    role: Mapped[str] = mapped_column(String(16))
+    # 전사 segment 의 speaker 값. parent_id 인 사람이 PARENT 다.
+    speaker_label: Mapped[str] = mapped_column(String(16))
+    analysis_status: Mapped[str] = mapped_column(
+        String(16), default=ParticipantStatus.PENDING.value
+    )
+    exclusion_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    speech_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class QuestionTtsGrant(Base):
@@ -320,6 +364,8 @@ class AudioAsset(Base):
     status: Mapped[str] = mapped_column(String(16), default=AssetStatus.PENDING.value)
     egress_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     track_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    # 이 음성이 누구의 목소리인지. 원시 오디오는 올린 사람, Egress 는 그 트랙의 참여자다.
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -343,6 +389,9 @@ class RepeatEvent(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     speaker: Mapped[str] = mapped_column(String(16), default=UserRole.PARENT.value)
     start_ms: Mapped[int] = mapped_column(Integer)
     end_ms: Mapped[int] = mapped_column(Integer)
@@ -356,9 +405,16 @@ class RepeatEvent(Base):
 
 class HealthExtraction(Base):
     __tablename__ = "health_extractions"
+    __table_args__ = (
+        Index("uq_health_extractions_call_subject", "call_id", "subject_user_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), unique=True, index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    # 이 행이 누구의 건강 기록인지. S3 이전 통화는 calls.parent_id 로 채워져 있다.
+    subject_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     parse_status: Mapped[str] = mapped_column(String(16))
     symptom: Mapped[str | None] = mapped_column(Text, nullable=True)
     medication: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -370,9 +426,15 @@ class HealthExtraction(Base):
 
 class ExtractionEvidence(Base):
     __tablename__ = "extraction_evidence"
+    __table_args__ = (
+        Index("uq_extraction_evidence_call_subject", "call_id", "subject_user_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), unique=True, index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     facts: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     schema_version: Mapped[str] = mapped_column(String(24), default="v2")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -383,6 +445,9 @@ class AcousticFeature(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     audio_source: Mapped[str] = mapped_column(String(24))
     metric: Mapped[str] = mapped_column(String(32), index=True)
     value: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -394,9 +459,15 @@ class AcousticFeature(Base):
 
 class AcousticAnalysisRun(Base):
     __tablename__ = "acoustic_analysis_runs"
+    __table_args__ = (
+        Index("uq_acoustic_analysis_runs_call_subject", "call_id", "subject_user_id", unique=True),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
-    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), unique=True, index=True)
+    call_id: Mapped[str] = mapped_column(ForeignKey("calls.id"), index=True)
+    subject_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id"), index=True, nullable=True
+    )
     analyzer_version: Mapped[str] = mapped_column(String(48))
     cough_detector_version: Mapped[str] = mapped_column(String(48))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

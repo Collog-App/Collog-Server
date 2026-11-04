@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     s3_force_path_style: bool = True
 
     consent_document_version: str = "2026-10-26.v5"
+    # 통화한 두 사람을 각자의 분석 대상으로 처리한다(S3). 통화를 만들 때만 읽고 결정은 통화 행
+    # (`calls.analysis_mode`)에 남기므로, 도중에 바꿔도 이미 만든 통화의 처리 방식은 그대로다.
+    two_participant_analysis_enabled: bool = False
     parent_min_speech_seconds: int = 20
     raw_audio_wait_seconds: int = 30
     egress_wait_seconds: int = Field(default=120, ge=1)

@@ -64,6 +64,7 @@ async def raw_audio_upload_url(
         content_type=payload.content_type,
         duration_sec=payload.duration_sec,
         sample_rate=payload.sample_rate,
+        owner_user_id=user.id,
     )
     session.add(asset)
     await session.commit()

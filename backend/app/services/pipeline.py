@@ -350,6 +350,7 @@ class ProcessingPipeline:
                 [
                     RepeatEvent(
                         call_id=call_id,
+                        subject_user_id=call.parent_id,
                         speaker="PARENT",
                         start_ms=event.start_ms,
                         end_ms=event.end_ms,
@@ -416,7 +417,9 @@ class ProcessingPipeline:
                 select(HealthExtraction).where(HealthExtraction.call_id == call_id)
             )
             if extraction is None:
-                extraction = HealthExtraction(call_id=call_id, parse_status=parse_status)
+                extraction = HealthExtraction(
+                    call_id=call_id, subject_user_id=call.parent_id, parse_status=parse_status
+                )
                 session.add(extraction)
             extraction.parse_status = parse_status
             extraction.symptom = extraction_values["symptom"]
@@ -428,7 +431,7 @@ class ProcessingPipeline:
                 select(ExtractionEvidence).where(ExtractionEvidence.call_id == call_id)
             )
             if evidence is None:
-                evidence = ExtractionEvidence(call_id=call_id)
+                evidence = ExtractionEvidence(call_id=call_id, subject_user_id=call.parent_id)
                 session.add(evidence)
             evidence.facts = extraction_facts
             evidence.schema_version = "v2"
@@ -438,6 +441,7 @@ class ProcessingPipeline:
             if analysis_run is None:
                 analysis_run = AcousticAnalysisRun(
                     call_id=call_id,
+                    subject_user_id=call.parent_id,
                     analyzer_version=self.settings.acoustic_analyzer_version,
                     cough_detector_version="transient-heuristic-v1",
                 )
@@ -453,6 +457,7 @@ class ProcessingPipeline:
                 session.add(
                     AcousticFeature(
                         call_id=call_id,
+                        subject_user_id=call.parent_id,
                         audio_source=(
                             "DEVICE_RAW"
                             if acoustic_asset.kind == AssetKind.DEVICE_RAW.value

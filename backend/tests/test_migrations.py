@@ -105,6 +105,75 @@ def test_incompatible_schema_is_refused_without_data_loss(tmp_path: Path, change
     engine.dispose()
 
 
+def test_two_participant_migration_backfills_the_single_subject(tmp_path: Path) -> None:
+    database = tmp_path / "s3.db"
+    result = migrate(database, "upgrade", "0015_kakao_login")
+    assert result.returncode == 0, result.stderr
+    engine = sa.create_engine(f"sqlite:///{database}")
+    now = datetime.now(UTC)
+    rows = {
+        "users": [
+            dict(id="parent", role="PARENT", name="부모", created_at=now),
+            dict(id="child", role="CHILD", name="자녀", created_at=now),
+        ],
+        "calls": [dict(
+            id="call", parent_id="parent", child_id="child", caller_id="child", state="ANALYZED",
+            room_name="room", recording_enabled=True, started_at=now, asked_question_ids="[]",
+            created_at=now,
+        )],
+        "audio_assets": [
+            dict(id=kind, call_id="call", kind=kind, uri=f"local://{kind}",
+                 content_type="audio/ogg", status="PURGED", created_at=now)
+            for kind in ("DEVICE_RAW", "WEBRTC_EGRESS_PARENT", "WEBRTC_EGRESS_CHILD")
+        ],
+        "health_extractions": [dict(id="x", call_id="call", parse_status="OK", created_at=now)],
+        "extraction_evidence": [
+            dict(id="e", call_id="call", facts="[]", schema_version="v2", created_at=now)
+        ],
+        "acoustic_analysis_runs": [dict(
+            id="r", call_id="call", analyzer_version="v", cough_detector_version="v",
+            created_at=now,
+        )],
+        "acoustic_features": [dict(
+            id="f", call_id="call", audio_source="DEVICE_RAW", metric="SPEECH_RATE",
+            value=1.0, unit="u", status="OK", observed_at=now,
+        )],
+        "repeat_events": [dict(
+            id="p", call_id="call", speaker="PARENT", start_ms=0, end_ms=1,
+            category="REPEAT_REQUEST", matched_text="뭐라고", rule_id="r", confidence=1.0,
+            rule_version="v", created_at=now,
+        )],
+    }
+    with engine.begin() as connection:
+        metadata = sa.MetaData()
+        metadata.reflect(connection)
+        for table, values in rows.items():
+            connection.execute(metadata.tables[table].insert(), values)
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        call = connection.execute(
+            sa.text("SELECT analysis_mode, question_target_id FROM calls")
+        ).one()
+        assert tuple(call) == ("SINGLE", "parent")
+        owners = dict(
+            connection.execute(sa.text("SELECT kind, owner_user_id FROM audio_assets")).all()
+        )
+        assert owners == {
+            "DEVICE_RAW": "parent",
+            "WEBRTC_EGRESS_PARENT": "parent",
+            "WEBRTC_EGRESS_CHILD": "child",
+        }
+        for table in rows:
+            if table in {"users", "calls", "audio_assets"}:
+                continue
+            subject = connection.scalar(sa.text(f"SELECT subject_user_id FROM {table}"))
+            assert subject == "parent", table
+        assert connection.scalar(sa.text("SELECT count(*) FROM call_participants")) == 0
+        assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+    engine.dispose()
+
+
 def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "rollback.db"
     assert migrate(database, "upgrade", "head").returncode == 0
