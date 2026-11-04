@@ -1,6 +1,6 @@
 # 가족 대칭 구조(B안) 이행 계획
 
-마지막 갱신: 2026-10-30 · 브랜치 `feat/family-symmetric`(`feat/android-port` 위)
+마지막 갱신: 2026-11-04(S3) · 브랜치 `feat/family-symmetric`(`feat/android-port` 위)
 
 ## 왜
 
@@ -40,10 +40,45 @@
   (설계 문서의 「가족 제안 → 본인 확인」은 S3 뒤로 미룬다). 저장 조건 = 대상 본인의 분석 동의.
 - 이메일: Google·카카오 로그인에서 받은 값을 `users.email`(nullable)에 저장해 계정 정보에 보인다. 변경은 없다.
 
-### S3 두 사람 분석 (큼 — 팀·비용 확인 뒤)
-- `CallParticipant(callId, userId, role, analysisStatus, speechSec)`, 참여자별 STT·추출·음향, 대상별 리포트.
-- 오늘의 질문 대상 = 받는 사람의 프로필. 원본 폐기는 두 사람 분석이 모두 끝난 뒤.
-- 분석 비용이 대략 두 배가 된다 → `operating-cost.html` 기준으로 다시 계산하고 팀 결정 뒤 착수.
+### S3 두 사람 분석 (2026-11-04 구현, 브랜치 `feat/two-participant-analysis`, 설정 기본 꺼짐)
+- 분석 비용이 대략 두 배가 된다 → `operating-cost.html` 기준으로 다시 계산하고 팀 결정 뒤 켠다.
+- 스위치: `TWO_PARTICIPANT_ANALYSIS_ENABLED`(기본 `false`). **통화를 만들 때만** 읽고 결정은 `calls.analysis_mode`
+  (`SINGLE`/`BOTH`)에 남긴다. 꺼져 있으면 지금과 똑같이 `calls.parent_id` 한 사람만 분석하고, 켜기 전에 만든 통화는
+  켠 뒤에 처리해도 `SINGLE` 이다. 마이그레이션 `0016_two_participant_analysis`.
+- 데이터: `call_participants(call_id, user_id, role CALLER/CALLEE, speaker_label PARENT/CHILD, analysis_status
+  PENDING/ANALYZED/EXCLUDED/FAILED, exclusion_reason, speech_sec)` — `BOTH` 통화만 행이 있다(옛 통화는 채우지 않음).
+  `speaker_label` 은 전사 segment 의 speaker 값이고 `parent_id` 인 사람이 `PARENT` 다. `audio_assets.owner_user_id`(누구의
+  목소리인지), 분석 표 다섯 개(`health_extractions`·`extraction_evidence`·`acoustic_analysis_runs`·`acoustic_features`·
+  `repeat_events`)에 `subject_user_id`, `calls.question_target_id`. 옛 행은 `parent_id`(자녀 Egress 는 `child_id`)로 채웠다.
+  통화당 한 행이던 세 표는 `(call_id, subject_user_id)` 유일로 바뀌었다.
+- 통화 생성(`BOTH`): 참여자 두 줄, 연결 질문 = 받는 사람의 프로필(`question_target_id` = 받는 사람, 최근 질문 제외도 이
+  칸 기준), `rawCaptureRequired` 는 녹음이 켜져 있으면 두 사람 모두 true. 원시 오디오 upload-url 은 두 참여자 모두 받고,
+  대기 중 자산은 올린 사람별로 찾으며, complete 는 자기 자산(`owner_user_id`)만 된다.
+- 파이프라인(`BOTH`): 공통 단계(상태·동의·보관 한도·자산 확인) 뒤에 나뉜다. 예전처럼 Egress·원시 오디오를 기다리고
+  (`raw_audio_wait_seconds`), 자기 Egress 가 없는 참여자는 `FAILED`(`EGRESS_MISSING`). 선점은 지금의 조건부 UPDATE 한 번.
+  전사는 두 트랙을 한 번에 저장하고 재시도 때 다시 쓴다(Deepgram 재호출 없음). 그 뒤 참여자마다: 발화가
+  `parent_min_speech_seconds` 보다 짧으면 `EXCLUDED`(`INSUFFICIENT_SPEECH`), 그 사람의 추출이 아직 없을 때만 Gemini 를
+  부르고 바로 커밋(재시도 때 재과금 없음), 음향은 자기 원시 오디오(없으면 자기 Egress, 이때 F0·기침은 지금처럼
+  `SOURCE_NOT_RAW`), 되묻기·기준선도 그 사람 것으로 만들고 `ANALYZED`. 일시 오류는 다른 참여자를 마저 끝낸 뒤 기존 재시도로
+  넘기고, 영구 오류는 그 참여자만 `FAILED`. 통화 상태 = 한 명이라도 `ANALYZED` 면 `ANALYZED`(리포트 알림 그대로), 아니면
+  `FAILED` 가 있으면 `ANALYSIS_FAILED`, 아니면 `ANALYSIS_EXCLUDED`. 원본 오디오는 모든 참여자가 끝난 뒤에만 지운다. 재시도
+  소진·24시간 보관 한도에서는 남은 참여자를 `FAILED` 로 닫고 지우며, 동의 철회는 기다리지 않고 바로 지운다. 전체 전사
+  보관은 지금과 같다. raw-only 개발 모드(`ALLOW_RAW_ONLY_ANALYSIS`)는 `SINGLE` 만 된다.
+- 추출 프롬프트·검증기·mock 은 그대로 쓴다. 분석할 사람의 segment 를 `PARENT`, 상대를 `CHILD` 로 바꿔 넣고(segment id 는
+  그대로라 근거가 저장된 전사를 가리킨다) 결과에 `subject_user_id` 를 단다. **프롬프트는 분석 대상을 여전히 「부모」라고
+  부른다** — 자녀·형제 발화를 「부모」로 읽혀도 품질이 같은지 relabel 한 평가(`evals/`)를 먼저 돌린 뒤 설정을 켠다.
+- 읽기(모드와 무관): 대상 X 의 통화 = `parent_id` 가 X 인 `SINGLE` 통화 + X 의 참여자 행이 끝난(`ANALYZED`/`EXCLUDED`)
+  `BOTH` 통화. 리포트(추출·음향·신호·되묻기)·기준선·변화 신호가 대상별로 나뉜다. `/parents/{id}/calls` 는 지금처럼 상태와
+  상관없이 `parent_id` 통화에 X 가 참여한 `BOTH` 통화를 더한다. 경로 `/v1/parents/{parentId}/...` 는 그대로.
+- API: 통화 응답(`GET /calls/{id}`, `/end`, `/parents/{id}/calls`)은 `BOTH` 통화에만 `analysisMode` 와
+  `participants[]`(`userId, role, speakerLabel, analysisStatus, exclusionReason, speechSec`)를 더한다.
+  `/calls/{id}/transcript`·`/extraction`·`/acoustic-features` 는 `?subjectId=` 를 받는다(비우면 `parent_id`, 지금과 같음).
+  통화 대상이 아니면 404, 다른 사람을 고르면 그 사람의 리포트 공유 범위(S4)를 본다. transcript 의 `excluded`·
+  `exclusionReason`·`parentSpeechSec` 는 고른 대상 기준이다.
+- 계정 삭제: 지금처럼 그 사람이 참여한 통화를 모두 지우고, `call_participants` 와 `BOTH` 통화 상대 쪽의 리포트·기준선도 지운다.
+- **되돌리기 주의**: `BOTH` 행이 생긴 뒤 S3 이전 바이너리로 되돌리면 `call_id` 로만 찾는 옛 코드가 한 사람의 추출·음향을
+  다른 사람 것처럼 보일 수 있다. 되돌리기 전에 `BOTH` 통화에서 나온 행(`analysis_mode='BOTH'` 통화의 분석 표 행·참여자 행,
+  상대 쪽 리포트·기준선)을 먼저 지운다. 설정만 끄는 것은 안전하다(이미 만든 `BOTH` 통화는 `BOTH` 로 끝난다).
 
 ### S4 구성원 관리·공유 범위 (중간)
 - `DELETE /v1/families/{familyId}/members/{memberId}`: 대기 중 초대는 구성원 누구나, 연결된 구성원은

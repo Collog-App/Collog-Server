@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from fastapi import HTTPException, Request, status
+from sqlalchemy import select
 
 from app.config import Settings
-from app.models import AnalysisMode, CallRecord, User
+from app.models import AnalysisMode, CallParticipant, CallRecord, User
 from app.security import SessionDep
+from app.services.domain import ensure_subject_access
 
 
 def settings_from(request: Request) -> Settings:
@@ -17,8 +19,8 @@ def aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def call_to_dict(call: CallRecord) -> dict:
-    return {
+def call_to_dict(call: CallRecord, participants: list[CallParticipant] | None = None) -> dict:
+    view = {
         "callId": call.id,
         "parentId": call.parent_id,
         "childId": call.child_id,
@@ -41,6 +43,36 @@ def call_to_dict(call: CallRecord) -> dict:
         "askedQuestionIds": call.asked_question_ids,
         "rawAudioPurgedAt": call.raw_audio_purged_at,
     }
+    # 두 사람을 분석한 통화만 참여자별 상태를 덧붙인다. SINGLE 응답은 그대로다.
+    if call.analysis_mode == AnalysisMode.BOTH.value:
+        view["analysisMode"] = call.analysis_mode
+        view["participants"] = [
+            {
+                "userId": item.user_id,
+                "role": item.role,
+                "speakerLabel": item.speaker_label,
+                "analysisStatus": item.analysis_status,
+                "exclusionReason": item.exclusion_reason,
+                "speechSec": item.speech_sec,
+            }
+            for item in participants or []
+        ]
+    return view
+
+
+async def call_participants(
+    session: SessionDep, calls: list[CallRecord]
+) -> dict[str, list[CallParticipant]]:
+    both_ids = [call.id for call in calls if call.analysis_mode == AnalysisMode.BOTH.value]
+    rows: dict[str, list[CallParticipant]] = {}
+    if both_ids:
+        for item in await session.scalars(
+            select(CallParticipant)
+            .where(CallParticipant.call_id.in_(both_ids))
+            .order_by(CallParticipant.role.desc())
+        ):
+            rows.setdefault(item.call_id, []).append(item)
+    return rows
 
 
 def raw_capture(call: CallRecord, user_id: str) -> bool:
@@ -53,3 +85,23 @@ def raw_capture(call: CallRecord, user_id: str) -> bool:
 async def ensure_call_access(session: SessionDep, user: User, call: CallRecord) -> None:
     if user.id not in {call.parent_id, call.child_id}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "통화 접근 권한이 없습니다")
+
+
+async def call_subject(
+    session: SessionDep, user: User, call: CallRecord, subject_id: str | None
+) -> str:
+    """통화 분석 결과를 볼 대상. 비우면 지금처럼 `parent_id` 다.
+
+    다른 사람의 결과를 고르면 그 사람이 정한 리포트 공유 범위(S4)를 본다.
+    """
+    await ensure_call_access(session, user, call)
+    if subject_id is None:
+        return call.parent_id
+    subjects = {call.parent_id}
+    if call.analysis_mode == AnalysisMode.BOTH.value:
+        subjects.add(call.child_id)
+    if subject_id not in subjects:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "이 통화의 분석 대상이 아닙니다")
+    if subject_id != user.id:
+        await ensure_subject_access(session, user, subject_id, "report")
+    return subject_id

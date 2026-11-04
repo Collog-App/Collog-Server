@@ -14,10 +14,12 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
+    AnalysisMode,
     AppleLoginChallenge,
     AssetKind,
     AudioAsset,
     Baseline,
+    CallParticipant,
     CallRecord,
     CallState,
     ChangeSignal,
@@ -257,7 +259,10 @@ async def delete_account(
             ).with_for_update()
         ))
         call_ids = [call.id for call in calls]
-        parent_ids = {user.id, *(call.parent_id for call in calls)}
+        # 두 사람을 분석한 통화는 상대의 리포트·기준선에도 들어가 있다.
+        parent_ids = {user.id, *(call.parent_id for call in calls)} | {
+            call.child_id for call in calls if call.analysis_mode == AnalysisMode.BOTH.value
+        }
         assets = list(await session.scalars(
             select(AudioAsset).where(AudioAsset.call_id.in_(call_ids))
         ))
@@ -278,6 +283,7 @@ async def delete_account(
         for model in (
             QuestionTtsGrant, AcousticAnalysisRun, AcousticFeature, ChangeSignal,
             ExtractionEvidence, HealthExtraction, RepeatEvent, Transcript, AudioAsset,
+            CallParticipant,
         ):
             await session.execute(delete(model).where(model.call_id.in_(call_ids)))
         await session.execute(delete(CallRecord).where(CallRecord.id.in_(call_ids)))

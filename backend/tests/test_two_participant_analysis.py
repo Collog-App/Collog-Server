@@ -11,6 +11,7 @@ from app.models import (
     AcousticFeature,
     AnalysisMode,
     AudioAsset,
+    Baseline,
     CallParticipant,
     CallRecord,
     CallState,
@@ -18,6 +19,7 @@ from app.models import (
     HealthExtraction,
     ParticipantStatus,
     RepeatEvent,
+    Report,
 )
 from app.services.pipeline import segments_for_subject
 from tests.conftest import auth
@@ -286,12 +288,24 @@ def test_both_participants_are_analysed_as_their_own_subjects(client: TestClient
         } == {speaker}
     features = subject_rows(client, call_id, AcousticFeature)
     assert {key: len(rows) for key, rows in features.items()} == {parent["id"]: 4, child["id"]: 4}
+    speech = {item["userId"]: item["speechSec"] for item in view["participants"]}
     for subject_id, word in ((parent["id"], "기침"), (child["id"], "머리")):
         report = client.get(
             f"/v1/parents/{subject_id}/reports?period=WEEKLY", headers=auth(parent_token)
         ).json()
         assert report["analyzedCallCount"] == 1
         assert [word in item for item in report["conversationItems"]["symptom"]] == [True]
+        query = f"?subjectId={subject_id}"
+        extraction = client.get(f"/v1/calls/{call_id}/extraction{query}", headers=auth(child_token))
+        assert word in extraction.json()["symptom"]
+        transcript = client.get(f"/v1/calls/{call_id}/transcript{query}", headers=auth(child_token))
+        assert transcript.json()["parentSpeechSec"] == speech[subject_id]
+        acoustics = client.get(
+            f"/v1/calls/{call_id}/acoustic-features{query}", headers=auth(child_token)
+        )
+        assert len(acoustics.json()["features"]) == 4
+    default = client.get(f"/v1/calls/{call_id}/extraction", headers=auth(child_token)).json()
+    assert "기침" in default["symptom"]
 
 
 def test_short_speech_excludes_only_that_participant(client: TestClient) -> None:
@@ -412,6 +426,71 @@ def test_call_created_while_off_stays_single_after_turning_on(client: TestClient
     assert participants_of(client, call_id) == []
     assert set(subject_rows(client, call_id, HealthExtraction)) == {parent["id"]}
     assert set(subject_rows(client, call_id, AcousticFeature)) == {parent["id"]}
+
+
+def test_call_views_show_participants_only_for_both_calls(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    single = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    single_id = single.json()["callId"]
+    client.post(f"/v1/calls/{single_id}/end", headers=auth(child_token))
+    both_id = stored_both_call(client, parent, child)
+
+    single_view = client.get(f"/v1/calls/{single_id}", headers=auth(child_token)).json()
+    assert "analysisMode" not in single_view and "participants" not in single_view
+    both_view = client.get(f"/v1/calls/{both_id}", headers=auth(child_token)).json()
+    assert both_view["analysisMode"] == "BOTH"
+    assert [(item["userId"], item["role"], item["analysisStatus"]) for item in both_view[
+        "participants"
+    ]] == [(child["id"], "CALLER", "ANALYZED"), (parent["id"], "CALLEE", "ANALYZED")]
+    listed = client.get(f"/v1/parents/{parent['id']}/calls", headers=auth(parent_token)).json()
+    by_id = {item["callId"]: item for item in listed["calls"]}
+    assert len(by_id[both_id]["participants"]) == 2
+    assert "participants" not in by_id[single_id]
+
+    # SINGLE 통화에는 자녀 몫의 결과가 없다.
+    assert client.get(
+        f"/v1/calls/{single_id}/extraction?subjectId={child['id']}", headers=auth(child_token)
+    ).status_code == 404
+    extraction = client.get(
+        f"/v1/calls/{both_id}/extraction?subjectId={child['id']}", headers=auth(parent_token)
+    )
+    assert extraction.json()["symptom"] == "자녀 두통"
+    shared = client.put(
+        "/v1/account/sharing",
+        headers=auth(child_token),
+        json={"shares": [{"viewerUserId": parent["id"], "report": False, "timeline": True}]},
+    )
+    assert shared.status_code == 200, shared.text
+    assert client.get(
+        f"/v1/calls/{both_id}/extraction?subjectId={child['id']}", headers=auth(parent_token)
+    ).status_code == 403
+    assert client.get(
+        f"/v1/calls/{both_id}/extraction?subjectId={child['id']}", headers=auth(child_token)
+    ).status_code == 200
+
+
+def test_deleting_the_subject_also_removes_the_other_sides_reports(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    stored_both_call(client, parent, child)
+    for subject_id in (parent["id"], child["id"]):
+        client.get(f"/v1/parents/{subject_id}/reports?period=WEEKLY", headers=auth(child_token))
+        client.get(f"/v1/parents/{subject_id}/baseline", headers=auth(child_token))
+    assert client.delete("/v1/account", headers=auth(parent_token)).status_code == 204
+
+    async def leftovers() -> tuple[int, int, int]:
+        async with client.app.state.container.database.sessions() as session:
+            counts = []
+            for model, column in (
+                (CallParticipant, CallParticipant.user_id),
+                (Report, Report.parent_id),
+                (Baseline, Baseline.parent_id),
+            ):
+                counts.append(len(list(await session.scalars(
+                    select(model).where(column == child["id"])
+                ))))
+            return tuple(counts)
+
+    assert client.portal.call(leftovers) == (0, 0, 0)
 
 
 def test_segments_for_subject_relabels_without_moving_segment_ids() -> None:
