@@ -8,6 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Query, Requ
 from sqlalchemy import or_, select, update
 
 from app.models import (
+    AnalysisMode,
     AssetKind,
     AudioAsset,
     CallParticipant,
@@ -19,7 +20,13 @@ from app.models import (
 )
 from app.routes.devices import deliver_incoming_call_push
 from app.routes.questions import questions_for_parent
-from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
+from app.routes.shared import (
+    aware,
+    call_to_dict,
+    ensure_call_access,
+    raw_capture,
+    settings_from,
+)
 from app.schemas import AudioConstraints, CallAccepted, CallAcceptRequest, CallCreate, CallCreated
 from app.security import CurrentUser, SessionDep
 from app.services.domain import (
@@ -108,7 +115,12 @@ async def create_reserved_call(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "상대방의 통화 수신 기기가 등록되지 않았습니다"
             )
-    source, questions = await questions_for_parent(request, session, parent.id, child.id)
+    both = settings_from(request).two_participant_analysis_enabled
+    # 두 사람을 모두 분석하면 연결 질문은 받는 사람의 프로필에서 고른다.
+    target = callee if both else parent
+    source, questions = await questions_for_parent(
+        request, session, target.id, child.id if target.id == parent.id else parent.id
+    )
     del source
     recording_enabled = await participants_consented(
         session, parent.id, child.id, settings_from(request).consent_document_version
@@ -132,10 +144,21 @@ async def create_reserved_call(
         recording_enabled=recording_enabled,
         recording_disabled_reason=disabled_reason,
         asked_question_ids=[item.question_id for item in questions],
-        question_target_id=parent.id,
+        question_target_id=target.id,
+        analysis_mode=(AnalysisMode.BOTH if both else AnalysisMode.SINGLE).value,
     )
     session.add(call)
     await session.flush()
+    if both:
+        session.add_all([
+            CallParticipant(
+                call_id=call.id,
+                user_id=person.id,
+                role=role,
+                speaker_label="PARENT" if person.id == parent.id else "CHILD",
+            )
+            for person, role in ((user, "CALLER"), (callee, "CALLEE"))
+        ])
     livekit = request.app.state.container.livekit
     try:
         await livekit.create_room(call.room_name)
@@ -181,7 +204,7 @@ async def create_reserved_call(
         call_id=call.id,
         caller_id=call.effective_caller_id,
         callee_id=call.callee_id,
-        raw_capture_required=recording_enabled and user.id == parent.id,
+        raw_capture_required=recording_enabled and raw_capture(call, user.id),
         livekit_url=settings_from(request).livekit_url,
         room_name=call.room_name,
         access_token=token,
@@ -222,7 +245,7 @@ async def accept_call(
             livekit_url=settings_from(request).livekit_url,
             room_name=call.room_name,
             access_token=livekit.participant_token(call.room_name, user.id, user.display_name),
-            raw_capture_required=call.recording_enabled and user.id == call.parent_id,
+            raw_capture_required=call.recording_enabled and raw_capture(call, user.id),
             audio_constraints=AudioConstraints(),
         ).model_dump(by_alias=True)
     if call.state not in {CallState.RINGING.value, CallState.CREATED.value}:
@@ -278,7 +301,7 @@ async def accept_call(
         livekit_url=settings.livekit_url,
         room_name=call.room_name,
         access_token=token,
-        raw_capture_required=call.recording_enabled and user.id == call.parent_id,
+        raw_capture_required=call.recording_enabled and raw_capture(call, user.id),
         audio_constraints=AudioConstraints(),
     )
     return response.model_dump(by_alias=True)

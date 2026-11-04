@@ -122,6 +122,7 @@ async def seed(args: argparse.Namespace) -> int:
                 room_name=f"{ROOM_PREFIX}w{abs(offset)}-{ended:%Y%m%d%H%M%S}",
                 recording_enabled=True,
                 asked_question_ids=list(entry.get("askedQuestionIds", [])),
+                question_target_id=parent.id,
                 started_at=started,
                 accepted_at=started,
                 ended_at=ended,

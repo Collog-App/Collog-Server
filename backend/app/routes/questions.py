@@ -23,7 +23,7 @@ async def recent_question_exclusions(session: SessionDep, parent_id: str) -> set
     calls = (
         await session.scalars(
             select(CallRecord)
-            .where(CallRecord.parent_id == parent_id)
+            .where(CallRecord.question_target_id == parent_id)
             .order_by(CallRecord.started_at.desc())
             .limit(3)
         )

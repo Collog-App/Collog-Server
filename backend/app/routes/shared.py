@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from fastapi import HTTPException, Request, status
 
 from app.config import Settings
-from app.models import CallRecord, User
+from app.models import AnalysisMode, CallRecord, User
 from app.security import SessionDep
 
 
@@ -41,6 +41,13 @@ def call_to_dict(call: CallRecord) -> dict:
         "askedQuestionIds": call.asked_question_ids,
         "rawAudioPurgedAt": call.raw_audio_purged_at,
     }
+
+
+def raw_capture(call: CallRecord, user_id: str) -> bool:
+    """원시 오디오를 올릴 사람. 두 사람을 분석하면 둘 다, 아니면 분석 대상만이다."""
+    return user_id == call.parent_id or (
+        call.analysis_mode == AnalysisMode.BOTH.value and user_id == call.child_id
+    )
 
 
 async def ensure_call_access(session: SessionDep, user: User, call: CallRecord) -> None:

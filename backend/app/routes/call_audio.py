@@ -8,7 +8,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Request, Re
 from sqlalchemy import select
 
 from app.models import AssetKind, AssetStatus, AudioAsset, CallRecord, CallState
-from app.routes.shared import aware, settings_from
+from app.routes.shared import aware, raw_capture, settings_from
 from app.schemas import RawAudioComplete, RawAudioUploadRequest
 from app.security import CurrentUser, SessionDep
 from app.services.storage import LocalStorage
@@ -29,7 +29,7 @@ async def raw_audio_upload_url(
     )
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
-    if user.id != call.parent_id or not call.recording_enabled:
+    if not raw_capture(call, user.id) or not call.recording_enabled:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "원시 오디오 업로드 권한이 없습니다")
     if call.state not in {CallState.ACTIVE.value, CallState.ENDED.value}:
         raise HTTPException(status.HTTP_409_CONFLICT, "오디오 업로드 시간이 지났습니다")
@@ -40,6 +40,7 @@ async def raw_audio_upload_url(
     existing = await session.scalar(select(AudioAsset).where(
         AudioAsset.call_id == call.id,
         AudioAsset.kind == AssetKind.DEVICE_RAW.value,
+        AudioAsset.owner_user_id == user.id,
         AudioAsset.status == AssetStatus.PENDING.value,
         AudioAsset.created_at >= datetime.now(UTC) - timedelta(
             seconds=settings_from(request).upload_url_ttl_seconds
@@ -56,7 +57,8 @@ async def raw_audio_upload_url(
                 (datetime.now(UTC) - aware(existing.created_at)).total_seconds()
             )),
         }
-    key = f"calls/{call.id}/raw/parent-{random.randrange(10**10):010d}.wav"
+    speaker = "parent" if user.id == call.parent_id else "child"
+    key = f"calls/{call.id}/raw/{speaker}-{random.randrange(10**10):010d}.wav"
     asset = AudioAsset(
         call_id=call.id,
         kind=AssetKind.DEVICE_RAW.value,
@@ -110,7 +112,9 @@ async def raw_audio_complete(
     asset = await session.get(AudioAsset, payload.asset_id)
     if call is None or asset is None or asset.call_id != call.id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "오디오 자산을 찾을 수 없습니다")
-    if user.id != call.parent_id or asset.kind != AssetKind.DEVICE_RAW.value:
+    # 자기 목소리 파일만 완료할 수 있다. 주인이 비어 있으면 S3 이전 자산이라 분석 대상의 것이다.
+    owner = asset.owner_user_id or call.parent_id
+    if user.id != owner or asset.kind != AssetKind.DEVICE_RAW.value:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "오디오 자산 접근 권한이 없습니다")
     if not call.recording_enabled:
         await session.rollback()
