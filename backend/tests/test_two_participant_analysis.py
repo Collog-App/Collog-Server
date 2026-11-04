@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
 from fastapi.testclient import TestClient
@@ -9,13 +10,16 @@ from sqlalchemy import select
 from app.models import (
     AcousticFeature,
     AnalysisMode,
+    AudioAsset,
     CallParticipant,
     CallRecord,
     CallState,
+    ExtractionEvidence,
     HealthExtraction,
     ParticipantStatus,
     RepeatEvent,
 )
+from app.services.pipeline import segments_for_subject
 from tests.conftest import auth
 from tests.test_api_flow import onboard_family, tone_wav
 from tests.test_family_symmetric import stored_call
@@ -187,6 +191,240 @@ def test_both_call_asks_questions_from_the_callee_profile(client: TestClient) ->
         assert stored_call(client, call_id).question_target_id == target["id"]
         ended = client.post(f"/v1/calls/{call_id}/end", headers=auth(parent_token))
         assert ended.status_code == 200
+
+
+PARENT_SPEECH = (
+    "어젯밤에 기침 때문에 두 번 깼어. 그래도 아침 혈압약은 챙겨 먹었고 오후에는 공원을 삼십 분 "
+    "정도 천천히 산책했어. 오늘은 잠이 조금 부족해서 평소보다 졸리지만 다른 불편함은 따로 "
+    "이야기하지 않았어."
+)
+CHILD_SPEECH = (
+    "저는 요즘 회사 일이 많아서 밤에 잠을 자주 깨요. 어제는 머리가 아팠어요. 그래서 진통제 약을 "
+    "먹었고 오늘 아침에는 회사까지 사십 분을 걸어서 출근했어요."
+)
+
+
+def start_call(client: TestClient, both: bool = True):
+    """통화를 받고 끊은 뒤 원시 오디오까지 올린다. Egress 는 `deliver_egress` 로 따로 끝낸다."""
+    child_token, child, parent_token, parent = onboard_family(client)
+    client.app.state.container.settings.two_participant_analysis_enabled = both
+    created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    call_id = created.json()["callId"]
+    assert client.post(f"/v1/calls/{call_id}/accept", headers=auth(parent_token)).status_code == 200
+    assert client.post(f"/v1/calls/{call_id}/end", headers=auth(child_token)).status_code == 200
+    for token in (child_token, parent_token) if both else (parent_token,):
+        upload = upload_url(client, call_id, token)
+        parsed = urlsplit(upload.json()["uploadUrl"])
+        assert client.put(parsed.path + "?" + parsed.query, content=tone_wav()).status_code == 204
+        completed = client.post(
+            f"/v1/calls/{call_id}/raw-audio/complete",
+            headers=auth(token),
+            json={"assetId": upload.json()["assetId"]},
+        )
+        assert completed.status_code == 202, completed.text
+    return call_id, child_token, child, parent_token, parent
+
+
+def call_assets(client: TestClient, call_id: str) -> list[AudioAsset]:
+    async def load() -> list[AudioAsset]:
+        async with client.app.state.container.database.sessions() as session:
+            return list(
+                await session.scalars(select(AudioAsset).where(AudioAsset.call_id == call_id))
+            )
+
+    return client.portal.call(load)
+
+
+def deliver_egress(client: TestClient, call_id: str, speech: dict[str, str]) -> None:
+    storage = client.app.state.container.storage
+    egress = [item for item in call_assets(client, call_id) if item.kind != "DEVICE_RAW"]
+    for asset in egress:
+        client.portal.call(
+            storage.write, storage.object_key(asset.uri), speech[asset.owner_user_id].encode()
+        )
+    for asset in egress:
+        assert asset.egress_id
+        webhook = client.post(
+            "/v1/webhooks/livekit",
+            json={
+                "event": "egress_ended",
+                "egress_info": {"egress_id": asset.egress_id, "status": "EGRESS_COMPLETE"},
+            },
+        )
+        assert webhook.status_code == 204, webhook.text
+
+
+def subject_rows(client: TestClient, call_id: str, model: type) -> dict[str, list]:
+    async def load() -> dict[str, list]:
+        async with client.app.state.container.database.sessions() as session:
+            rows: dict[str, list] = {}
+            for row in await session.scalars(select(model).where(model.call_id == call_id)):
+                rows.setdefault(row.subject_user_id, []).append(row)
+            return rows
+
+    return client.portal.call(load)
+
+
+def test_both_participants_are_analysed_as_their_own_subjects(client: TestClient) -> None:
+    call_id, child_token, child, parent_token, parent = start_call(client)
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert view["state"] == "ANALYZED"
+    assert view["rawAudioPurgedAt"] is not None
+    assert {(row.user_id, row.analysis_status) for row in participants_of(client, call_id)} == {
+        (parent["id"], "ANALYZED"), (child["id"], "ANALYZED"),
+    }
+    transcript = client.get(f"/v1/calls/{call_id}/transcript", headers=auth(child_token)).json()
+    speaker_of = {item["segmentId"]: item["speaker"] for item in transcript["segments"]}
+    evidence = subject_rows(client, call_id, ExtractionEvidence)
+    for subject_id, speaker in ((parent["id"], "PARENT"), (child["id"], "CHILD")):
+        facts = evidence[subject_id][0].facts
+        assert facts
+        assert {
+            speaker_of[segment_id] for fact in facts for segment_id in fact["evidenceSegmentIds"]
+        } == {speaker}
+    features = subject_rows(client, call_id, AcousticFeature)
+    assert {key: len(rows) for key, rows in features.items()} == {parent["id"]: 4, child["id"]: 4}
+    for subject_id, word in ((parent["id"], "기침"), (child["id"], "머리")):
+        report = client.get(
+            f"/v1/parents/{subject_id}/reports?period=WEEKLY", headers=auth(parent_token)
+        ).json()
+        assert report["analyzedCallCount"] == 1
+        assert [word in item for item in report["conversationItems"]["symptom"]] == [True]
+
+
+def test_short_speech_excludes_only_that_participant(client: TestClient) -> None:
+    call_id, child_token, child, _, parent = start_call(client)
+    extract = AsyncMock(wraps=client.app.state.container.pipeline.extraction.extract)
+    client.app.state.container.pipeline.extraction.extract = extract
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: "네 저도 잘 지내요"})
+
+    view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert view["state"] == "ANALYZED"
+    assert view["rawAudioPurgedAt"] is not None
+    assert {
+        (row.user_id, row.analysis_status, row.exclusion_reason)
+        for row in participants_of(client, call_id)
+    } == {(parent["id"], "ANALYZED", None), (child["id"], "EXCLUDED", "INSUFFICIENT_SPEECH")}
+    assert extract.await_count == 1
+    assert set(subject_rows(client, call_id, HealthExtraction)) == {parent["id"]}
+    child_report = client.get(
+        f"/v1/parents/{child['id']}/reports?period=WEEKLY", headers=auth(child_token)
+    ).json()
+    assert child_report["analyzedCallCount"] == 0
+    assert child_report["state"] != "EMPTY"
+
+
+def test_transient_error_keeps_audio_and_retries_without_billing_again(
+    client: TestClient,
+) -> None:
+    call_id, child_token, child, _, parent = start_call(client)
+    container = client.app.state.container
+    pipeline = container.pipeline
+    transcribe = AsyncMock(wraps=pipeline.stt.transcribe)
+    extract = AsyncMock(wraps=pipeline.extraction.extract)
+    pipeline.stt.transcribe = transcribe
+    pipeline.extraction.extract = extract
+    parent_raw = next(
+        item.uri for item in call_assets(client, call_id)
+        if item.kind == "DEVICE_RAW" and item.owner_user_id == parent["id"]
+    )
+    original_read = pipeline.storage.read
+    failed: list[str] = []
+
+    async def flaky_read(uri: str) -> bytes:
+        if uri == parent_raw and not failed:
+            failed.append(uri)
+            raise TimeoutError()
+        return await original_read(uri)
+
+    pipeline.storage.read = flaky_read
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    call = stored_call(client, call_id)
+    assert call.state == CallState.ENDED.value
+    assert call.processing_retry_at is not None
+    assert call.raw_audio_purged_at is None
+    assert client.portal.call(container.storage.exists, parent_raw)
+    assert {(row.user_id, row.analysis_status) for row in participants_of(client, call_id)} == {
+        (parent["id"], "PENDING"), (child["id"], "ANALYZED"),
+    }
+
+    async def release() -> None:
+        async with container.database.sessions() as session:
+            row = await session.get(CallRecord, call_id)
+            row.processing_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+    client.portal.call(release)
+    client.portal.call(pipeline.process, call_id)
+
+    view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert view["state"] == "ANALYZED"
+    assert view["rawAudioPurgedAt"] is not None
+    assert not client.portal.call(container.storage.exists, parent_raw)
+    assert (transcribe.await_count, extract.await_count) == (2, 2)
+    assert {row.analysis_status for row in participants_of(client, call_id)} == {"ANALYZED"}
+
+
+def test_exhausted_retry_closes_the_rest_and_purges(client: TestClient) -> None:
+    call_id, child_token, child, _, parent = start_call(client)
+    container = client.app.state.container
+    pipeline = container.pipeline
+    parent_raw = next(
+        item.uri for item in call_assets(client, call_id)
+        if item.kind == "DEVICE_RAW" and item.owner_user_id == parent["id"]
+    )
+    original_read = pipeline.storage.read
+
+    async def broken_read(uri: str) -> bytes:
+        if uri == parent_raw:
+            raise TimeoutError()
+        return await original_read(uri)
+
+    async def last_attempt() -> None:
+        async with container.database.sessions() as session:
+            row = await session.get(CallRecord, call_id)
+            row.processing_attempts = 2
+            await session.commit()
+
+    client.portal.call(last_attempt)
+    pipeline.storage.read = broken_read
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert view["state"] == "ANALYZED"
+    assert view["rawAudioPurgedAt"] is not None
+    assert {
+        (row.user_id, row.analysis_status, row.exclusion_reason)
+        for row in participants_of(client, call_id)
+    } == {(parent["id"], "FAILED", "ANALYSIS_ERROR"), (child["id"], "ANALYZED", None)}
+
+
+def test_call_created_while_off_stays_single_after_turning_on(client: TestClient) -> None:
+    call_id, child_token, child, _, parent = start_call(client, both=False)
+    client.app.state.container.settings.two_participant_analysis_enabled = True
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    call = stored_call(client, call_id)
+    assert (call.state, call.analysis_mode) == ("ANALYZED", "SINGLE")
+    assert participants_of(client, call_id) == []
+    assert set(subject_rows(client, call_id, HealthExtraction)) == {parent["id"]}
+    assert set(subject_rows(client, call_id, AcousticFeature)) == {parent["id"]}
+
+
+def test_segments_for_subject_relabels_without_moving_segment_ids() -> None:
+    segments = [
+        {"segmentId": "s0000", "speaker": "PARENT", "text": "괜찮아"},
+        {"segmentId": "s0001", "speaker": "CHILD", "text": "머리가 아팠어요"},
+    ]
+    relabelled = segments_for_subject(segments, "CHILD")
+    assert [(item["segmentId"], item["speaker"]) for item in relabelled] == [
+        ("s0000", "CHILD"), ("s0001", "PARENT"),
+    ]
+    assert segments_for_subject(segments, "PARENT") == segments
+    assert segments[0]["speaker"] == "PARENT"
 
 
 def test_single_call_keeps_raw_audio_with_the_subject_only(client: TestClient) -> None:
