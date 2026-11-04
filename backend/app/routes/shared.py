@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.config import Settings
 from app.models import AnalysisMode, CallParticipant, CallRecord, User
 from app.security import SessionDep
-from app.services.domain import ensure_subject_access
+from app.services.domain import ensure_subject_access, subject_visible
 
 
 def settings_from(request: Request) -> Settings:
@@ -19,7 +19,11 @@ def aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
-def call_to_dict(call: CallRecord, participants: list[CallParticipant] | None = None) -> dict:
+def call_to_dict(
+    call: CallRecord,
+    participants: list[CallParticipant] | None = None,
+    hidden: frozenset[str] = frozenset(),
+) -> dict:
     view = {
         "callId": call.id,
         "parentId": call.parent_id,
@@ -45,6 +49,11 @@ def call_to_dict(call: CallRecord, participants: list[CallParticipant] | None = 
     }
     # 두 사람을 분석한 통화만 참여자별 상태를 덧붙인다. SINGLE 응답은 그대로다.
     if call.analysis_mode == AnalysisMode.BOTH.value:
+        # `hidden` 은 보는 사람에게 타임라인을 공유하지 않은 참여자다. 그 사람 몫은 뺀다.
+        if call.parent_id in hidden:
+            view["parentSpeechSec"] = None
+        if call.question_target_id in hidden:
+            view["askedQuestionIds"] = []
         view["analysisMode"] = call.analysis_mode
         view["participants"] = [
             {
@@ -56,23 +65,34 @@ def call_to_dict(call: CallRecord, participants: list[CallParticipant] | None = 
                 "speechSec": item.speech_sec,
             }
             for item in participants or []
+            if item.user_id not in hidden
         ]
     return view
 
 
-async def call_participants(
-    session: SessionDep, calls: list[CallRecord]
-) -> dict[str, list[CallParticipant]]:
-    both_ids = [call.id for call in calls if call.analysis_mode == AnalysisMode.BOTH.value]
-    rows: dict[str, list[CallParticipant]] = {}
-    if both_ids:
+async def call_views(session: SessionDep, user: User, calls: list[CallRecord]) -> list[dict]:
+    both = [call for call in calls if call.analysis_mode == AnalysisMode.BOTH.value]
+    participants: dict[str, list[CallParticipant]] = {}
+    visible: dict[str, bool] = {}
+    if both:
+        visible[user.id] = True
         for item in await session.scalars(
             select(CallParticipant)
-            .where(CallParticipant.call_id.in_(both_ids))
+            .where(CallParticipant.call_id.in_([call.id for call in both]))
             .order_by(CallParticipant.role.desc())
         ):
-            rows.setdefault(item.call_id, []).append(item)
-    return rows
+            participants.setdefault(item.call_id, []).append(item)
+        for person in {person for call in both for person in (call.parent_id, call.child_id)}:
+            if person not in visible:
+                visible[person] = await subject_visible(session, user, person, "timeline")
+    return [
+        call_to_dict(
+            call,
+            participants.get(call.id),
+            frozenset(person for person, shown in visible.items() if not shown),
+        )
+        for call in calls
+    ]
 
 
 def raw_capture(call: CallRecord, user_id: str) -> bool:

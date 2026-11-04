@@ -22,9 +22,9 @@ from app.models import (
     Report,
 )
 from app.services.pipeline import segments_for_subject
-from tests.conftest import auth
+from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family, tone_wav
-from tests.test_family_symmetric import stored_call
+from tests.test_family_symmetric import accept, invite, stored_call
 
 
 def stored_both_call(client: TestClient, parent: dict, child: dict) -> str:
@@ -47,6 +47,8 @@ def stored_both_call(client: TestClient, parent: dict, child: dict) -> str:
                 time_slot="MORNING",
                 analysis_mode=AnalysisMode.BOTH.value,
                 question_target_id=parent["id"],
+                asked_question_ids=["hypertension-med"],
+                parent_speech_sec=30,
             )
             session.add(call)
             await session.flush()
@@ -499,6 +501,31 @@ def test_default_subject_of_a_both_call_respects_report_sharing(client: TestClie
     # SINGLE 통화는 예전처럼 통화 참여자 확인만 한다(403 이 아니라 결과가 아직 없어 404).
     single_extraction = client.get(f"/v1/calls/{single_id}/extraction", headers=auth(child_token))
     assert single_extraction.status_code == 404
+
+
+def test_call_list_hides_a_participant_who_blocks_the_viewers_timeline(
+    client: TestClient,
+) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    third_token, third = create_user(client, "01099990001", "PARENT", "셋째")
+    joined = accept(client, third_token, invite(client, child_token, child["familyId"])["code"])
+    assert joined.status_code == 200, joined.text
+    call_id = stored_both_call(client, parent, child)
+
+    def seen_by_third() -> dict:
+        calls = client.get(f"/v1/parents/{child['id']}/calls", headers=auth(third_token)).json()
+        return next(item for item in calls["calls"] if item["callId"] == call_id)
+
+    shown = seen_by_third()
+    assert (shown["parentSpeechSec"], shown["askedQuestionIds"]) == (30, ["hypertension-med"])
+    assert {item["userId"] for item in shown["participants"]} == {parent["id"], child["id"]}
+    hide(client, parent_token, third["id"], timeline=False)
+    hidden = seen_by_third()
+    assert (hidden["parentSpeechSec"], hidden["askedQuestionIds"]) == (None, [])
+    assert [item["userId"] for item in hidden["participants"]] == [child["id"]]
+    # 통화 당사자는 그대로 본다.
+    own = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert (own["parentSpeechSec"], len(own["participants"])) == (30, 2)
 
 
 def test_deleting_the_subject_also_removes_the_other_sides_reports(client: TestClient) -> None:

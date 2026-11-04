@@ -22,8 +22,7 @@ from app.routes.devices import deliver_incoming_call_push
 from app.routes.questions import questions_for_parent
 from app.routes.shared import (
     aware,
-    call_participants,
-    call_to_dict,
+    call_views,
     ensure_call_access,
     raw_capture,
     settings_from,
@@ -358,9 +357,12 @@ async def end_call(
     await session.rollback()
     await request.app.state.container.calls.finish(call_id)
     call = await session.get(CallRecord, call_id, populate_existing=True)
-    participants = await call_participants(session, [call])
+    if call.analysis_mode == AnalysisMode.BOTH.value:
+        # 위의 rollback 으로 사용자 행이 만료됐다. 공유 범위를 보려면 다시 읽어야 한다.
+        await session.refresh(user)
+    views = await call_views(session, user, [call])
     background.add_task(request.app.state.container.pipeline.process, call_id)
-    return call_to_dict(call, participants.get(call.id))
+    return views[0]
 
 
 @router.get("/calls/{callId}", tags=["Call"])
@@ -373,8 +375,7 @@ async def get_call(
     if call is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "통화를 찾을 수 없습니다")
     await ensure_call_access(session, user, call)
-    participants = await call_participants(session, [call])
-    return call_to_dict(call, participants.get(call.id))
+    return (await call_views(session, user, [call]))[0]
 
 
 @router.get("/parents/{parentId}/calls", tags=["Call"])
@@ -402,5 +403,4 @@ async def list_calls(
             CallRecord.started_at < datetime.combine(to + timedelta(days=1), datetime.min.time())
         )
     calls = list(await session.scalars(statement.order_by(CallRecord.started_at.desc())))
-    participants = await call_participants(session, calls)
-    return {"calls": [call_to_dict(call, participants.get(call.id)) for call in calls]}
+    return {"calls": await call_views(session, user, calls)}

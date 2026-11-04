@@ -236,6 +236,17 @@ async def ensure_subject_access(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "열람 권한이 없는 항목입니다")
 
 
+async def subject_visible(
+    session: AsyncSession, user: User, subject_id: str, scope: Literal["report", "timeline"]
+) -> bool:
+    """`ensure_subject_access` 를 예외 대신 참·거짓으로."""
+    try:
+        await ensure_subject_access(session, user, subject_id, scope)
+    except HTTPException:
+        return False
+    return True
+
+
 def subject_calls(subject_id: str) -> Select[tuple[CallRecord, str]]:
     """대상 사용자의 분석이 끝난 통화와 그 사람 기준 결과(`ANALYZED` 면 분석됨).
 
