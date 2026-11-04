@@ -52,8 +52,14 @@
   기본값 모두 허용. `GET/PUT /v1/account/sharing`. S1 접근 권한이 이것을 본다.
 - 마케팅 수신 동의: `users.marketing_opt_in` + `PATCH /v1/account/preferences`.
 
-### S5 카카오 로그인 (카카오 디벨로퍼스 앱 키가 생긴 뒤)
-- `POST /v1/auth/kakao` — 안드로이드 SDK 가 받은 토큰을 서버가 카카오에 확인. Google 로그인과 같은 계정 연결 방식.
+### S5 카카오 로그인 (2026-11-04 구현, 브랜치 `feat/kakao-login`)
+- Google 과 같은 방식: `POST /v1/auth/kakao/challenge` → `{challengeId, nonce, expiresIn}`, 앱이 카카오 SDK 로그인에
+  nonce 를 넣어 받은 OpenID Connect ID 토큰을 `POST /v1/auth/kakao {idToken, challengeId, name?}` 로 보낸다.
+- 서버 검증: iss `https://kauth.kakao.com`, RS256, 공개키 `https://kauth.kakao.com/.well-known/jwks.json`,
+  aud = `KAKAO_APP_KEY`(네이티브 앱 키), nonce 일치, 준비 요청은 한 번만. 비우면 503.
+- 계정은 `users.kakao_subject` 로 찾고 없으면 역할 없이(저장은 CHILD) 만든다 — 가족은 첫 초대 때. 이름 기본값은
+  ID 토큰 `nickname`, 이메일은 `email`(이용자가 제공에 동의했을 때만 들어온다). 마이그레이션 `0015_kakao_login`.
+- 카카오 콘솔: 카카오 로그인과 OpenID Connect 를 켜야 ID 토큰이 나온다. 계정 삭제 때 카카오 연결 끊기(unlink)는 하지 않는다(Google 도 같음).
 
 ### S6 PASS 본인인증 (대행사 계약 뒤)
 - 계약 전까지 앱의 PASS 화면은 꺼 둔다.

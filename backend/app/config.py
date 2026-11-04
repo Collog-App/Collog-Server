@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     # 비워두면 Google 로그인 엔드포인트는 503을 반환한다. nonce 유효 시간은
     # apple_challenge_ttl_seconds를 같이 쓴다.
     google_client_id: str = ""
+    # 카카오 ID 토큰의 aud(안드로이드 SDK 로그인이면 네이티브 앱 키). 비우면 카카오 로그인이 꺼진다.
+    kakao_app_key: str = ""
 
     schema_auto_reset: bool = False
 

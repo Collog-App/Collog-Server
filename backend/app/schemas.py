@@ -82,7 +82,15 @@ class GoogleLoginRequest(ApiModel):
     name: str | None = Field(default=None, max_length=80)
 
 
+class KakaoLoginRequest(ApiModel):
+    id_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    name: str | None = Field(default=None, max_length=80)
+
+
 class GoogleChallengeResponse(ApiModel):
+    """Google·카카오 로그인 준비 응답(모양이 같다)."""
+
     challenge_id: str
     nonce: str
     expires_in: int

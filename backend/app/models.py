@@ -99,6 +99,9 @@ class User(Base):
     google_subject: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    kakao_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     # 가입 정보. 기존 사용자를 위해 비울 수 있고, 닉네임이 있으면 가입을 마친 것으로 본다.
     nickname: Mapped[str | None] = mapped_column(
         String(10), unique=True, index=True, nullable=True
@@ -140,6 +143,15 @@ class AppleLoginChallenge(Base):
 
 class GoogleLoginChallenge(Base):
     __tablename__ = "google_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KakaoLoginChallenge(Base):
+    __tablename__ = "kakao_login_challenges"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)

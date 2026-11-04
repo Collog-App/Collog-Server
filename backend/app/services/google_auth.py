@@ -17,11 +17,11 @@ CLOCK_SKEW_SECONDS = 60
 
 
 class GoogleIdentityError(Exception):
-    pass
+    """ID 토큰이 올바르지 않다(401). 카카오 ID 토큰 검증도 같이 쓴다."""
 
 
 class GoogleServiceError(Exception):
-    pass
+    """서명 공개키를 받을 수 없다(503). 카카오 ID 토큰 검증도 같이 쓴다."""
 
 
 @dataclass(frozen=True)
@@ -29,22 +29,27 @@ class GoogleIdentity:
     subject: str
     nonce: str
     email: str | None = None
+    name: str | None = None
 
 
-class GoogleIdentityVerifier:
-    """Android Credential Manager가 발급받은 Google ID 토큰을 검증한다.
+class OidcIdentityVerifier:
+    """OpenID Connect ID 토큰(RS256)을 발급자의 공개키로 검증한다.
 
     AppleIdentityVerifier와 같은 키 캐시·실패 backoff 규칙을 따른다.
+    발급자마다 [keys_url]·[issuers]만 다르다.
     """
+
+    keys_url: str
+    issuers: tuple[str, ...]
 
     def __init__(
         self,
-        settings: Settings,
+        audience: str,
         *,
         client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._audience = settings.google_client_id
+        self._audience = audience
         self._client = client or httpx.AsyncClient(timeout=10)
         self._owns_client = client is None
         self._clock = clock
@@ -68,7 +73,7 @@ class GoogleIdentityVerifier:
                 raise GoogleIdentityError("Unknown Google signing key")
             self._retry_at = now + 60
             try:
-                response = await self._client.get(GOOGLE_KEYS_URL)
+                response = await self._client.get(self.keys_url)
                 response.raise_for_status()
                 document = response.json()
                 if not isinstance(document, dict) or not isinstance(document.get("keys"), list):
@@ -107,7 +112,7 @@ class GoogleIdentityVerifier:
                 key.key,
                 algorithms=["RS256"],
                 audience=self._audience,
-                issuer=GOOGLE_ISSUERS,
+                issuer=self.issuers,
                 leeway=CLOCK_SKEW_SECONDS,
                 options={"require": ["exp", "iat", "sub", "nonce", "iss", "aud"]},
             )
@@ -117,12 +122,36 @@ class GoogleIdentityVerifier:
                 raise GoogleIdentityError("Invalid Google subject")
             if not isinstance(nonce, str) or not nonce or len(nonce) > 255:
                 raise GoogleIdentityError("Invalid Google nonce")
-            # 계정 정보에 보여 줄 이메일. Google이 확인한 주소만 받는다.
-            email = claims.get("email")
-            verified = claims.get("email_verified") in (True, "true")
-            if not isinstance(email, str) or not verified or not 0 < len(email) <= 320:
-                email = None
-            return GoogleIdentity(subject=subject, nonce=nonce, email=email)
+            return GoogleIdentity(
+                subject=subject, nonce=nonce, email=self._email(claims), name=self._name(claims)
+            )
         # 깊게 중첩된 헤더 JSON은 PyJWT 안에서 RecursionError가 된다(PYSEC-2026-4142).
         except (jwt.PyJWTError, TypeError, ValueError, RecursionError) as exc:
             raise GoogleIdentityError("Invalid Google ID token") from exc
+
+    def _email(self, claims: dict) -> str | None:
+        """계정 정보에 보여 줄 이메일. 발급자가 확인한 주소만 받는다."""
+        email = claims.get("email")
+        verified = claims.get("email_verified") in (True, "true")
+        if not isinstance(email, str) or not verified or not 0 < len(email) <= 320:
+            return None
+        return email
+
+    def _name(self, claims: dict) -> str | None:
+        return None
+
+
+class GoogleIdentityVerifier(OidcIdentityVerifier):
+    """Android Credential Manager가 발급받은 Google ID 토큰을 검증한다."""
+
+    keys_url = GOOGLE_KEYS_URL
+    issuers = GOOGLE_ISSUERS
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client: httpx.AsyncClient | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(settings.google_client_id, client=client, clock=clock)

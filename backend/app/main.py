@@ -70,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await container.android_voip_push.close()
             await container.apple_identity.close()
             await container.google_identity.close()
+            await container.kakao_identity.close()
             await container.database.close()
 
     app = FastAPI(
