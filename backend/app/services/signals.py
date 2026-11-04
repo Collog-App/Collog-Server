@@ -8,7 +8,16 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import AcousticFeature, Baseline, BaselineKind, CallRecord, ChangeSignal, Metric
+from app.models import (
+    AcousticFeature,
+    AnalysisMode,
+    Baseline,
+    BaselineKind,
+    CallRecord,
+    ChangeSignal,
+    Metric,
+)
+from app.services.domain import subject_owns
 
 METRIC_LABELS = {
     Metric.COUGH_EVENTS.value: "기침 횟수",
@@ -69,7 +78,7 @@ class SignalService:
                     select(AcousticFeature.value, AcousticFeature.observed_at)
                     .join(CallRecord, CallRecord.id == AcousticFeature.call_id)
                     .where(
-                        CallRecord.parent_id == parent_id,
+                        subject_owns(AcousticFeature, parent_id),
                         CallRecord.time_slot == time_slot,
                         AcousticFeature.metric == metric.value,
                         AcousticFeature.status == "OK",
@@ -130,25 +139,28 @@ class SignalService:
                     )
         await session.flush()
 
-    async def process_call(self, session: AsyncSession, call: CallRecord) -> None:
+    async def process_call(
+        self, session: AsyncSession, call: CallRecord, subject_id: str | None = None
+    ) -> None:
+        # BOTH 통화는 참여자마다 한 번씩 부른다. 비우면 S3 이전처럼 parent_id 다.
+        subject_id = subject_id or call.parent_id
         # The current measurement must never be part of the baseline it is compared with.
-        await self.rebuild_baselines(session, call.parent_id, exclude_call_id=call.id)
-        features = (
-            await session.scalars(
-                select(AcousticFeature).where(
-                    AcousticFeature.call_id == call.id,
-                    AcousticFeature.status == "OK",
-                    AcousticFeature.value.is_not(None),
-                )
-            )
-        ).all()
+        await self.rebuild_baselines(session, subject_id, exclude_call_id=call.id)
+        statement = select(AcousticFeature).where(
+            AcousticFeature.call_id == call.id,
+            AcousticFeature.status == "OK",
+            AcousticFeature.value.is_not(None),
+        )
+        if call.analysis_mode == AnalysisMode.BOTH.value:
+            statement = statement.where(AcousticFeature.subject_user_id == subject_id)
+        features = (await session.scalars(statement)).all()
         if not features or not call.time_slot:
             return
         for feature in features:
             baselines = (
                 await session.scalars(
                     select(Baseline).where(
-                        Baseline.parent_id == call.parent_id,
+                        Baseline.parent_id == subject_id,
                         Baseline.metric == feature.metric,
                         Baseline.time_slot == call.time_slot,
                     )
@@ -179,7 +191,7 @@ class SignalService:
             )
             consecutive = await self._consecutive_count(
                 session,
-                call.parent_id,
+                subject_id,
                 feature.metric,
                 call.time_slot,
                 vs_anchor,
@@ -190,7 +202,7 @@ class SignalService:
             label = METRIC_LABELS[feature.metric]
             session.add(
                 ChangeSignal(
-                    parent_id=call.parent_id,
+                    parent_id=subject_id,
                     call_id=call.id,
                     metric=feature.metric,
                     time_slot=call.time_slot,
@@ -215,7 +227,7 @@ class SignalService:
             )
         await session.flush()
         # Persist the new measurement into the baseline only after its signal was computed.
-        await self.rebuild_baselines(session, call.parent_id)
+        await self.rebuild_baselines(session, subject_id)
 
     async def _consecutive_count(
         self,

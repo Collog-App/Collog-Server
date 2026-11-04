@@ -7,7 +7,16 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Query, Request, status
 from sqlalchemy import or_, select, update
 
-from app.models import AssetKind, AudioAsset, CallRecord, CallState, Device, User, UserRole
+from app.models import (
+    AssetKind,
+    AudioAsset,
+    CallParticipant,
+    CallRecord,
+    CallState,
+    Device,
+    User,
+    UserRole,
+)
 from app.routes.devices import deliver_incoming_call_push
 from app.routes.questions import questions_for_parent
 from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
@@ -351,7 +360,13 @@ async def list_calls(
     to: date | None = None,
 ) -> dict:
     await ensure_subject_access(session, user, parent_id, "timeline")
-    statement = select(CallRecord).where(CallRecord.parent_id == parent_id)
+    # BOTH 통화는 두 참여자 모두의 통화 기록에 보인다.
+    statement = select(CallRecord).where(or_(
+        CallRecord.parent_id == parent_id,
+        CallRecord.id.in_(
+            select(CallParticipant.call_id).where(CallParticipant.user_id == parent_id)
+        ),
+    ))
     if from_:
         statement = statement.where(
             CallRecord.started_at >= datetime.combine(from_, datetime.min.time())

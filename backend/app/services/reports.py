@@ -17,6 +17,7 @@ from app.models import (
     RepeatEvent,
     Report,
 )
+from app.services.domain import subject_calls, subject_owns
 from app.services.signals import signal_to_dict
 
 DISCLAIMER = "이 리포트는 의료 진단이 아니며 건강 변화 참고용입니다."
@@ -52,16 +53,15 @@ class ReportService:
         end_dt = datetime.combine(
             to_date + timedelta(days=1), datetime.min.time(), tzinfo=REPORT_TIMEZONE
         ).astimezone(UTC)
-        calls = (
-            await session.scalars(
-                select(CallRecord).where(
-                    CallRecord.parent_id == parent_id,
+        rows = (
+            await session.execute(
+                subject_calls(parent_id).where(
                     CallRecord.ended_at >= start_dt,
                     CallRecord.ended_at < end_dt,
-                    CallRecord.state.in_(["ANALYZED", "ANALYSIS_EXCLUDED"]),
                 )
             )
         ).all()
+        calls = [call for call, _ in rows]
         existing = await session.scalar(
             select(Report)
             .where(
@@ -82,7 +82,7 @@ class ReportService:
             or latest_call_at <= aware_datetime(existing.issued_at)
         ):
             return {**existing.snapshot, "issuedAt": existing.issued_at}
-        analyzed_ids = [call.id for call in calls if call.state == "ANALYZED"]
+        analyzed_ids = [call.id for call, result in rows if result == "ANALYZED"]
         extractions = []
         features = []
         signals = []
@@ -90,14 +90,22 @@ class ReportService:
         if analyzed_ids:
             extractions = list(
                 await session.scalars(
-                    select(HealthExtraction).where(HealthExtraction.call_id.in_(analyzed_ids))
+                    select(HealthExtraction)
+                    .join(CallRecord, CallRecord.id == HealthExtraction.call_id)
+                    .where(
+                        HealthExtraction.call_id.in_(analyzed_ids),
+                        subject_owns(HealthExtraction, parent_id),
+                    )
                 )
             )
             features = list(
                 await session.scalars(
                     select(AcousticFeature)
+                    .join(CallRecord, CallRecord.id == AcousticFeature.call_id)
                     .where(
-                        AcousticFeature.call_id.in_(analyzed_ids), AcousticFeature.status == "OK"
+                        AcousticFeature.call_id.in_(analyzed_ids),
+                        subject_owns(AcousticFeature, parent_id),
+                        AcousticFeature.status == "OK",
                     )
                     # 추이 그래프는 이 순서 그대로 선을 잇는다. 정렬하지 않으면 DB가 주는
                     # 순서를 따라가면서 선이 시간을 거슬러 꺾인다.
@@ -106,12 +114,19 @@ class ReportService:
             )
             signals = list(
                 await session.scalars(
-                    select(ChangeSignal).where(ChangeSignal.call_id.in_(analyzed_ids))
+                    select(ChangeSignal).where(
+                        ChangeSignal.call_id.in_(analyzed_ids), ChangeSignal.parent_id == parent_id
+                    )
                 )
             )
             repeat_events = list(
                 await session.scalars(
-                    select(RepeatEvent).where(RepeatEvent.call_id.in_(analyzed_ids))
+                    select(RepeatEvent)
+                    .join(CallRecord, CallRecord.id == RepeatEvent.call_id)
+                    .where(
+                        RepeatEvent.call_id.in_(analyzed_ids),
+                        subject_owns(RepeatEvent, parent_id),
+                    )
                 )
             )
         # 기준선 행은 지표 × 시간대 × 종류로 항상 만들어지지만(signals.rebuild_baselines),
@@ -123,7 +138,7 @@ class ReportService:
             select(AcousticFeature.metric, CallRecord.time_slot)
             .join(CallRecord, CallRecord.id == AcousticFeature.call_id)
             .where(
-                CallRecord.parent_id == parent_id,
+                subject_owns(AcousticFeature, parent_id),
                 AcousticFeature.status == "OK",
                 AcousticFeature.value.is_not(None),
             )

@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import Select, and_, delete, or_, select
+from sqlalchemy import ColumnElement, Select, and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.consent import CONSENT_ITEMS, CONSENT_VERSION
 from app.models import (
+    AnalysisMode,
+    CallParticipant,
+    CallRecord,
+    CallState,
     ConsentDecision,
     ConsentRecord,
     Family,
     FamilyMember,
     FamilyShare,
     Invitation,
+    ParticipantStatus,
     User,
 )
 
@@ -229,3 +234,54 @@ async def ensure_subject_access(
         share = await session.get(FamilyShare, (subject_id, user.id))
         if share is not None and not getattr(share, scope):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "열람 권한이 없는 항목입니다")
+
+
+def subject_calls(subject_id: str) -> Select[tuple[CallRecord, str]]:
+    """대상 사용자의 분석이 끝난 통화와 그 사람 기준 결과(`ANALYZED` 면 분석됨).
+
+    SINGLE 통화는 `parent_id` 와 통화 상태로, BOTH 통화는 그 사람의 참여자 상태로 본다.
+    거절·미응답처럼 분석 없이 제외된 BOTH 통화는 참여자 행이 PENDING 이라 통화 상태를 따른다.
+    """
+    return (
+        select(CallRecord, func.coalesce(CallParticipant.analysis_status, CallRecord.state))
+        .outerjoin(
+            CallParticipant,
+            and_(CallParticipant.call_id == CallRecord.id, CallParticipant.user_id == subject_id),
+        )
+        .where(or_(
+            and_(
+                CallRecord.analysis_mode == AnalysisMode.SINGLE.value,
+                CallRecord.parent_id == subject_id,
+                CallRecord.state.in_(
+                    [CallState.ANALYZED.value, CallState.ANALYSIS_EXCLUDED.value]
+                ),
+            ),
+            and_(
+                CallRecord.analysis_mode == AnalysisMode.BOTH.value,
+                CallParticipant.id.is_not(None),
+                or_(
+                    CallParticipant.analysis_status.in_(
+                        [ParticipantStatus.ANALYZED.value, ParticipantStatus.EXCLUDED.value]
+                    ),
+                    CallRecord.state == CallState.ANALYSIS_EXCLUDED.value,
+                ),
+            ),
+        ))
+    )
+
+
+def subject_owns(model: Any, subject_id: str) -> ColumnElement[bool]:
+    """`CallRecord` 와 join 한 분석 행이 대상 사용자 몫인지.
+
+    SINGLE 통화의 행은 모두 `parent_id` 의 것이고, BOTH 통화는 행의 `subject_user_id` 로 가른다.
+    """
+    return or_(
+        and_(
+            CallRecord.analysis_mode == AnalysisMode.SINGLE.value,
+            CallRecord.parent_id == subject_id,
+        ),
+        and_(
+            CallRecord.analysis_mode == AnalysisMode.BOTH.value,
+            model.subject_user_id == subject_id,
+        ),
+    )
