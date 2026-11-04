@@ -92,15 +92,15 @@ async def call_subject(
 ) -> str:
     """통화 분석 결과를 볼 대상. 비우면 지금처럼 `parent_id` 다.
 
-    다른 사람의 결과를 고르면 그 사람이 정한 리포트 공유 범위(S4)를 본다.
+    다른 사람의 결과를 보면 그 사람이 정한 리포트 공유 범위(S4)를 본다. SINGLE 통화를 대상을
+    비우고 부르는 것은 예전과 같이 통화 참여자 확인만 한다.
     """
     await ensure_call_access(session, user, call)
-    if subject_id is None:
+    both = call.analysis_mode == AnalysisMode.BOTH.value
+    if subject_id is None and not both:
         return call.parent_id
-    subjects = {call.parent_id}
-    if call.analysis_mode == AnalysisMode.BOTH.value:
-        subjects.add(call.child_id)
-    if subject_id not in subjects:
+    subject_id = subject_id or call.parent_id
+    if subject_id not in ({call.parent_id, call.child_id} if both else {call.parent_id}):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "이 통화의 분석 대상이 아닙니다")
     if subject_id != user.id:
         await ensure_subject_access(session, user, subject_id, "report")

@@ -469,6 +469,38 @@ def test_call_views_show_participants_only_for_both_calls(client: TestClient) ->
     ).status_code == 200
 
 
+def hide(client: TestClient, owner_token: str, viewer_id: str, **scopes: bool) -> None:
+    shares = {"report": True, "timeline": True, **scopes}
+    response = client.put(
+        "/v1/account/sharing",
+        headers=auth(owner_token),
+        json={"shares": [{"viewerUserId": viewer_id, **shares}]},
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_default_subject_of_a_both_call_respects_report_sharing(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    both_id = stored_both_call(client, parent, child)
+    single = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    single_id = single.json()["callId"]
+    hide(client, parent_token, child["id"], report=False)
+
+    for path in ("extraction", "acoustic-features"):
+        assert client.get(
+            f"/v1/calls/{both_id}/{path}", headers=auth(child_token)
+        ).status_code == 403
+        assert client.get(
+            f"/v1/calls/{both_id}/{path}?subjectId={child['id']}", headers=auth(child_token)
+        ).status_code == 200
+        assert client.get(
+            f"/v1/calls/{both_id}/{path}", headers=auth(parent_token)
+        ).status_code == 200
+    # SINGLE 통화는 예전처럼 통화 참여자 확인만 한다(403 이 아니라 결과가 아직 없어 404).
+    single_extraction = client.get(f"/v1/calls/{single_id}/extraction", headers=auth(child_token))
+    assert single_extraction.status_code == 404
+
+
 def test_deleting_the_subject_also_removes_the_other_sides_reports(client: TestClient) -> None:
     child_token, child, parent_token, parent = onboard_family(client)
     stored_both_call(client, parent, child)
