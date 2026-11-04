@@ -54,9 +54,11 @@ class ProcessingPipeline:
                 call.state = CallState.ANALYSIS_EXCLUDED.value
                 call.processing_claimed_at = None
                 call.processing_retry_at = None
-                await close_participants(
+                if await close_participants(
                     session, call_id, ParticipantStatus.EXCLUDED, "ANALYSIS_NOT_ALLOWED"
-                )
+                ):
+                    # 먼저 끝난 참여자가 있으면 그 사람의 분석으로 끝난 통화다.
+                    call.state = CallState.ANALYZED.value
                 await session.commit()
         await self.purge_call_audio(call_id)
         return False
@@ -169,9 +171,10 @@ class ProcessingPipeline:
             ):
                 call.state = CallState.ANALYSIS_EXCLUDED.value
                 call.recording_enabled = False
-                await close_participants(
+                if await close_participants(
                     session, call_id, ParticipantStatus.EXCLUDED, "ANALYSIS_NOT_ALLOWED"
-                )
+                ):
+                    call.state = CallState.ANALYZED.value
                 await session.commit()
                 await self.purge_call_audio(call_id)
                 return

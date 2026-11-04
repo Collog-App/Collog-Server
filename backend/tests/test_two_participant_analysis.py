@@ -15,6 +15,7 @@ from app.models import (
     CallParticipant,
     CallRecord,
     CallState,
+    ConsentRecord,
     ExtractionEvidence,
     HealthExtraction,
     ParticipantStatus,
@@ -416,6 +417,41 @@ def test_exhausted_retry_closes_the_rest_and_purges(client: TestClient) -> None:
         (row.user_id, row.analysis_status, row.exclusion_reason)
         for row in participants_of(client, call_id)
     } == {(parent["id"], "FAILED", "ANALYSIS_ERROR"), (child["id"], "ANALYZED", None)}
+
+
+def test_withdrawal_after_one_analysis_keeps_the_call_analysed(client: TestClient) -> None:
+    call_id, child_token, child, _, parent = start_call(client)
+    container = client.app.state.container
+    pipeline = container.pipeline
+    child_raw = next(
+        item.uri for item in call_assets(client, call_id)
+        if item.kind == "DEVICE_RAW" and item.owner_user_id == child["id"]
+    )
+    original_read = pipeline.storage.read
+
+    async def withdraw_then_read(uri: str) -> bytes:
+        if uri == child_raw:
+            async with container.database.sessions() as session:
+                session.add(ConsentRecord(
+                    user_id=child["id"],
+                    document_version=container.settings.consent_document_version,
+                    decision="DENIED",
+                    agreed_items=[],
+                    agreed_at=datetime.now(UTC),
+                ))
+                await session.commit()
+        return await original_read(uri)
+
+    pipeline.storage.read = withdraw_then_read
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+    assert view["state"] == "ANALYZED"
+    assert view["rawAudioPurgedAt"] is not None
+    assert {
+        (row.user_id, row.analysis_status, row.exclusion_reason)
+        for row in participants_of(client, call_id)
+    } == {(parent["id"], "ANALYZED", None), (child["id"], "EXCLUDED", "ANALYSIS_NOT_ALLOWED")}
 
 
 def test_call_created_while_off_stays_single_after_turning_on(client: TestClient) -> None:
