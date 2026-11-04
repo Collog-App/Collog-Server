@@ -385,6 +385,42 @@ def test_transient_error_keeps_audio_and_retries_without_billing_again(
     assert {row.analysis_status for row in participants_of(client, call_id)} == {"ANALYZED"}
 
 
+def test_failed_second_track_does_not_resend_the_first_to_stt(client: TestClient) -> None:
+    call_id, child_token, child, _, parent = start_call(client)
+    container = client.app.state.container
+    pipeline = container.pipeline
+    original = pipeline.stt.transcribe
+    speakers: list[str] = []
+
+    async def flaky_transcribe(audio: bytes, content_type: str, speaker: str):
+        speakers.append(speaker)
+        if speakers == ["PARENT", "CHILD"]:
+            raise TimeoutError()
+        return await original(audio, content_type, speaker)
+
+    pipeline.stt.transcribe = flaky_transcribe
+    deliver_egress(client, call_id, {parent["id"]: PARENT_SPEECH, child["id"]: CHILD_SPEECH})
+
+    assert stored_call(client, call_id).state == CallState.ENDED.value
+    kept = {row.speaker_label: row.stt_result for row in participants_of(client, call_id)}
+    assert kept["PARENT"]["segments"] and kept["CHILD"] is None
+
+    async def release() -> None:
+        async with container.database.sessions() as session:
+            row = await session.get(CallRecord, call_id)
+            row.processing_retry_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+    client.portal.call(release)
+    client.portal.call(pipeline.process, call_id)
+
+    assert speakers == ["PARENT", "CHILD", "CHILD"]
+    assert stored_call(client, call_id).state == CallState.ANALYZED.value
+    assert {row.stt_result for row in participants_of(client, call_id)} == {None}
+    transcript = client.get(f"/v1/calls/{call_id}/transcript", headers=auth(child_token)).json()
+    assert {item["speaker"] for item in transcript["segments"]} == {"PARENT", "CHILD"}
+
+
 def test_exhausted_retry_closes_the_rest_and_purges(client: TestClient) -> None:
     call_id, child_token, child, _, parent = start_call(client)
     container = client.app.state.container

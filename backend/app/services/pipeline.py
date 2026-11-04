@@ -622,19 +622,37 @@ class ProcessingPipeline:
         participants: list[CallParticipant],
         sources: dict[str, AudioAsset],
     ) -> list[dict[str, Any]] | None:
-        results = []
+        # 트랙마다 STT 가 끝나는 대로 참여자 행에 남긴다. 다른 트랙이 실패해 재시도해도
+        # 이미 받은 트랙은 다시 보내지 않는다.
+        tracks = {item.id: item.stt_result for item in participants}
+        speech = {item.id: item.speech_sec or 0 for item in participants}
         for item in participants:
+            if tracks[item.id] is not None:
+                continue
             source = sources[item.user_id]
             audio = await self.storage.read(source.uri)
             if not await self.processing_allowed(call_id):
                 return None
             result = await self.stt.transcribe(audio, source.content_type, item.speaker_label)
             self.log_stt_result(call_id, item.speaker_label, result)
-            results.append((item, result))
-        segments = merge_segments([(item.speaker_label, result) for item, result in results])
-        speech = {item.id: round(result.speech_seconds) for item, result in results}
+            if not await self.processing_allowed(call_id):
+                return None
+            tracks[item.id] = {
+                "provider": result.provider,
+                "segments": track_segments(item.speaker_label, result),
+            }
+            speech[item.id] = round(result.speech_seconds)
+            async with self.database.sessions() as session:
+                row = await session.get(CallParticipant, item.id)
+                row.stt_result = tracks[item.id]
+                row.speech_sec = speech[item.id]
+                row.updated_at = datetime.now(UTC)
+                await session.commit()
+        segments = number_segments(
+            [segment for track in tracks.values() for segment in track["segments"]]
+        )
         parent_speech_sec = next(
-            (speech[item.id] for item, _ in results if item.speaker_label == "PARENT"), 0
+            (speech[item.id] for item in participants if item.speaker_label == "PARENT"), 0
         )
         excluded = all(value < self.settings.parent_min_speech_seconds for value in speech.values())
         if not await self.processing_allowed(call_id):
@@ -647,16 +665,17 @@ class ProcessingPipeline:
             session.add(
                 Transcript(
                     call_id=call_id,
-                    provider=results[0][1].provider,
+                    provider=tracks[participants[0].id]["provider"],
                     excluded=excluded,
                     exclusion_reason="INSUFFICIENT_SPEECH" if excluded else None,
                     parent_speech_sec=parent_speech_sec,
                     segments=segments,
                 )
             )
+            # 전사로 합쳤으니 트랙별 임시 결과는 지운다.
             for item in participants:
                 row = await session.get(CallParticipant, item.id)
-                row.speech_sec = speech[item.id]
+                row.stt_result = None
                 row.updated_at = datetime.now(UTC)
             await session.commit()
         return segments
@@ -922,28 +941,34 @@ class ProcessingPipeline:
 
 
 def merge_segments(stt_results: list[tuple[str, SttResult]]) -> list[dict[str, Any]]:
-    raw_segments = sorted(
-        [
-            {
-                "speaker": speaker,
-                "startMs": segment.start_ms,
-                "endMs": segment.end_ms,
-                "text": segment.text,
-                "words": [
-                    {
-                        "startMs": word.start_ms,
-                        "endMs": word.end_ms,
-                        "text": word.text,
-                        "confidence": word.confidence,
-                    }
-                    for word in segment.words
-                ],
-            }
-            for speaker, result in stt_results
-            for segment in result.segments
-        ],
-        key=lambda item: (item["startMs"], item["speaker"]),
+    return number_segments(
+        [item for speaker, result in stt_results for item in track_segments(speaker, result)]
     )
+
+
+def track_segments(speaker: str, result: SttResult) -> list[dict[str, Any]]:
+    return [
+        {
+            "speaker": speaker,
+            "startMs": segment.start_ms,
+            "endMs": segment.end_ms,
+            "text": segment.text,
+            "words": [
+                {
+                    "startMs": word.start_ms,
+                    "endMs": word.end_ms,
+                    "text": word.text,
+                    "confidence": word.confidence,
+                }
+                for word in segment.words
+            ],
+        }
+        for segment in result.segments
+    ]
+
+
+def number_segments(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_segments = sorted(items, key=lambda item: (item["startMs"], item["speaker"]))
     return [{"segmentId": f"s{index:04d}", **item} for index, item in enumerate(raw_segments)]
 
 
@@ -964,9 +989,8 @@ def segments_for_subject(
 async def close_participants(
     session: AsyncSession, call_id: str, status: ParticipantStatus, reason: str
 ) -> bool:
-    """아직 끝나지 않은 참여자를 끝내고, 이미 분석을 마친 참여자가 있는지 돌려준다.
-
-    SINGLE 통화에는 참여자 행이 없어 아무 일도 없고 False 다.
+    """아직 끝나지 않은 참여자를 끝내고(남은 트랙별 STT 결과도 지운다), 이미 분석을 마친
+    참여자가 있는지 돌려준다. SINGLE 통화에는 참여자 행이 없어 아무 일도 없고 False 다.
     """
     await session.execute(
         update(CallParticipant)
@@ -974,7 +998,12 @@ async def close_participants(
             CallParticipant.call_id == call_id,
             CallParticipant.analysis_status == ParticipantStatus.PENDING.value,
         )
-        .values(analysis_status=status.value, exclusion_reason=reason, updated_at=datetime.now(UTC))
+        .values(
+            analysis_status=status.value,
+            exclusion_reason=reason,
+            stt_result=None,
+            updated_at=datetime.now(UTC),
+        )
     )
     analyzed = await session.scalar(
         select(CallParticipant.id)

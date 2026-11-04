@@ -335,6 +335,8 @@ class CallParticipant(Base):
     )
     exclusion_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
     speech_sec: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 이 사람 트랙의 STT 결과. 두 트랙이 모여 transcripts 로 합쳐지거나 참여자가 끝나면 지운다.
+    stt_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

@@ -39,6 +39,7 @@ def upgrade() -> None:
         sa.Column("analysis_status", sa.String(16), nullable=False),
         sa.Column("exclusion_reason", sa.String(48), nullable=True),
         sa.Column("speech_sec", sa.Integer(), nullable=True),
+        sa.Column("stt_result", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
