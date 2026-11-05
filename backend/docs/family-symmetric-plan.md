@@ -56,8 +56,9 @@
   대기 중 자산은 올린 사람별로 찾으며, complete 는 자기 자산(`owner_user_id`)만 된다.
 - 파이프라인(`BOTH`): 공통 단계(상태·동의·보관 한도·자산 확인) 뒤에 나뉜다. 예전처럼 Egress·원시 오디오를 기다리고
   (`raw_audio_wait_seconds`), 자기 Egress 가 없는 참여자는 `FAILED`(`EGRESS_MISSING`). 선점은 지금의 조건부 UPDATE 한 번.
-  STT 는 트랙마다 끝나는 대로 참여자 행(`call_participants.stt_result`)에 잠깐 남기고, 두 트랙이 모이면 transcript 로
-  합친 뒤 지운다(참여자가 끝날 때도 지운다). 재시도 때는 남은 트랙만 Deepgram 에 보낸다. 그 뒤 참여자마다: 발화가
+  STT 는 자기 Egress 가 있는 참여자의 트랙마다 끝나는 대로 참여자 행(`call_participants.stt_result`)에 잠깐 남기고, 그
+  트랙이 다 모이면 transcript 로 합친 뒤 지운다(남은 참여자를 닫을 때도 지운다). 재시도 때 transcript 가 이미 있으면 그대로
+  쓰고(Deepgram 호출 없음), 없으면 결과가 없는 트랙만 Deepgram 에 보낸다(`SINGLE` 은 지금처럼 다시 전사). 그 뒤 참여자마다: 발화가
   `parent_min_speech_seconds` 보다 짧으면 `EXCLUDED`(`INSUFFICIENT_SPEECH`), 그 사람의 추출이 아직 없을 때만 Gemini 를
   부르고 바로 커밋(재시도 때 재과금 없음), 음향은 자기 원시 오디오(없으면 자기 Egress, 이때 F0·기침은 지금처럼
   `SOURCE_NOT_RAW`), 되묻기·기준선도 그 사람 것으로 만들고 `ANALYZED`. 일시 오류는 다른 참여자를 마저 끝낸 뒤 기존 재시도로
