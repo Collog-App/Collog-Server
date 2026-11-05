@@ -76,13 +76,19 @@ class ReportService:
         latest_call_at = max(
             (aware_datetime(call.ended_at) for call in calls if call.ended_at), default=None
         )
-        if existing and (
-            to_date < date.today()
-            or latest_call_at is None
-            or latest_call_at <= aware_datetime(existing.issued_at)
+        analyzed_ids = [call.id for call in calls if call.state == "ANALYZED"]
+        # 분석은 통화가 끝나고 몇 분 뒤에 끝난다. 그 사이에 만든 스냅샷은 종료 시각만 보면
+        # 최신으로 보이므로, 분석된 통화 수가 달라졌으면(지난 기간도) 다시 만든다.
+        if (
+            existing
+            and existing.snapshot.get("analyzedCallCount") == len(analyzed_ids)
+            and (
+                to_date < date.today()
+                or latest_call_at is None
+                or latest_call_at <= aware_datetime(existing.issued_at)
+            )
         ):
             return {**existing.snapshot, "issuedAt": existing.issued_at}
-        analyzed_ids = [call.id for call in calls if call.state == "ANALYZED"]
         extractions = []
         features = []
         signals = []
