@@ -62,7 +62,7 @@
   `parent_min_speech_seconds` 보다 짧으면 `EXCLUDED`(`INSUFFICIENT_SPEECH`), 그 사람의 추출이 아직 없을 때만 Gemini 를
   부르고 바로 커밋(재시도 때 재과금 없음), 음향은 자기 원시 오디오(없으면 자기 Egress, 이때 F0·기침은 지금처럼
   `SOURCE_NOT_RAW`), 되묻기·기준선도 그 사람 것으로 만들고 `ANALYZED`. 일시 오류는 다른 참여자를 마저 끝낸 뒤 기존 재시도로
-  넘기고, 영구 오류는 그 참여자만 `FAILED`. 통화 상태 = 한 명이라도 `ANALYZED` 면 `ANALYZED`(리포트 알림 그대로), 아니면
+  넘기고, 영구 오류는 그 참여자만 `FAILED`. 통화 상태 = 한 명이라도 `ANALYZED` 면 `ANALYZED`(리포트 알림은 `ANALYZED` 참여자에게만), 아니면
   `FAILED` 가 있으면 `ANALYSIS_FAILED`, 아니면 `ANALYSIS_EXCLUDED`. 원본 오디오는 모든 참여자가 끝난 뒤에만 지운다. 재시도
   소진·24시간 보관 한도에서는 남은 참여자를 `FAILED` 로 닫고 지우며, 동의 철회는 기다리지 않고 바로 지운다. 전체 전사
   보관은 지금과 같다. raw-only 개발 모드(`ALLOW_RAW_ONLY_ANALYSIS`)는 `SINGLE` 만 된다. 거절·미응답·녹음 꺼짐으로

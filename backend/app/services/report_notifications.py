@@ -8,7 +8,14 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import select, update
 
 from app.database import Database
-from app.models import CallRecord, CallState, Device
+from app.models import (
+    AnalysisMode,
+    CallParticipant,
+    CallRecord,
+    CallState,
+    Device,
+    ParticipantStatus,
+)
 from app.services.notifications import (
     PushNotificationError,
     ReportPushGateway,
@@ -56,10 +63,19 @@ class ReportNotifications:
                 self._delivered.pop(call.id, None)
                 await session.commit()
                 return
+            recipients = [call.parent_id, call.child_id]
+            if call.analysis_mode == AnalysisMode.BOTH.value:
+                # 두 사람을 분석한 통화는 자기 분석이 끝난 사람에게만 알린다.
+                recipients = list(await session.scalars(
+                    select(CallParticipant.user_id).where(
+                        CallParticipant.call_id == call.id,
+                        CallParticipant.analysis_status == ParticipantStatus.ANALYZED.value,
+                    )
+                ))
             devices = list(await session.scalars(
                 select(Device)
                 .where(
-                    Device.user_id.in_([call.parent_id, call.child_id]),
+                    Device.user_id.in_(recipients),
                     Device.platform.in_(
                         ["IOS", "ANDROID"] if self.android_gateway is not None else ["IOS"]
                     ),

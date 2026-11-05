@@ -13,7 +13,15 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.config import Settings
 from app.database import Database
-from app.models import CallRecord, CallState, Device, User
+from app.models import (
+    AnalysisMode,
+    CallParticipant,
+    CallRecord,
+    CallState,
+    Device,
+    ParticipantStatus,
+    User,
+)
 from app.services.notifications import (
     ApnsReportPushGateway,
     MockReportPushGateway,
@@ -75,6 +83,31 @@ async def test_report_targets_and_preferences_are_separate_from_voip(database: D
         call = await session.get(CallRecord, call_id)
         assert call is not None and call.report_notified_at is not None
         assert call.state == CallState.ANALYZED.value
+
+
+@pytest.mark.asyncio
+async def test_both_call_reports_only_to_analysed_participants(database: Database) -> None:
+    call_id, parent_id, child_id = await seed_call(database)
+    async with database.sessions() as session:
+        call = await session.get(CallRecord, call_id)
+        call.analysis_mode = AnalysisMode.BOTH.value
+        session.add_all([
+            CallParticipant(
+                call_id=call_id, user_id=parent_id, role="CALLEE", speaker_label="PARENT",
+                analysis_status=ParticipantStatus.ANALYZED.value,
+            ),
+            CallParticipant(
+                call_id=call_id, user_id=child_id, role="CALLER", speaker_label="CHILD",
+                analysis_status=ParticipantStatus.EXCLUDED.value,
+                exclusion_reason="INSUFFICIENT_SPEECH",
+            ),
+            Device(user_id=parent_id, platform="IOS", token="parent", push_token="a" * 64),
+            Device(user_id=child_id, platform="IOS", token="child", push_token="b" * 64),
+        ])
+        await session.commit()
+    gateway = MockReportPushGateway()
+    await ReportNotifications(database, gateway).notify(call_id)
+    assert [token for token, _ in gateway.sent] == ["a" * 64]
 
 
 @pytest.mark.asyncio
