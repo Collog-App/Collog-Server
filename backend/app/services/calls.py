@@ -12,8 +12,18 @@ from sqlalchemy import and_, or_, select, update
 
 from app.config import Settings
 from app.database import Database
-from app.models import AssetKind, AssetStatus, AudioAsset, CallRecord, CallState, TimeSlot
+from app.models import (
+    AnalysisMode,
+    AssetKind,
+    AssetStatus,
+    AudioAsset,
+    CallRecord,
+    CallState,
+    ParticipantStatus,
+    TimeSlot,
+)
 from app.services.livekit import LiveKitError, LiveKitGateway
+from app.services.pipeline import close_participants
 from app.services.storage import StorageGateway
 
 logger = logging.getLogger(__name__)
@@ -136,6 +146,14 @@ class CallLifecycle:
                     CallState.ENDED.value
                     if call.recording_enabled else CallState.ANALYSIS_EXCLUDED.value
                 )
+                if not call.recording_enabled and call.analysis_mode == AnalysisMode.BOTH.value:
+                    # 미응답·녹음 꺼짐으로 분석 없이 끝났다. 참여자도 기다리지 않게 닫는다.
+                    await close_participants(
+                        session,
+                        call.id,
+                        ParticipantStatus.EXCLUDED,
+                        call.recording_disabled_reason or "RECORDING_DISABLED",
+                    )
                 started = aware(call.accepted_at or call.started_at)
                 call.duration_sec = (
                     max(0, round((call.ended_at - started).total_seconds()))
@@ -175,11 +193,23 @@ class CallLifecycle:
     async def maintain(self) -> None:
         now = datetime.now(UTC)
         async with self.database.sessions() as session:
-            await session.execute(update(CallRecord).where(
+            unrecorded = (
                 CallRecord.state == CallState.ENDED.value,
                 CallRecord.recording_enabled.is_(False),
                 CallRecord.ended_at.is_not(None),
-            ).values(state=CallState.ANALYSIS_EXCLUDED.value, processing_claimed_at=None))
+            )
+            for call in list(await session.scalars(select(CallRecord).where(
+                *unrecorded, CallRecord.analysis_mode == AnalysisMode.BOTH.value
+            ))):
+                await close_participants(
+                    session,
+                    call.id,
+                    ParticipantStatus.EXCLUDED,
+                    call.recording_disabled_reason or "RECORDING_DISABLED",
+                )
+            await session.execute(update(CallRecord).where(*unrecorded).values(
+                state=CallState.ANALYSIS_EXCLUDED.value, processing_claimed_at=None
+            ))
             await session.commit()
             calls = list(
                 await session.scalars(

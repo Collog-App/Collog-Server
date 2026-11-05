@@ -251,7 +251,8 @@ def subject_calls(subject_id: str) -> Select[tuple[CallRecord, str]]:
     """대상 사용자의 분석이 끝난 통화와 그 사람 기준 결과(`ANALYZED` 면 분석됨).
 
     SINGLE 통화는 `parent_id` 와 통화 상태로, BOTH 통화는 그 사람의 참여자 상태로 본다.
-    거절·미응답처럼 분석 없이 제외된 BOTH 통화는 참여자 행이 PENDING 이라 통화 상태를 따른다.
+    거절·미응답·녹음 꺼짐으로 분석 없이 끝난 BOTH 통화는 참여자 행도 EXCLUDED 로 닫힌다. 통화
+    상태 조건은 그래도 PENDING 으로 남은 행을 위한 안전장치다.
     """
     return (
         select(CallRecord, func.coalesce(CallParticipant.analysis_status, CallRecord.state))

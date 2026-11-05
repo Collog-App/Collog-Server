@@ -15,6 +15,7 @@ from app.models import (
     CallRecord,
     CallState,
     Device,
+    ParticipantStatus,
     User,
     UserRole,
 )
@@ -37,6 +38,7 @@ from app.services.domain import (
 )
 from app.services.livekit import LiveKitError
 from app.services.notifications import IncomingCallPush
+from app.services.pipeline import close_participants
 
 router = APIRouter()
 
@@ -337,6 +339,10 @@ async def decline_call(
     )
     if declined.rowcount != 1:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 처리된 통화입니다")
+    if call.analysis_mode == AnalysisMode.BOTH.value:
+        await close_participants(
+            session, call_id, ParticipantStatus.EXCLUDED, "CALL_NOT_ANSWERED"
+        )
     await session.commit()
     await request.app.state.container.calls.finish(call_id)
     return {"status": "DECLINED"}

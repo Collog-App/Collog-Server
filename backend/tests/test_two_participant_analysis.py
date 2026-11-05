@@ -490,6 +490,67 @@ def test_withdrawal_after_one_analysis_keeps_the_call_analysed(client: TestClien
     } == {(parent["id"], "ANALYZED", None), (child["id"], "EXCLUDED", "ANALYSIS_NOT_ALLOWED")}
 
 
+def test_calls_ending_without_analysis_close_their_participants(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    container = client.app.state.container
+    container.settings.two_participant_analysis_enabled = True
+
+    def ring() -> str:
+        created = client.post(
+            "/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]}
+        )
+        assert created.status_code == 201, created.text
+        return created.json()["callId"]
+
+    declined = ring()
+    decline = client.post(f"/v1/calls/{declined}/decline", headers=auth(parent_token))
+    assert decline.status_code == 200
+    missed = ring()
+    assert client.post(f"/v1/calls/{missed}/end", headers=auth(child_token)).status_code == 200
+    document = client.get("/v1/consents/document").json()
+    denied = client.post(
+        "/v1/consents",
+        headers=auth(child_token),
+        json={
+            "documentVersion": document["version"],
+            "decision": "DENY",
+            "scrolledToEnd": False,
+            "agreedItems": [],
+        },
+    )
+    assert denied.status_code == 201, denied.text
+    unrecorded = ring()
+    accept_call = client.post(f"/v1/calls/{unrecorded}/accept", headers=auth(parent_token))
+    assert accept_call.status_code == 200
+    assert client.post(f"/v1/calls/{unrecorded}/end", headers=auth(child_token)).status_code == 200
+    # 끝난 뒤에 녹음이 꺼진 통화는 주기 정리(maintain)가 닫는다.
+    stopped = ring()
+
+    async def end_unrecorded() -> None:
+        async with container.database.sessions() as session:
+            row = await session.get(CallRecord, stopped)
+            row.state = CallState.ENDED.value
+            row.ended_at = datetime.now(UTC)
+            row.recording_enabled = False
+            row.recording_disabled_reason = None
+            await session.commit()
+
+    client.portal.call(end_unrecorded)
+    client.portal.call(container.calls.maintain)
+
+    for call_id, reason in (
+        (declined, "CALL_NOT_ANSWERED"),
+        (missed, "CALL_NOT_ANSWERED"),
+        (unrecorded, "CONSENT_DENIED"),
+        (stopped, "RECORDING_DISABLED"),
+    ):
+        view = client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()
+        assert view["state"] == "ANALYSIS_EXCLUDED"
+        assert {
+            (item["analysisStatus"], item["exclusionReason"]) for item in view["participants"]
+        } == {("EXCLUDED", reason)}
+
+
 def test_call_created_while_off_stays_single_after_turning_on(client: TestClient) -> None:
     call_id, child_token, child, _, parent = start_call(client, both=False)
     client.app.state.container.settings.two_participant_analysis_enabled = True
