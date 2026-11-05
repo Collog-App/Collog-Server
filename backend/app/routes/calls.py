@@ -14,8 +14,8 @@ from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_
 from app.schemas import AudioConstraints, CallAccepted, CallAcceptRequest, CallCreate, CallCreated
 from app.security import CurrentUser, SessionDep
 from app.services.domain import (
-    ensure_child_can_access_parent,
-    ensure_report_access,
+    ensure_same_family,
+    ensure_subject_access,
     latest_consent,
     participants_consented,
 )
@@ -35,37 +35,39 @@ async def create_call(
     callee = await session.get(User, payload.callee_id)
     if callee is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 계정을 찾을 수 없습니다")
-    if user.id == callee.id or user.role == callee.role:
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "가족의 부모와 자녀 사이에 통화할 수 있습니다"
-        )
-    parent, child = (user, callee) if user.role == UserRole.PARENT.value else (callee, user)
-    await ensure_child_can_access_parent(session, child, parent.id)
-    async with request.app.state.container.calls.reserve_participants([parent.id, child.id]):
-        return await create_reserved_call(request, user, callee, parent, child, session)
+    if user.id == callee.id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "자기 자신에게는 전화할 수 없습니다")
+    await ensure_same_family(session, user.id, callee.id)
+    async with request.app.state.container.calls.reserve_participants([user.id, callee.id]):
+        return await create_reserved_call(request, user, callee, session)
+
+
+def analysis_subject(caller: User, callee: User) -> tuple[User, User]:
+    """S3 전까지 한 통화의 분석 대상(`calls.parent_id`)과 상대(`calls.child_id`).
+
+    두 사람 중 PARENT 역할이 정확히 하나면 그 사람(지금 iOS 동작), 아니면 받는 사람이다.
+    """
+    parents = [person for person in (caller, callee) if person.role == UserRole.PARENT.value]
+    subject = parents[0] if len(parents) == 1 else callee
+    return subject, callee if subject is caller else caller
 
 
 async def create_reserved_call(
     request: Request,
     user: User,
     callee: User,
-    parent: User,
-    child: User,
     session: SessionDep,
 ) -> dict:
-    participants = [parent.id, child.id]
+    participants = [user.id, callee.id]
     locked = list(await session.scalars(
         select(User.id).where(User.id.in_(participants)).order_by(User.id).with_for_update()
     ))
     if len(locked) != 2:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "가족 계정을 찾을 수 없습니다")
-    await session.refresh(parent)
-    await session.refresh(child)
-    if parent.role != UserRole.PARENT.value or child.role != UserRole.CHILD.value:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, "사용자 역할이 변경되었습니다. 다시 시도해주세요"
-        )
-    await ensure_child_can_access_parent(session, child, parent.id)
+    await session.refresh(user)
+    await session.refresh(callee)
+    await ensure_same_family(session, user.id, callee.id)
+    parent, child = analysis_subject(user, callee)
     busy = await session.scalar(
         select(CallRecord.id)
         .where(
@@ -80,10 +82,15 @@ async def create_reserved_call(
     if busy is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "본인 또는 상대방이 이미 통화 중입니다")
     if not settings_from(request).mock_external_services:
+        platforms = (
+            ["IOS", "ANDROID"]
+            if settings_from(request).fcm_service_account_path is not None
+            else ["IOS"]
+        )
         receiver = await session.scalar(
             select(Device.id).where(
                 Device.user_id == callee.id,
-                Device.platform == "IOS",
+                Device.platform.in_(platforms),
                 Device.voip_token.is_not(None),
                 Device.call_notifications_enabled.is_(True),
             )
@@ -124,12 +131,12 @@ async def create_reserved_call(
         await livekit.create_room(call.room_name)
     except LiveKitError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-    token = livekit.participant_token(call.room_name, user.id, user.name)
+    token = livekit.participant_token(call.room_name, user.id, user.display_name)
     devices = list(await session.scalars(
         select(Device)
         .where(
             Device.user_id == callee.id,
-            Device.platform == "IOS",
+            Device.platform.in_(["IOS", "ANDROID"]),
             Device.voip_token.is_not(None),
             Device.call_notifications_enabled.is_(True),
         )
@@ -138,13 +145,14 @@ async def create_reserved_call(
     await session.commit()
     delivered = False
     for device in devices:
+        container = request.app.state.container
         device_delivered = await deliver_incoming_call_push(
-            request.app.state.container.voip_push,
+            container.android_voip_push if device.platform == "ANDROID" else container.voip_push,
             device,
             IncomingCallPush(
                 call_id=call.id,
                 caller_id=user.id,
-                caller_name=user.name,
+                caller_name=user.display_name,
                 callee_id=callee.id,
                 expires_at=datetime.now(UTC)
                 + timedelta(seconds=settings_from(request).incoming_call_ttl_seconds),
@@ -203,7 +211,7 @@ async def accept_call(
             recording_enabled=call.recording_enabled,
             livekit_url=settings_from(request).livekit_url,
             room_name=call.room_name,
-            access_token=livekit.participant_token(call.room_name, user.id, user.name),
+            access_token=livekit.participant_token(call.room_name, user.id, user.display_name),
             raw_capture_required=call.recording_enabled and user.id == call.parent_id,
             audio_constraints=AudioConstraints(),
         ).model_dump(by_alias=True)
@@ -236,7 +244,7 @@ async def accept_call(
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 종료되었거나 응답한 통화입니다")
     settings = settings_from(request)
     livekit = request.app.state.container.livekit
-    token = livekit.participant_token(call.room_name, user.id, user.name)
+    token = livekit.participant_token(call.room_name, user.id, user.display_name)
     if call.recording_enabled and not settings.allow_raw_only_analysis:
         for _, kind, filename in (
             (call.parent_id, AssetKind.WEBRTC_EGRESS_PARENT, "parent.ogg"),
@@ -340,7 +348,7 @@ async def list_calls(
     from_: Annotated[date | None, Query(alias="from")] = None,
     to: date | None = None,
 ) -> dict:
-    await ensure_report_access(session, user, parent_id)
+    await ensure_subject_access(session, user, parent_id, "timeline")
     statement = select(CallRecord).where(CallRecord.parent_id == parent_id)
     if from_:
         statement = statement.where(

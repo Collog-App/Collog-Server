@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 from datetime import UTC, datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import Field
 from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     AcousticAnalysisRun,
@@ -24,6 +26,7 @@ from app.models import (
     ExtractionEvidence,
     Family,
     FamilyMember,
+    FamilyShare,
     HealthExtraction,
     Invitation,
     OtpChallenge,
@@ -36,11 +39,18 @@ from app.models import (
     User,
     UserRole,
 )
-from app.schemas import ApiModel, UserView
+from app.schemas import (
+    NICKNAME_PATTERN,
+    AccountProfileUpdate,
+    ApiModel,
+    PreferencesUpdate,
+    SharingUpdate,
+    UserView,
+)
 from app.security import CurrentUser, SessionDep
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.apple_oauth import apple_client_secret, revoke_apple_authorization
-from app.services.domain import family_of
+from app.services.domain import connected_family_ids, family_of, hand_over_family
 from app.services.storage import StorageError
 
 router = APIRouter(prefix="/account", tags=["Account"])
@@ -94,16 +104,109 @@ async def update_role(
             family = Family(created_by=user.id)
             session.add(family)
             await session.flush()
-        result = UserView(
-            id=user.id,
-            role=user.role,
-            name=user.name,
-            phone=user.phone,
-            apple_user_id=user.apple_subject,
-            family_id=family.id if family else None,
-        )
+        result = UserView.of(user, family.id if family else None)
         await session.commit()
         return result
+
+
+@router.get("/nickname-availability")
+async def nickname_availability(nickname: str, user: CurrentUser, session: SessionDep) -> dict:
+    if re.fullmatch(NICKNAME_PATTERN, nickname) is None:
+        return {"available": False, "reason": "INVALID"}
+    owner = await session.scalar(select(User.id).where(User.nickname == nickname))
+    if owner is not None and owner != user.id:
+        return {"available": False, "reason": "TAKEN"}
+    return {"available": True, "reason": None}
+
+
+@router.patch("/profile", response_model=UserView)
+async def update_profile(
+    payload: AccountProfileUpdate, user: CurrentUser, session: SessionDep
+) -> UserView:
+    taken = await session.scalar(
+        select(User.id).where(User.nickname == payload.nickname, User.id != user.id)
+    )
+    if taken is not None:
+        raise HTTPException(409, "이미 사용 중인 닉네임이에요")
+    user.nickname = payload.nickname
+    user.gender = payload.gender
+    user.birth_date = payload.birth_date
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(409, "이미 사용 중인 닉네임이에요") from None
+    family = await family_of(session, user)
+    return UserView.of(user, family.id if family else None)
+
+
+@router.patch("/preferences", response_model=UserView)
+async def update_preferences(
+    payload: PreferencesUpdate, user: CurrentUser, session: SessionDep
+) -> UserView:
+    user.marketing_opt_in = payload.marketing_opt_in
+    await session.commit()
+    family = await family_of(session, user)
+    return UserView.of(user, family.id if family else None)
+
+
+async def sharing_view(session: SessionDep, user: User) -> dict:
+    """내 기록을 같은 가족의 연결된 구성원 각각에게 보일지. 행이 없으면 모두 보인다."""
+    families = list(await session.scalars(
+        select(Family)
+        .where(Family.id.in_(connected_family_ids(user.id)))
+        .order_by(Family.created_at, Family.id)
+    ))
+    shares = []
+    seen = {user.id}
+    for family in families:
+        members = list(await session.scalars(
+            select(FamilyMember)
+            .where(FamilyMember.family_id == family.id, FamilyMember.user_id.is_not(None))
+            .order_by(FamilyMember.invited_at)
+        ))
+        # 구성원 목록과 같은 이름·관계를 쓴다. 만든 사람은 관계가 비어 있다.
+        people = [(row.user_id, row.name, row.relation) for row in members]
+        owner = await session.get(User, family.created_by)
+        if owner is not None:
+            people.append((owner.id, owner.display_name, ""))
+        for viewer_id, name, relation in people:
+            if viewer_id in seen:
+                continue
+            seen.add(viewer_id)
+            share = await session.get(FamilyShare, (user.id, viewer_id))
+            shares.append({
+                "viewerUserId": viewer_id,
+                "viewerName": name,
+                "relation": relation,
+                "report": share.report if share else True,
+                "timeline": share.timeline if share else True,
+            })
+    return {"shares": shares}
+
+
+@router.get("/sharing")
+async def get_sharing(user: CurrentUser, session: SessionDep) -> dict:
+    return await sharing_view(session, user)
+
+
+@router.put("/sharing")
+async def update_sharing(payload: SharingUpdate, user: CurrentUser, session: SessionDep) -> dict:
+    await session.scalar(select(User).where(User.id == user.id).with_for_update())
+    viewers = {row["viewerUserId"] for row in (await sharing_view(session, user))["shares"]}
+    updates = {item.viewer_user_id: item for item in payload.shares}
+    if set(updates) - viewers:
+        raise HTTPException(422, "같은 가족 구성원에게만 공유 범위를 정할 수 있어요")
+    for viewer_id, item in updates.items():
+        share = await session.get(FamilyShare, (user.id, viewer_id))
+        if share is None:
+            share = FamilyShare(owner_id=user.id, viewer_id=viewer_id)
+            session.add(share)
+        share.report = item.report
+        share.timeline = item.timeline
+        share.updated_at = datetime.now(UTC)
+    await session.commit()
+    return await sharing_view(session, user)
 
 
 @router.delete("", status_code=204)
@@ -181,6 +284,13 @@ async def delete_account(
         # Reports and baselines can contain summaries derived from the deleted calls.
         for model in (Report, Baseline):
             await session.execute(delete(model).where(model.parent_id.in_(parent_ids)))
+        # 만든 가족에 다른 구성원이 있으면 가족은 남기고 주인만 넘긴다.
+        # 남은 사람이 없는 가족만 아래에서 지운다.
+        for family in list(await session.scalars(
+            select(Family).where(Family.created_by == user.id)
+        )):
+            await hand_over_family(session, family)
+        await session.flush()
         owned_family_ids = select(Family.id).where(Family.created_by == user.id)
         removed_member_ids = select(FamilyMember.id).where(
             or_(FamilyMember.user_id == user.id, FamilyMember.family_id.in_(owned_family_ids))
@@ -191,6 +301,9 @@ async def delete_account(
         await session.execute(delete(FamilyMember).where(FamilyMember.id.in_(removed_member_ids)))
         await session.execute(delete(Family).where(Family.created_by == user.id))
         await session.execute(delete(ParentProfile).where(ParentProfile.parent_id == user.id))
+        await session.execute(delete(FamilyShare).where(
+            or_(FamilyShare.owner_id == user.id, FamilyShare.viewer_id == user.id)
+        ))
         for model in (ConsentRecord, QuestionTtsGrant, Device, RefreshSession):
             await session.execute(delete(model).where(model.user_id == user.id))
         if user.phone:

@@ -7,6 +7,20 @@ from app.config import Settings
 from app.schemas import QuestionView
 
 QUESTION_POOL: dict[str, list[tuple[str, str]]] = {
+    # Open questions (docs/profile-question-report-design.md §5): yes/no answers leave no record.
+    "FORGETFULNESS": [
+        ("forgetfulness-day", "오늘은 어떤 일을 하며 지내셨어요?"),
+        ("forgetfulness-med", "오늘 약은 언제 챙겨 드셨어요?"),
+        ("forgetfulness-recall", "어제 저녁에는 뭐 드셨어요?"),
+    ],
+    "RESPIRATORY": [
+        ("respiratory-breath", "오늘 숨쉬기는 좀 어떠셨어요?"),
+        ("respiratory-cough", "요즘 기침이나 가래는 어떠세요?"),
+    ],
+    "RHINITIS": [
+        ("rhinitis-nose", "요즘 코 상태는 어떠세요?"),
+        ("rhinitis-sleep", "코가 불편할 때 밤에는 어떻게 주무세요?"),
+    ],
     "DIABETES": [
         ("diabetes-walk", "오늘 산책이나 가벼운 운동 하셨어요?"),
         ("diabetes-meal", "오늘 식사는 제때 챙겨 드셨어요?"),

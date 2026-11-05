@@ -14,6 +14,8 @@ from app.models import (
     AppleLoginChallenge,
     Device,
     Family,
+    GoogleLoginChallenge,
+    KakaoLoginChallenge,
     OtpChallenge,
     RefreshSession,
     User,
@@ -22,6 +24,9 @@ from app.models import (
 from app.schemas import (
     AppleChallengeResponse,
     AppleLoginRequest,
+    GoogleChallengeResponse,
+    GoogleLoginRequest,
+    KakaoLoginRequest,
     OtpRequest,
     OtpVerify,
     RefreshRequest,
@@ -31,6 +36,12 @@ from app.schemas import (
 from app.security import SessionDep, issue_token, otp_hash
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.domain import family_of
+from app.services.google_auth import (
+    GoogleIdentity,
+    GoogleIdentityError,
+    GoogleServiceError,
+    OidcIdentityVerifier,
+)
 from app.services.sms import SmsDeliveryError, send_otp
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -51,19 +62,16 @@ async def token_response(
     return TokenResponse(
         access_token=issue_token(user, settings, auth_session.id),
         refresh_token=refresh_token,
-        user=UserView(
-            id=user.id,
-            role=user.role,
-            name=user.name,
-            phone=user.phone,
-            apple_user_id=user.apple_subject,
-            family_id=family.id if family else None,
-        ),
+        user=UserView.of(user, family.id if family else None),
     )
 
 
-async def create_session(session: SessionDep, user: User, settings: Settings) -> TokenResponse:
-    if user.role == UserRole.CHILD.value and await family_of(session, user) is None:
+async def create_session(
+    session: SessionDep, user: User, settings: Settings, *, role_sent: bool = True
+) -> TokenResponse:
+    # 역할을 보내는 클라이언트(iOS)의 자녀는 로그인 직후 초대할 가족이 있어야 한다.
+    # 역할을 보내지 않는 가입은 첫 초대 때 `POST /families`로 가족을 만든다.
+    if role_sent and user.role == UserRole.CHILD.value and await family_of(session, user) is None:
         session.add(Family(created_by=user.id))
         await session.flush()
     refresh_token = secrets.token_urlsafe(48)
@@ -160,6 +168,176 @@ async def apple_login(
                     status.HTTP_409_CONFLICT, "Apple 로그인을 다시 시도해주세요"
                 ) from None
     return await create_session(session, user, settings)
+
+
+def require_google_login(settings: Settings) -> None:
+    if not settings.google_client_id:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Google 로그인을 사용할 수 없습니다"
+        )
+
+
+def require_kakao_login(settings: Settings) -> None:
+    if not settings.kakao_app_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "카카오 로그인을 사용할 수 없습니다"
+        )
+
+
+LoginChallenge = type[GoogleLoginChallenge] | type[KakaoLoginChallenge]
+
+
+async def issue_login_challenge(
+    session: SessionDep, model: LoginChallenge, settings: Settings
+) -> GoogleChallengeResponse:
+    """Google·카카오 로그인 준비: ID 토큰에 넣을 일회용 nonce 를 발급한다."""
+    now = datetime.now(UTC)
+    await session.execute(delete(model).where(model.expires_at < now))
+    nonce = secrets.token_urlsafe(32)
+    challenge = model(
+        nonce_hash=hashlib.sha256(nonce.encode()).hexdigest(),
+        expires_at=now + timedelta(seconds=settings.apple_challenge_ttl_seconds),
+    )
+    session.add(challenge)
+    await session.commit()
+    return GoogleChallengeResponse(
+        challenge_id=challenge.id, nonce=nonce, expires_in=settings.apple_challenge_ttl_seconds
+    )
+
+
+async def verified_login_identity(
+    session: SessionDep,
+    model: LoginChallenge,
+    challenge_id: str,
+    id_token: str,
+    verifier: OidcIdentityVerifier,
+    label: str,
+) -> GoogleIdentity:
+    """준비 요청과 ID 토큰을 확인하고, 준비 요청은 한 번만 쓰게 한다."""
+    challenge = await session.get(model, challenge_id)
+    if challenge is None or challenge.consumed_at is not None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"{label} 로그인을 다시 시작해주세요")
+    if challenge.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"{label} 로그인 요청이 만료되었습니다")
+    try:
+        identity = await verifier.verify(id_token)
+    except GoogleIdentityError as exc:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, f"{label} 로그인 정보를 확인할 수 없습니다"
+        ) from exc
+    except GoogleServiceError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, f"{label} 로그인 확인을 잠시 후 다시 시도해주세요"
+        ) from exc
+    nonce_hash = hashlib.sha256(identity.nonce.encode()).hexdigest()
+    if not hmac.compare_digest(challenge.nonce_hash, nonce_hash):
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, f"{label} 로그인 요청이 일치하지 않습니다"
+        )
+    consumed = await session.scalar(
+        update(model)
+        .where(
+            model.id == challenge_id,
+            model.consumed_at.is_(None),
+            model.expires_at > datetime.now(UTC),
+        )
+        .values(consumed_at=datetime.now(UTC))
+        .execution_options(synchronize_session=False)
+        .returning(model.id)
+    )
+    if consumed is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"이미 사용한 {label} 로그인 요청입니다")
+    return identity
+
+
+@router.post("/google/challenge", response_model=GoogleChallengeResponse)
+async def google_challenge(request: Request, session: SessionDep) -> GoogleChallengeResponse:
+    settings: Settings = request.app.state.container.settings
+    require_google_login(settings)
+    return await issue_login_challenge(session, GoogleLoginChallenge, settings)
+
+
+@router.post("/google", response_model=TokenResponse)
+async def google_login(
+    payload: GoogleLoginRequest, request: Request, session: SessionDep
+) -> TokenResponse:
+    settings: Settings = request.app.state.container.settings
+    require_google_login(settings)
+    identity = await verified_login_identity(
+        session, GoogleLoginChallenge, payload.challenge_id, payload.id_token,
+        request.app.state.container.google_identity, "Google",
+    )
+    user = await session.scalar(select(User).where(User.google_subject == identity.subject))
+    if user is None:
+        try:
+            async with session.begin_nested():
+                user = User(
+                    google_subject=identity.subject,
+                    phone=None,
+                    role=payload.role or UserRole.CHILD.value,
+                    name=(payload.name or "").strip() or "사용자",
+                    email=identity.email,
+                )
+                session.add(user)
+                await session.flush()
+        except IntegrityError:
+            user = await session.scalar(
+                select(User).where(User.google_subject == identity.subject)
+            )
+            if user is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "Google 로그인을 다시 시도해주세요"
+                ) from None
+    if identity.email:
+        user.email = identity.email
+    return await create_session(session, user, settings, role_sent=payload.role is not None)
+
+
+@router.post("/kakao/challenge", response_model=GoogleChallengeResponse)
+async def kakao_challenge(request: Request, session: SessionDep) -> GoogleChallengeResponse:
+    settings: Settings = request.app.state.container.settings
+    require_kakao_login(settings)
+    return await issue_login_challenge(session, KakaoLoginChallenge, settings)
+
+
+@router.post("/kakao", response_model=TokenResponse)
+async def kakao_login(
+    payload: KakaoLoginRequest, request: Request, session: SessionDep
+) -> TokenResponse:
+    """카카오 SDK 로그인(OpenID Connect) ID 토큰으로 로그인한다.
+
+    역할 없이 가입하므로 가족은 첫 초대 때 생긴다.
+    """
+    settings: Settings = request.app.state.container.settings
+    require_kakao_login(settings)
+    identity = await verified_login_identity(
+        session, KakaoLoginChallenge, payload.challenge_id, payload.id_token,
+        request.app.state.container.kakao_identity, "카카오",
+    )
+    user = await session.scalar(select(User).where(User.kakao_subject == identity.subject))
+    if user is None:
+        try:
+            async with session.begin_nested():
+                user = User(
+                    kakao_subject=identity.subject,
+                    phone=None,
+                    role=UserRole.CHILD.value,
+                    name=(payload.name or "").strip() or identity.name or "사용자",
+                    email=identity.email,
+                )
+                session.add(user)
+                await session.flush()
+        except IntegrityError:
+            user = await session.scalar(
+                select(User).where(User.kakao_subject == identity.subject)
+            )
+            if user is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "카카오 로그인을 다시 시도해주세요"
+                ) from None
+    if identity.email:
+        user.email = identity.email
+    return await create_session(session, user, settings, role_sent=False)
 
 
 @router.post("/otp/request", status_code=202)

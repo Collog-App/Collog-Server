@@ -5,7 +5,18 @@ from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    false,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -85,7 +96,26 @@ class User(Base):
     apple_subject: Mapped[str | None] = mapped_column(
         String(255), unique=True, index=True, nullable=True
     )
+    google_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
+    kakao_subject: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
+    # 가입 정보. 기존 사용자를 위해 비울 수 있고, 닉네임이 있으면 가입을 마친 것으로 본다.
+    nickname: Mapped[str | None] = mapped_column(
+        String(10), unique=True, index=True, nullable=True
+    )
+    gender: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    birth_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    marketing_opt_in: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    @property
+    def display_name(self) -> str:
+        """다른 가족에게 보이는 이름. 가입 때 정한 닉네임이 있으면 로그인 계정 이름 대신 쓴다."""
+        return self.nickname or self.name
 
 
 class OtpChallenge(Base):
@@ -104,6 +134,24 @@ class OtpChallenge(Base):
 
 class AppleLoginChallenge(Base):
     __tablename__ = "apple_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class GoogleLoginChallenge(Base):
+    __tablename__ = "google_login_challenges"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class KakaoLoginChallenge(Base):
+    __tablename__ = "kakao_login_challenges"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     nonce_hash: Mapped[str] = mapped_column(String(64), unique=True)
@@ -170,6 +218,18 @@ class Invitation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class FamilyShare(Base):
+    """구성원 각자가 자기 기록을 다른 구성원에게 보일지. 행이 없으면 모두 보인다."""
+
+    __tablename__ = "family_shares"
+
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    viewer_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True, index=True)
+    report: Mapped[bool] = mapped_column(Boolean, default=True)
+    timeline: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ConsentRecord(Base):
     __tablename__ = "consent_records"
 
@@ -186,6 +246,7 @@ class ParentProfile(Base):
 
     parent_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
     conditions: Mapped[list[str]] = mapped_column(JSON, default=list)
+    concerns: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

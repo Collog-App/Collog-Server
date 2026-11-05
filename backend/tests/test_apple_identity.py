@@ -59,6 +59,17 @@ async def test_verified_subject_and_cached_keys(signing_key, claims):
         assert len(requests) == 1
 
 
+@pytest.mark.parametrize("seconds_ahead", [5, 55])
+async def test_tolerates_server_clock_behind_apple(signing_key, claims, seconds_ahead):
+    # 서버 시계가 Apple보다 몇 초 느리면 막 발급된 토큰의 iat가 미래로 보인다.
+    claims["iat"] = int(time.time()) + seconds_ahead
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=key_document(signing_key)))
+    ) as client:
+        verifier = AppleIdentityVerifier(Settings(_env_file=None), client=client)
+        assert (await verifier.verify(encode(signing_key, claims))).subject == claims["sub"]
+
+
 @pytest.mark.parametrize(
     ("claim", "value"),
     [

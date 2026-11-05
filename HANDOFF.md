@@ -1,6 +1,6 @@
 # 콜록(Collog) 개발 HANDOFF
 
-마지막 갱신: 2026-08-18 (Asia/Seoul)
+마지막 갱신: 2026-10-30 (Asia/Seoul)
 
 이 문서는 콜록 개발의 단일 인수인계 기준이다. 구현, 계약, 검증 결과, 미완료 항목이 바뀌면
 코드와 같은 커밋에서 반드시 이 문서를 갱신한다. 비밀키와 실제 건강정보는 기록하지 않는다.
@@ -132,6 +132,8 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
 - iOS PushKit용 APNs HTTP/2 provider와 `/devices` idempotent 등록
 - PushKit → CallKit → `/accept` → LiveKit iOS 계약 문서
 - `/team` 모바일 웹 포털과 `/team/status.json` 비밀값 없는 연동 상태 endpoint
+- Android용 Google 로그인 `/v1/auth/google/challenge`·`/v1/auth/google`. Apple 로그인과 같은
+  서버 nonce challenge 1회 소비 구조이며 `users.google_subject`로 계정을 찾는다
 - 연결 대기 질문 ElevenLabs provider, MP3 cache, local/S3 만료 download URL과 iOS 로컬 폴백
 - ElevenLabs voice 목록/한국어 MP3 preview CLI. provider key는 backend에만 보관
 - APNs 자격증명 점검·실기기 발송 CLI와 sandbox 실기기 CallKit 수신 검증
@@ -160,9 +162,28 @@ STT/LLM/음향 파이프라인이 끝까지 도는 것을 확인했다. 다만 �
 
 ### 의도적으로 미완료
 
-- **새 피그마와 현재 백엔드의 건강 주체 모델이 다르다.** 현재 API는 자녀 발신·부모 분석,
-  부모 질환 코드 배열에 고정돼 있다. 부모/자녀 양방향 통화와 양 참여자 동시 분석,
-  복용약·걱정·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 완료됐다.
+- **Google 로그인은 `GOOGLE_CLIENT_ID`를 설정해야 켜진다.** 값이 비면 두 엔드포인트가 503이다.
+  Google Cloud에 Web OAuth 클라이언트(이 값)와 Android OAuth 클라이언트(패키지 이름·서명
+  SHA-1)를 같은 프로젝트에 만들어야 한다. 같은 사람이 iOS(Apple)와 Android(Google)로
+  가입하면 계정이 따로 생기며 병합하지 않는다. Google 계정 삭제는 OTP 계정처럼 재인증 없이
+  진행한다.
+- **Android 통화·리포트 알림은 Firebase 서비스 계정 키가 있어야 나간다.** compose에서는 APNs 키처럼
+  `FCM_KEY_FILE`에 호스트 절대 경로를 주면 `/run/secrets/fcm-service-account.json`으로 읽기 전용
+  bind되고 `FCM_SERVICE_ACCOUNT_PATH`가 그 경로로 채워진다. compose 없이 직접 실행할 때만
+  `FCM_SERVICE_ACCOUNT_PATH`에 키 경로를 준다. 값이 비면
+  Android 기기는 수신 기기로 치지 않아 Android만 가진 상대에게 거는 통화는 409(수신 기기 없음)이고,
+  리포트 알림도 Android 기기를 대상에서 뺀다. Android 기기는 `platform=ANDROID`로 FCM 토큰 하나를
+  `token`·`voipToken`·`pushToken`에 같이 등록한다. 키 JSON은 `.gitignore`가 막는다.
+- **가족은 대칭 구조로 바뀌었지만 분석은 아직 한 사람만 한다.** `feat/family-symmetric`
+  (`backend/docs/family-symmetric-plan.md` S1)에서 초대·수락·통화·프로필·리포트 접근의 역할 검사를
+  없앴다. 한 사람은 한 가족에만 속하고, 같은 가족 구성원 둘이면 누구나 통화한다. `calls.parent_id`는
+  S3 전까지 **분석 대상**이다(PARENT 역할이 정확히 하나면 그 사람, 아니면 받는 사람). 두 참여자 동시
+  분석(`CallParticipant`), 복용약·출처·본인 확인, Q/A 관찰 event와 리포트 v2는 설계만 있다.
+  `users.role`은 응답 호환용과 위 분석 대상 선택에만 쓴다.
+- **가족 대칭 구조에서 정하지 않은 것.** 가족을 만든 사람은 `DELETE /families/{id}/members/{id}`로
+  나가거나 내보내질 수 없다(409). 소유권 넘기기가 정해지면 바꾼다. 초대 관계(`relation`)는 아직
+  `MOTHER`·`FATHER`뿐이라 형제·자녀를 초대할 때 고를 값이 없다. 만든 사람이 계정을 지우면 지금처럼
+  가족 전체가 사라진다.
 - **전체 STT segment 보관과 동의 문구가 불일치할 수 있다.** 성공 통화도 `transcripts.segments`에
   전체 전사를 저장하지만 화면은 구조화 항목만 기록한다고 안내한다. 보관 기간과 최소 evidence
   정책을 결정하고 코드/동의 문서를 함께 맞춰야 한다.
@@ -296,6 +317,8 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | 파일 | 역할 |
 |---|---|
 | `services/livekit.py` | self-host LiveKit room/token/audio-track 조회/Track Egress/webhook adapter와 mock |
+| `services/fcm.py` | Android FCM HTTP v1 발송. 서비스 계정 JWT로 OAuth 토큰 발급·재사용, 수신 통화·리포트 데이터 메시지, 만료 토큰 판정 |
+| `services/google_auth.py` | Google ID 토큰 JWKS 검증(iss 두 값, aud=Web client ID, nonce), 키 cache·실패 backoff |
 | `services/notifications.py` | APNs ES256 provider JWT와 HTTP/2 VoIP push, mock/disabled adapter |
 | `services/storage.py` | 로컬/S3 저장, presigned upload/download, TTS write/cache/read/delete |
 | `services/tts.py` | ElevenLabs 한국어 질문 합성·cache key·만료 URL과 질문별 iOS 폴백 |
@@ -328,6 +351,7 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/docs/acoustic-design.md` | 음향 4종 정의, 품질 gate, model, worker와 검증 기준 |
 | `backend/docs/voice-health-model-research.md` | HeAR/기침 detector 판정, 유사 서비스 비교, 되묻기·난청 한계와 검증 설계 |
 | `backend/docs/profile-question-report-design.md` | 피그마 기준 건강 프로필→질문→통화 자기보고→주·월간 리포트 계약과 현재 코드 차이 |
+| `backend/docs/family-symmetric-plan.md` | 가족 대칭 구조(B안) 이행 단계 S1~S6과 안드로이드가 맞출 API 약속 |
 | `backend/docs/implementation-plan-v2.md` | 승인된 권장 기본값, Phase 0~7 구현 순서·완료 조건, 실제 질문이 필요한 외부 조건 |
 | `backend/docs/schema-management-design.md` | 로컬 schema guard와 배포 Alembic의 두 축, 판정 규칙, 가비아 서버 배포 제약 |
 | `backend/docs/service-proposal-outline.md` | 초기 서비스 기획안을 개조식으로 재구성하고 현재 제품·구현·검증 상태에 맞춰 정정한 문서 |
@@ -350,6 +374,9 @@ APNs payload에는 `callId/callUUID/callerId/callerName/expiresAt`만 넣는다.
 | `backend/deploy/livekit-local.yaml` | Docker 없이 실행하는 단일 노드 LiveKit 설정. Egress 없음 |
 | `backend/docs/calibration-todo.md` | 보정되지 않은 상수와 측정 계획. 근거와 완료 기준 |
 | `backend/tests/test_api_flow.py` | 온보딩부터 분석·폐기·리포트까지 E2E API test |
+| `backend/tests/test_family_symmetric.py` | 역할 없는 초대·수락(혼자뿐인 가족 정리, 409), 형제 통화, 분석 대상 선택, 프로필·리포트 접근 test |
+| `backend/tests/test_account_profile.py` | 닉네임 확인(INVALID·TAKEN), 가입 정보 저장·중복 409·형식 422, 구성원 목록의 닉네임·생년월일 test |
+| `backend/tests/test_family_sharing.py` | 공유 범위 기본값·끄면 리포트/타임라인 403, 구성원 내보내기 권한, 나가면 공유 초기화, 마케팅 동의, 계정 삭제 정리 test |
 | `backend/tests/test_providers.py` | Deepgram/Gemini/APNs provider unit test |
 | `backend/tests/test_ai_pipeline.py` | prompt/repeat/acoustic/calendar-week deterministic test |
 | `backend/tests/test_tts.py` | ElevenLabs 요청 계약, cache/서명 URL, 장애 local 폴백 test |
@@ -553,6 +580,8 @@ Compose는 ignored `backend/private/`를 `/run/secrets/collog`에 read-only moun
 | `HF_TOKEN` | Hugging Face 계정에서 HAI-DEF 약관 수락 후 발급 | HeAR detector artifact를 처음 받을 때만 필요 | gated model download. 앱/런타임 API key가 아니며 Git에 넣지 않음 |
 | `LIVEKIT_API_KEY/SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | self-hosted room token, server API, Egress, webhook 서명 |
 | `JWT_SECRET` | 우리가 직접 강한 난수로 생성 | 필수 | 콜록 사용자 인증 JWT |
+| `FCM_KEY_FILE`(compose) / `FCM_SERVICE_ACCOUNT_PATH`(직접 실행) | Firebase Console 프로젝트 설정의 서비스 계정 키(JSON) | Android 통화 수신 시 필수 | FCM 발송. 비밀값이며 Git에 넣지 않음 |
+| `GOOGLE_CLIENT_ID` | Google Cloud Console의 Web OAuth 클라이언트 ID | Android Google 로그인 시 필수 | ID 토큰 `aud` 검증. 비밀값 아님 |
 | APNs `.p8`/Key ID/Team ID/Bundle ID | Apple Developer 발급·확인 | 실기기 백그라운드 수신 시 필수 | PushKit VoIP push |
 | MinIO access key/secret | 우리가 직접 생성 | Egress 녹음 시 필수 | self-hosted S3 호환 오디오 저장 |
 
@@ -916,3 +945,46 @@ API를 바꿀 때에는 기존 camelCase 계약과 테스트를 유지하고, �
 - 2026-08-20: 통합 직후 main이 lint 실패 상태였던 것을 고쳤다. `pipeline.py`의 로그 한 줄이
   E501, `seed_narrative_history.py`가 async 안에서 `pathlib`을 써 ASYNC240이었다. 파일 읽기를
   동기 함수로 분리했다. 브랜치를 머지할 때 `ruff`를 다시 돌려야 한다.
+- 2026-10-24: Android 포팅을 위해 Google 로그인 엔드포인트, `google_subject` 컬럼과
+  `google_login_challenges` 테이블(migration 0011), 검증기·라우트 테스트 40개를 추가했다.
+- 2026-10-24: Android 기기로 수신 통화·리포트 알림을 FCM HTTP v1으로 보내는 발송기와 플랫폼별 발송
+  분기, 테스트 12개를 추가했다.
+- 2026-10-24: FCM 보안 리뷰 반영. 빈 키 경로를 미설정으로 처리(기동 실패 방지), 리포트 재시도 때
+  이미 받은 기기 재발송 방지, 수신 기기 사전 검사에 ANDROID 포함, 죽은 토큰 판정을 `message.token`
+  지목 시로 한정, 토큰 정리를 해당 기기 행으로 한정, token_uri 고정, 서비스 계정 JSON gitignore.
+- 2026-10-25: 실기기(에뮬레이터) Google 로그인이 401이었다. 맥 시계가 Google보다 약 4초 느려 막 발급된
+  ID 토큰의 `iat`가 미래로 보였고, 검증이 시계 오차를 0초 허용했다. Google 검증에 60초 leeway를
+  두고 테스트를 추가했다.
+  `backend/.env`가 있으면 pytest도 그 값을 읽어 Apple·팀 포털 테스트가 실패한다. 로컬 실행용 값은
+  `backend/private/`에 두고 실행할 때만 불러온다.
+- 2026-10-26: 에뮬레이터 자녀 → Android 휴대폰 부모 통화에서 양방향 음성까지 로컬 E2E로 확인했다
+  (Google 로그인, FCM 수신, 받기, 음성, 끊으면 양쪽 종료).
+- 2026-10-26: compose에 FCM 키 bind가 없어, 운영 env에 호스트 경로를 넣으면 컨테이너가 키를 못 읽고
+  `AppContainer` 생성에서 기동 실패하던 문제를 고쳤다. `FCM_KEY_FILE` → `/run/secrets/fcm-service-account.json`,
+  비우면 `/dev/null`을 bind하고 Android 발송을 끈다(운영·로컬 compose 모두).
+- 2026-10-26: 동의 문서를 Android에도 맞게 고치고 버전을 `2026-10-26.v5`로 올렸다. "아이폰 직접 요청"·
+  "아이폰 기본 음성"을 "휴대폰"으로, 로그인 토큰을 "Apple·Google"로 바꿨다. Android도 질문 음성을
+  ElevenLabs에 직접 요청하므로 IP 전달 문구가 Android 사용자에게도 사실이어야 한다. 버전이 바뀌므로
+  배포 후 기존 사용자는 다시 동의해야 녹음·AI 분석이 켜진다(통화는 그대로 된다).
+- 2026-10-26: Apple 신원 토큰 검증에도 Google과 같은 60초 leeway를 두고 테스트를 추가했다.
+- 2026-10-26: 알려진 취약점이 있던 의존성을 잠금 파일에서 올렸다. pyjwt 2.13.0→2.15.1,
+  aiohttp 3.14.3→3.14.5, urllib3 2.7.0→2.8.0, certifi→2026.10.23, multidict 6.7.1→6.9.1(yarl 1.25.1 따라옴).
+  올린 뒤 `pip-audit` 0건.
+- 2026-10-30: 가족 대칭 구조 S1. 초대 생성·재발송은 가족 구성원 누구나, 수락은 가족이 없거나 혼자뿐인
+  가족에 있는 사람 누구나(그 가족은 정리), 다른 사람이 있는 가족에 이미 있으면 409. `POST /v1/families`가
+  내 가족을 주거나 만든다. 구성원 목록에 `acceptedAt`·`consentGranted`·`isCreator`를 더하고 만든 사람도
+  같은 모양(`relation` 빈 문자열)으로 주며 `canInvite`는 누구나 true, 초대 코드도 구성원 모두에게 보인다.
+  통화는 같은 가족 둘이면 누구나, `/parents/{id}/...`는 본인 또는 같은 가족이면 허용한다. Google 로그인은
+  역할을 안 보내도 되고, 그때는 로그인 때 가족을 만들지 않는다(iOS처럼 역할을 보내면 예전대로).
+- 2026-10-30: 가족 대칭 구조 S2. `users`에 `nickname`(유일, 한글 음절·영문·숫자 2~10자)·`gender`·`birth_date`·
+  `email`을 더했다(migration 0013, 모두 nullable). `UserView`에 같은 칸과 `signupCompleted`(닉네임 있음)를
+  더하고 `GET /v1/account/nickname-availability`, `PATCH /v1/account/profile`(중복 409, 형식 422)을 추가했다.
+  Google 로그인은 Google이 확인한(`email_verified`) 이메일만 `users.email`에 저장한다. 구성원 목록에
+  `nickname`·`birthDate`가 붙는다. 닉네임은 대소문자를 구분한다.
+- 2026-10-30: 가족 대칭 구조 S4. `family_shares(owner_id, viewer_id, report, timeline)`와
+  `users.marketing_opt_in`(migration 0014)을 더했다. `GET/PUT /v1/account/sharing`은 같은 가족의 연결된
+  구성원마다 한 줄이며 행이 없으면 모두 허용이다. 리포트·기준선·변화 신호는 `report`, 통화 목록은
+  `timeline`을 본다(프로필·오늘의 질문은 같은 가족이면 그대로). `DELETE /v1/families/{familyId}/members/{memberId}`는
+  대기 중 초대는 구성원 누구나, 연결된 구성원은 만든 사람 또는 본인만 지우고, 그 두 사람 사이의 공유 행도
+  지운다. 구성원 목록에 `canRemove`, `PATCH /v1/account/preferences`(`marketingOptIn`)를 더했다. 계정 삭제는
+  그 사용자가 들어간 공유 행을 함께 지운다. migration 0013·0014는 SQLite로만 검증했다(맥에 Postgres 없음).

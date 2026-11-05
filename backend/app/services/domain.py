@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import HTTPException, status
-from sqlalchemy import or_, select
+from sqlalchemy import Select, and_, delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.consent import CONSENT_ITEMS, CONSENT_VERSION
@@ -12,6 +13,7 @@ from app.models import (
     ConsentRecord,
     Family,
     FamilyMember,
+    FamilyShare,
     Invitation,
     User,
 )
@@ -37,7 +39,86 @@ async def family_for_parent(session: AsyncSession, parent_id: str) -> Family | N
     )
 
 
+async def family_for_user(session: AsyncSession, user_id: str) -> Family | None:
+    """역할과 상관없이 사용자가 속한 가족.
+
+    한 사람은 한 가족에만 속한다. 예전 데이터에서 둘 다 있으면 수락한 가족을 먼저 본다.
+    """
+    return await family_for_parent(session, user_id) or await family_for_child(session, user_id)
+
+
+def connected_family_ids(user_id: str) -> Select[tuple[str]]:
+    """사용자가 만들었거나 초대를 수락해 들어간 가족의 ID."""
+    return (
+        select(Family.id)
+        .outerjoin(FamilyMember, FamilyMember.family_id == Family.id)
+        .where(or_(Family.created_by == user_id, FamilyMember.user_id == user_id))
+    )
+
+
+async def is_family_member(session: AsyncSession, family: Family, user_id: str) -> bool:
+    if family.created_by == user_id:
+        return True
+    member = await session.scalar(
+        select(FamilyMember.id).where(
+            FamilyMember.family_id == family.id, FamilyMember.user_id == user_id
+        ).limit(1)
+    )
+    return member is not None
+
+
+async def family_people(session: AsyncSession, family: Family) -> set[str]:
+    """가족을 만든 사람과 초대를 수락한 구성원의 사용자 ID."""
+    members = await session.scalars(
+        select(FamilyMember.user_id).where(
+            FamilyMember.family_id == family.id, FamilyMember.user_id.is_not(None)
+        )
+    )
+    return {family.created_by, *members}
+
+
+async def clear_family_shares(session: AsyncSession, family: Family, user_id: str) -> None:
+    """가족을 떠나는 사람과 남은 구성원 사이의 공유 범위를 지운다.
+
+    다시 들어오면 기본값(모두 공개)부터 시작한다.
+    """
+    others = list(await family_people(session, family) - {user_id})
+    await session.execute(delete(FamilyShare).where(or_(
+        and_(FamilyShare.owner_id == user_id, FamilyShare.viewer_id.in_(others)),
+        and_(FamilyShare.viewer_id == user_id, FamilyShare.owner_id.in_(others)),
+    )))
+
+
+async def hand_over_family(session: AsyncSession, family: Family) -> bool:
+    """가족을 만든 사람이 떠날 때 가장 먼저 초대받아 들어온 구성원을 새 주인으로 한다.
+
+    넘길 사람이 없으면 False.
+    """
+    heir = await session.scalar(
+        select(FamilyMember)
+        .where(FamilyMember.family_id == family.id, FamilyMember.user_id.is_not(None))
+        .order_by(FamilyMember.invited_at, FamilyMember.id)
+        .limit(1)
+    )
+    if heir is None:
+        return False
+    # 만든 사람은 구성원 줄 없이 Family.created_by 로만 연결된다
+    await session.execute(delete(Invitation).where(Invitation.member_id == heir.id))
+    await session.execute(delete(FamilyMember).where(FamilyMember.id == heir.id))
+    family.created_by = heir.user_id
+    return True
+
+
+async def delete_family(session: AsyncSession, family: Family) -> None:
+    """남은 구성원이 없는 가족을 대기 중 초대와 함께 지운다."""
+    member_ids = select(FamilyMember.id).where(FamilyMember.family_id == family.id)
+    await session.execute(delete(Invitation).where(Invitation.member_id.in_(member_ids)))
+    await session.execute(delete(FamilyMember).where(FamilyMember.family_id == family.id))
+    await session.delete(family)
+
+
 async def family_of(session: AsyncSession, user: User) -> Family | None:
+    """응답의 `familyId`. 부모 역할 계정의 빈 가족을 숨기는 것은 iOS 호환 때문이다."""
     if user.role == "PARENT":
         joined = await family_for_parent(session, user.id)
         if joined is not None:
@@ -94,15 +175,21 @@ async def latest_invitation(session: AsyncSession, member_id: str) -> Invitation
     )
 
 
+async def consent_status(
+    session: AsyncSession, user_id: str, version: str = CONSENT_VERSION
+) -> str:
+    consent = await latest_consent(session, user_id)
+    if consent_is_current(consent, version):
+        return "CONSENT_GRANTED" if consent.decision == "GRANTED" else "CONSENT_DENIED"
+    return "AWAITING_CONSENT"
+
+
 async def derived_member_status(
     session: AsyncSession, member: FamilyMember, invitation: Invitation | None = None,
     version: str = CONSENT_VERSION,
 ) -> str:
     if member.user_id:
-        consent = await latest_consent(session, member.user_id)
-        if consent_is_current(consent, version):
-            return "CONSENT_GRANTED" if consent.decision == "GRANTED" else "CONSENT_DENIED"
-        return "AWAITING_CONSENT"
+        return await consent_status(session, member.user_id, version)
     invitation = invitation or await latest_invitation(session, member.id)
     now = datetime.now(UTC)
     if invitation and invitation.expires_at.replace(tzinfo=UTC) <= now:
@@ -110,29 +197,35 @@ async def derived_member_status(
     return "AWAITING_CONSENT"
 
 
-async def ensure_child_can_access_parent(
-    session: AsyncSession, child: User, parent_id: str
-) -> None:
-    child_families = select(Family.id).outerjoin(FamilyMember).where(
-        or_(Family.created_by == child.id, FamilyMember.user_id == child.id)
-    )
+async def ensure_same_family(session: AsyncSession, user_id: str, other_id: str) -> None:
     shared_family = await session.scalar(
         select(Family.id)
         .outerjoin(FamilyMember)
         .where(
-            Family.id.in_(child_families),
-            or_(Family.created_by == parent_id, FamilyMember.user_id == parent_id),
+            Family.id.in_(connected_family_ids(user_id)),
+            or_(Family.created_by == other_id, FamilyMember.user_id == other_id),
         )
         .limit(1)
     )
-    if shared_family is None or child.id == parent_id:
+    if shared_family is None or user_id == other_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "가족 접근 권한이 없습니다")
 
 
-async def ensure_report_access(session: AsyncSession, user: User, parent_id: str) -> None:
-    if user.role == "PARENT" and user.id == parent_id:
+async def ensure_subject_access(
+    session: AsyncSession,
+    user: User,
+    subject_id: str,
+    scope: Literal["report", "timeline"] | None = None,
+) -> None:
+    """`/parents/{id}/...`의 id를 대상 사용자로 읽는다.
+
+    본인 또는 같은 가족 구성원만 허용하고, `scope`가 있으면 대상이 그 구성원에게 공유를 껐는지도
+    본다. 공유 행이 없으면 허용한다.
+    """
+    if user.id == subject_id:
         return
-    if user.role == "CHILD":
-        await ensure_child_can_access_parent(session, user, parent_id)
-        return
-    raise HTTPException(status.HTTP_403_FORBIDDEN, "열람 권한이 없는 항목입니다")
+    await ensure_same_family(session, user.id, subject_id)
+    if scope is not None:
+        share = await session.get(FamilyShare, (subject_id, user.id))
+        if share is not None and not getattr(share, scope):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "열람 권한이 없는 항목입니다")

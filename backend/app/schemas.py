@@ -3,10 +3,14 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
-from app.models import BaselineKind, CallState, Metric, TimeSlot, UserRole
+from app.models import BaselineKind, CallState, Metric, TimeSlot, User, UserRole
+
+# 닉네임: 한글 음절·영문·숫자 2~10자.
+NICKNAME_PATTERN = r"^[가-힣A-Za-z0-9]{2,10}$"
 
 
 def to_camel(value: str) -> str:
@@ -70,6 +74,28 @@ class AppleChallengeResponse(ApiModel):
     expires_in: int
 
 
+class GoogleLoginRequest(ApiModel):
+    id_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    # 새 Android 가입은 역할을 보내지 않는다. 저장은 응답 호환용 CHILD.
+    role: UserRole | None = None
+    name: str | None = Field(default=None, max_length=80)
+
+
+class KakaoLoginRequest(ApiModel):
+    id_token: str = Field(min_length=1, max_length=16_384)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    name: str | None = Field(default=None, max_length=80)
+
+
+class GoogleChallengeResponse(ApiModel):
+    """Google·카카오 로그인 준비 응답(모양이 같다)."""
+
+    challenge_id: str
+    nonce: str
+    expires_in: int
+
+
 class UserView(ApiModel):
     id: str
     role: str
@@ -77,6 +103,56 @@ class UserView(ApiModel):
     phone: str | None = None
     apple_user_id: str | None = None
     family_id: str | None = None
+    nickname: str | None = None
+    gender: Literal["MALE", "FEMALE"] | None = None
+    birth_date: date | None = None
+    email: str | None = None
+    marketing_opt_in: bool = False
+    signup_completed: bool = False
+
+    @classmethod
+    def of(cls, user: User, family_id: str | None) -> UserView:
+        return cls(
+            id=user.id,
+            role=user.role,
+            name=user.name,
+            phone=user.phone,
+            apple_user_id=user.apple_subject,
+            family_id=family_id,
+            nickname=user.nickname,
+            gender=user.gender,
+            birth_date=user.birth_date,
+            email=user.email,
+            marketing_opt_in=user.marketing_opt_in,
+            signup_completed=user.nickname is not None,
+        )
+
+
+class AccountProfileUpdate(ApiModel):
+    nickname: str = Field(pattern=NICKNAME_PATTERN)
+    gender: Literal["MALE", "FEMALE"]
+    birth_date: date
+
+    @field_validator("birth_date")
+    @classmethod
+    def plausible_birth_date(cls, value: date) -> date:
+        if not date(1900, 1, 1) <= value <= datetime.now(ZoneInfo("Asia/Seoul")).date():
+            raise ValueError("생년월일을 확인해주세요")
+        return value
+
+
+class PreferencesUpdate(ApiModel):
+    marketing_opt_in: bool
+
+
+class ShareUpdate(ApiModel):
+    viewer_user_id: str
+    report: bool
+    timeline: bool
+
+
+class SharingUpdate(ApiModel):
+    shares: list[ShareUpdate]
 
 
 class TokenResponse(ApiModel):
@@ -97,7 +173,8 @@ class DeviceCreate(ApiModel):
 
 class InvitationCreate(ApiModel):
     name: str = Field(min_length=1, max_length=80)
-    relation: Literal["MOTHER", "FATHER"]
+    # Display label only. Anyone can invite anyone in the symmetric family model.
+    relation: Literal["MOTHER", "FATHER", "SPOUSE", "CHILD", "SIBLING", "GRANDPARENT", "OTHER"]
 
 
 class InvitationAccept(ApiModel):
@@ -111,13 +188,33 @@ class ConsentSubmit(ApiModel):
     agreed_items: list[str]
 
 
+Condition = Literal[
+    # Figma final design (2026-10-30)
+    "FORGETFULNESS",
+    "RESPIRATORY",
+    "RHINITIS",
+    # earlier list, still sent by the iOS app
+    "DIABETES",
+    "HYPERTENSION",
+    "DYSLIPIDEMIA",
+    "ASTHMA",
+    "OBESITY",
+]
+
+
 class ProfilePut(ApiModel):
-    conditions: list[Literal["DIABETES", "HYPERTENSION", "DYSLIPIDEMIA", "ASTHMA", "OBESITY"]]
+    conditions: list[Condition]
+    concerns: str | None = Field(default=None, max_length=500)
 
     @field_validator("conditions")
     @classmethod
     def unique_conditions(cls, value: list[str]) -> list[str]:
         return list(dict.fromkeys(value))
+
+    @field_validator("concerns")
+    @classmethod
+    def blank_concerns(cls, value: str | None) -> str | None:
+        return value.strip() or None if value is not None else None
 
 
 class QuestionView(ApiModel):
