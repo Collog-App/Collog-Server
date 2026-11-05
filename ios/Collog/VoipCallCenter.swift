@@ -47,14 +47,16 @@ final class VoipCallCenter: NSObject, ObservableObject {
     @Published private(set) var apnsToken: String?
     @Published private(set) var activeCall: ActiveCall?
     @Published private(set) var events: [String] = []
-    // .voiceChat 모드의 기본 출력은 수화기라 소리가 작다. 가족 통화라 하던 일을 하며 받는
-    // 경우가 많아 스피커를 기본으로 둔다. 통화 화면에서 끌 수 있다.
-    @Published private(set) var isSpeakerEnabled = true
+    // 버튼은 요청값이 아닌 실제 출력 경로를 표시한다.
+    @Published private(set) var isSpeakerEnabled = false
+    @Published private(set) var audioOutputLabel = "연결 대기"
 
     private let registry = PKPushRegistry(queue: .main)
     private let callController = CXCallController()
     private let speaker = RingingQuestionSpeaker()
     private let room = Room()
+    private let audioRouter = CallAudioRouter(session: SystemCallAudioSession())
+    private var audioRouteObserver: AnyCancellable?
     private lazy var provider: CXProvider = {
         let configuration = CXProviderConfiguration()
         configuration.supportsVideo = false
@@ -80,6 +82,7 @@ final class VoipCallCenter: NSObject, ObservableObject {
         // 시작해, 통화가 활성화되기 전에는 오디오 장치를 건드리지 않는다.
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
         setEngine(.none)
+        observeAudioSession()
         provider.setDelegate(self, queue: nil)
         room.add(delegate: self)
         registry.delegate = self
@@ -184,6 +187,12 @@ final class VoipCallCenter: NSObject, ObservableObject {
                     captureOptions: options
                 )
                 log("마이크 publish 완료")
+                do {
+                    try audioRouter.microphoneDidStart()
+                } catch {
+                    log("마이크 시작 후 출력 경로 복구 실패: \(error.localizedDescription)")
+                }
+                refreshAudioRoute(event: "microphone-published")
                 attachAnalysisWriter(to: publication)
             } catch {
                 didPublishMicrophone = false
@@ -266,6 +275,10 @@ final class VoipCallCenter: NSObject, ObservableObject {
 
     private func teardown() {
         speaker.stop()
+        audioRouter.deactivate()
+        isAudioSessionActive = false
+        isSpeakerEnabled = false
+        audioOutputLabel = "연결 대기"
         if let callId = activeCall?.id {
             finishAnalysisRecording(callId: callId)
         } else {
@@ -295,31 +308,60 @@ final class VoipCallCenter: NSObject, ObservableObject {
 
     // 통화 중 스피커폰 전환. 부모가 손을 못 쓰거나 소리가 작을 때 쓴다.
     func toggleSpeaker() {
-        isSpeakerEnabled.toggle()
-        applyAudioRoute()
-        log(isSpeakerEnabled ? "스피커폰 켬" : "스피커폰 끔")
-    }
-
-    // CallKit이 세션을 넘겨준 뒤에만 라우팅을 바꿀 수 있다. 통화가 끝나도 세션 category는
-    // .voiceChat으로 남아 다음 통화의 질문 낭독이 수화기로 나가므로, 낭독 직전에도 이 값을
-    // 다시 적용한다.
-    private func applyAudioRoute() {
         guard isAudioSessionActive else { return }
         do {
-            try AVAudioSession.sharedInstance()
-                .overrideOutputAudioPort(isSpeakerEnabled ? .speaker : .none)
+            try audioRouter.toggleSpeaker()
         } catch {
             log("오디오 출력 전환 실패: \(error.localizedDescription)")
         }
+        refreshAudioRoute(event: "speaker-button")
+    }
+
+    private func observeAudioSession() {
+        guard audioRouteObserver == nil else { return }
+        audioRouteObserver = NotificationCenter.default
+            .publisher(for: AVAudioSession.routeChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+                MainActor.assumeIsolated {
+                    self?.audioRouteChanged(reason: reason)
+                }
+            }
+
+    }
+
+    private func audioRouteChanged(reason rawReason: UInt?) {
+        guard isAudioSessionActive else { return }
+        let reason = rawReason.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:))
+        // 자신의 setCategory/override 알림에서 재설정하면 순환할 수 있으므로,
+        // 실제 기기의 연결·해제에서만 경로를 다시 선택한다.
+        if reason == .newDeviceAvailable || reason == .oldDeviceUnavailable {
+            do {
+                try audioRouter.externalDeviceChanged()
+            } catch {
+                log("외부 오디오 경로 전환 실패: \(error.localizedDescription)")
+            }
+        }
+        refreshAudioRoute(event: "route-change-\(rawReason ?? 0)")
+    }
+
+    private func refreshAudioRoute(event: String) {
+        guard isAudioSessionActive else { return }
+        let output = audioRouter.output
+        isSpeakerEnabled = output == .speaker
+        audioOutputLabel = output.label
+
+        log("오디오[\(event)] 출력: \(output.label)")
+
     }
 
     // 초기 데모에서는 첫 질문만 읽고 나머지는 화면의 참고 질문으로 둔다. 재생 실패가
     // 통화 연결을 막아서는 안 된다.
     private func speakFirstQuestion(_ questions: [CollogAPI.Question]) {
         guard let first = questions.first else { return }
-        // 첫 통화가 아니면 세션이 이전 통화의 .voiceChat 라우팅을 그대로 물고 있어 낭독이
-        // 수화기로 나간다. 낭독 직전에 현재 설정을 다시 적용한다.
-        applyAudioRoute()
+        // 라우팅은 CallKit 활성화와 기기 변경에서만 설정한다. 질문 재생이 Bluetooth
+        // 선택을 덮어쓰거나 통화 세션을 다시 구성해서는 안 된다.
         let contract = first.usesRemoteTTS ? "ElevenLabs REMOTE_ASSET" : "iOS LOCAL fallback"
         log("질문 음성 계약: \(contract)")
         speaker.speak(first) { [weak self] message in
@@ -541,27 +583,28 @@ extension VoipCallCenter: CXProviderDelegate {
 
     nonisolated func provider(_ provider: CXProvider, didActivate session: AVAudioSession) {
         MainActor.assumeIsolated {
+            isAudioSessionActive = true
             do {
-                try session.setCategory(
-                    .playAndRecord,
-                    mode: .voiceChat,
-                    options: [.mixWithOthers]
-                )
-                setEngine(.default)
-                isAudioSessionActive = true
-                applyAudioRoute()
-                log("오디오 세션 활성화")
-                publishMicrophoneIfReady()
+                try audioRouter.activate()
             } catch {
-                log("오디오 초기화 실패: \(error.localizedDescription)")
+                // 라우팅 실패와 CallKit 활성 상태는 별개다. 경로 변경/버튼/마이크
+                // 시작에서 재시도할 수 있도록 엔진과 통화 진행은 유지한다.
+                log("오디오 경로 초기화 실패: \(error.localizedDescription)")
             }
+            setEngine(.default)
+            refreshAudioRoute(event: "callkit-activated")
+            log("오디오 세션 활성화")
+            publishMicrophoneIfReady()
         }
     }
 
     nonisolated func provider(_ provider: CXProvider, didDeactivate session: AVAudioSession) {
         MainActor.assumeIsolated {
+            audioRouter.deactivate()
             setEngine(.none)
             isAudioSessionActive = false
+            isSpeakerEnabled = false
+            audioOutputLabel = "연결 대기"
             log("오디오 세션 비활성화")
         }
     }

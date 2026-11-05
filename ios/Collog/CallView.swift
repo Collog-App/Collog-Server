@@ -64,13 +64,17 @@ struct CallView: View {
 
             Spacer()
 
+            Text("오디오 출력: \(callCenter.audioOutputLabel)")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
             Button {
                 callCenter.toggleSpeaker()
             } label: {
                 Label(
-                    callCenter.isSpeakerEnabled ? "스피커폰 켜짐" : "스피커폰 꺼짐",
+                    callCenter.isSpeakerEnabled ? "스피커폰 끄기" : "스피커폰 켜기",
                     systemImage: callCenter.isSpeakerEnabled
-                        ? "speaker.wave.3.fill" : "speaker.slash.fill"
+                        ? "speaker.wave.3.fill" : "speaker.wave.1"
                 )
                 .font(.title3.bold())
                 .frame(maxWidth: .infinity)
