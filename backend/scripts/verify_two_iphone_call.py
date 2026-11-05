@@ -14,6 +14,7 @@ from app.config import Settings
 from app.database import Database
 from app.models import (
     AcousticFeature,
+    AnalysisMode,
     AssetKind,
     AssetStatus,
     AudioAsset,
@@ -59,15 +60,20 @@ async def snapshot(database: Database, call_id: str | None) -> dict[str, Any] | 
         transcript = await session.scalar(
             select(Transcript).where(Transcript.call_id == call.id)
         )
-        extraction = await session.scalar(
-            select(HealthExtraction).where(HealthExtraction.call_id == call.id)
-        )
-        features = list(
-            await session.scalars(select(AcousticFeature).where(AcousticFeature.call_id == call.id))
-        )
+        extraction_query = select(HealthExtraction).where(HealthExtraction.call_id == call.id)
+        feature_query = select(AcousticFeature).where(AcousticFeature.call_id == call.id)
+        if call.analysis_mode == AnalysisMode.BOTH.value:
+            # 두 사람을 분석한 통화는 결과가 사람마다 있다. 이 검증은 부모(parent_id) 몫을 본다.
+            extraction_query = extraction_query.where(
+                HealthExtraction.subject_user_id == call.parent_id
+            )
+            feature_query = feature_query.where(AcousticFeature.subject_user_id == call.parent_id)
+        extraction = await session.scalar(extraction_query)
+        features = list(await session.scalars(feature_query))
         return {
             "call": {
                 "id": call.id,
+                "parentId": call.parent_id,
                 "state": call.state,
                 "roomName": call.room_name,
                 "acceptedAt": call.accepted_at,
@@ -80,6 +86,7 @@ async def snapshot(database: Database, call_id: str | None) -> dict[str, Any] | 
             "assets": [
                 {
                     "kind": asset.kind,
+                    "ownerUserId": asset.owner_user_id,
                     "status": asset.status,
                     "egressId": asset.egress_id,
                     "durationSec": asset.duration_sec,
@@ -131,7 +138,16 @@ def evaluate(data: dict[str, Any], minimum_duration: int, allow_excluded: bool) 
     by_kind = {asset["kind"]: asset for asset in assets}
     parent_asset = by_kind.get(AssetKind.WEBRTC_EGRESS_PARENT.value)
     child_asset = by_kind.get(AssetKind.WEBRTC_EGRESS_CHILD.value)
-    raw_asset = by_kind.get(AssetKind.DEVICE_RAW.value)
+    # 두 사람을 분석하면 원시 오디오도 둘이다. 부모가 올린 것을 본다.
+    raw_asset = next(
+        (
+            asset
+            for asset in assets
+            if asset["kind"] == AssetKind.DEVICE_RAW.value
+            and asset["ownerUserId"] == call["parentId"]
+        ),
+        None,
+    )
     speakers = {
         segment.get("speaker")
         for segment in (transcript or {}).get("segments", [])

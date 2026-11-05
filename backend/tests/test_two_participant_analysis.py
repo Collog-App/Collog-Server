@@ -23,6 +23,7 @@ from app.models import (
     Report,
 )
 from app.services.pipeline import segments_for_subject
+from scripts.verify_two_iphone_call import evaluate, snapshot
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family, tone_wav
 from tests.test_family_symmetric import accept, invite, stored_call
@@ -719,6 +720,28 @@ def test_deleting_the_subject_also_removes_the_other_sides_reports(client: TestC
             return tuple(counts)
 
     assert client.portal.call(leftovers) == (0, 0, 0)
+
+
+def test_two_iphone_verifier_reads_the_parents_share_of_a_both_call(client: TestClient) -> None:
+    _, child, _, parent = onboard_family(client)
+    call_id = stored_both_call(client, parent, child)
+    database = client.app.state.container.database
+
+    async def add_raw_audio() -> None:
+        async with database.sessions() as session:
+            for owner in (parent["id"], child["id"]):
+                session.add(AudioAsset(
+                    call_id=call_id, kind="DEVICE_RAW", uri=f"memory://{owner}.wav",
+                    content_type="audio/wav", owner_user_id=owner, status="PURGED",
+                ))
+            await session.commit()
+
+    client.portal.call(add_raw_audio)
+    data = client.portal.call(snapshot, database, call_id)
+    assert data["extraction"]["symptom"] == "부모 기침"
+    assert [item["value"] for item in data["features"]] == [100.0]
+    checks = {item["name"]: item for item in evaluate(data, 0, False)["checks"]}
+    assert checks["parent device raw PCM"]["actual"]["ownerUserId"] == parent["id"]
 
 
 def test_segments_for_subject_relabels_without_moving_segment_ids() -> None:

@@ -120,6 +120,7 @@ async def replay(args: argparse.Namespace) -> int:
             room_name=f"replay-{started:%Y%m%d%H%M%S}",
             recording_enabled=True,
             asked_question_ids=[],
+            question_target_id=parent.id,
             started_at=started,
             accepted_at=started,
             ended_at=started + timedelta(minutes=3),
@@ -163,6 +164,9 @@ async def replay(args: argparse.Namespace) -> int:
                     sample_rate=sample_rate,
                     status=AssetStatus.UPLOADED.value,
                     uploaded_at=datetime.now(UTC),
+                    owner_user_id=(
+                        child.id if kind == AssetKind.WEBRTC_EGRESS_CHILD.value else parent.id
+                    ),
                 )
             )
             await session.commit()

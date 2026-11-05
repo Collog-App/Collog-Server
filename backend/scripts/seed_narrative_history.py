@@ -138,6 +138,7 @@ async def seed(args: argparse.Namespace) -> int:
             session.add(
                 AcousticFeature(
                     call_id=call.id,
+                    subject_user_id=parent.id,
                     audio_source="DEVICE_RAW",
                     metric=Metric.SPEECH_RATE.value,
                     value=float(entry["speechRate"]),
@@ -150,6 +151,7 @@ async def seed(args: argparse.Namespace) -> int:
             session.add(
                 HealthExtraction(
                     call_id=call.id,
+                    subject_user_id=parent.id,
                     parse_status="OK",
                     symptom=report.get("symptom"),
                     medication=report.get("medication"),
