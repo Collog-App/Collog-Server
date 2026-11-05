@@ -872,7 +872,7 @@ class ProcessingPipeline:
             await self.purge_call_audio(call_id)
         for call_id in call_ids:
             async with self.database.sessions() as session:
-                await session.execute(
+                expired = await session.execute(
                     update(CallRecord)
                     .where(
                         CallRecord.id == call_id,
@@ -885,7 +885,8 @@ class ProcessingPipeline:
                         processing_retry_at=None,
                     )
                 )
-                if await close_participants(
+                # 이번에 실패로 바꾼 통화만 참여자를 닫는다. 이미 끝났거나 통화 중이면 그대로 둔다.
+                if expired.rowcount and await close_participants(
                     session, call_id, ParticipantStatus.FAILED, "AUDIO_RETENTION_LIMIT"
                 ):
                     await session.execute(

@@ -551,6 +551,42 @@ def test_calls_ending_without_analysis_close_their_participants(client: TestClie
         } == {("EXCLUDED", reason)}
 
 
+def test_retention_limit_closes_participants_only_of_calls_it_fails(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    container = client.app.state.container
+    container.settings.two_participant_analysis_enabled = True
+    call_ids = []
+    for hang_up in (True, False):
+        created = client.post(
+            "/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]}
+        )
+        call_ids.append(created.json()["callId"])
+        accepted = client.post(f"/v1/calls/{call_ids[-1]}/accept", headers=auth(parent_token))
+        assert accepted.status_code == 200
+        if hang_up:
+            assert client.post(
+                f"/v1/calls/{call_ids[-1]}/end", headers=auth(child_token)
+            ).status_code == 200
+    ended, live = call_ids
+
+    async def age_audio() -> None:
+        async with container.database.sessions() as session:
+            for asset in await session.scalars(select(AudioAsset)):
+                asset.created_at = datetime.now(UTC) - timedelta(hours=25)
+            await session.commit()
+
+    client.portal.call(age_audio)
+    client.portal.call(container.pipeline.purge_expired_audio)
+
+    assert stored_call(client, ended).state == CallState.ANALYSIS_FAILED.value
+    assert {
+        (row.analysis_status, row.exclusion_reason) for row in participants_of(client, ended)
+    } == {("FAILED", "AUDIO_RETENTION_LIMIT")}
+    # 아직 통화 중인 통화는 상태가 그대로라 참여자도 그대로다.
+    assert stored_call(client, live).state == CallState.ACTIVE.value
+    assert {row.analysis_status for row in participants_of(client, live)} == {"PENDING"}
+
+
 def test_call_created_while_off_stays_single_after_turning_on(client: TestClient) -> None:
     call_id, child_token, child, _, parent = start_call(client, both=False)
     client.app.state.container.settings.two_participant_analysis_enabled = True
