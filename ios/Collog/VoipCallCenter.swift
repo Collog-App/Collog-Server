@@ -57,6 +57,7 @@ final class VoipCallCenter: NSObject, ObservableObject {
     private let room = Room()
     private let audioRouter = CallAudioRouter(session: SystemCallAudioSession())
     private var audioRouteObserver: AnyCancellable?
+    private var audioVolumeObservation: NSKeyValueObservation?
     private lazy var provider: CXProvider = {
         let configuration = CXProviderConfiguration()
         configuration.supportsVideo = false
@@ -328,7 +329,13 @@ final class VoipCallCenter: NSObject, ObservableObject {
                     self?.audioRouteChanged(reason: reason)
                 }
             }
-
+        audioVolumeObservation = AVAudioSession.sharedInstance()
+            .observe(\.outputVolume, options: [.new]) { [weak self] _, _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isAudioSessionActive else { return }
+                    self.refreshAudioRoute(event: "volume-change")
+                }
+            }
     }
 
     private func audioRouteChanged(reason rawReason: UInt?) {
@@ -352,8 +359,22 @@ final class VoipCallCenter: NSObject, ObservableObject {
         isSpeakerEnabled = output == .speaker
         audioOutputLabel = output.label
 
-        log("오디오[\(event)] 출력: \(output.label)")
-
+        let session = AVAudioSession.sharedInstance()
+        // UID/장치 이름 대신 포트 종류만 기록한다. AirPods 이름에 개인정보가 들어갈 수 있다.
+        let inputs = session.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let outputs = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        let processing = AudioManager.shared.audioProcessingState
+        let platform = AudioManager.shared.platformVoiceProcessingState
+        log(
+            "오디오[\(event)] in=\(inputs) out=\(outputs) "
+                + "volume=\(String(format: "%.2f", session.outputVolume)) "
+                + "category=\(session.category.rawValue) mode=\(session.mode.rawValue) "
+                + "options=\(session.categoryOptions.rawValue) sampleRate=\(Int(session.sampleRate)) "
+                + "AEC=\(processing.echoCancellation.effective) "
+                + "AGC=\(processing.autoGainControl.effective) NS=\(processing.noiseSuppression.effective) "
+                + "VPIO=\(platform.voiceProcessingEnabled.isActive) "
+                + "platformAGC=\(platform.voiceProcessingAGCEnabled.isActive)"
+        )
     }
 
     // 초기 데모에서는 첫 질문만 읽고 나머지는 화면의 참고 질문으로 둔다. 재생 실패가
@@ -613,6 +634,20 @@ extension VoipCallCenter: CXProviderDelegate {
 // MARK: - LiveKit
 
 extension VoipCallCenter: RoomDelegate {
+    nonisolated func room(
+        _ room: Room,
+        participant: RemoteParticipant,
+        didSubscribeTrack publication: RemoteTrackPublication
+    ) {
+        guard let audio = publication.track as? RemoteAudioTrack else { return }
+        let gain = audio.volume
+        Task { @MainActor in
+            guard self.activeCall != nil else { return }
+            self.log("원격 음성 수신: playbackGain=\(gain)")
+            self.refreshAudioRoute(event: "remote-audio-subscribed")
+        }
+    }
+
     nonisolated func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         // RoomDelegate는 main thread를 보장하지 않는다.
         Task { @MainActor in
