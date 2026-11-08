@@ -16,6 +16,7 @@ def upgrade() -> None:
         sa.Column("decision", sa.String(16), nullable=False),
         sa.Column("platform", sa.String(16), nullable=False),
         sa.Column("agreed_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("seq", sa.Integer(), nullable=False),
         sa.Column("ip", sa.String(45), nullable=True),
         sa.Column("user_agent", sa.String(255), nullable=True),
     )

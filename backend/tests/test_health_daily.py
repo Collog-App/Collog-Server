@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -161,7 +161,7 @@ def test_upload_rejects_out_of_range_values(client: TestClient) -> None:
     rejected = {
         "no days": [],
         "too many days": [day(offset) for offset in range(36)],
-        "future": [day(-1)],
+        "two days ahead": [day(-2)],
         "too old": [day(401)],
         "duplicate": [day(1), day(1)],
         "sleep low": [day(1, sleepMinutes=-1)],
@@ -189,6 +189,9 @@ def test_upload_rejects_out_of_range_values(client: TestClient) -> None:
         *[day(offset) for offset in range(35)],
     )
     assert accepted.status_code == 200, accepted.text
+    # 자정 무렵 기기 시계가 조금 빠른 경우를 위해 서울 기준 내일까지는 받는다.
+    tomorrow = upload(client, parent_token, day(-1, steps=10))
+    assert tomorrow.status_code == 200, tomorrow.text
     edges = upload(
         client,
         parent_token,
@@ -301,3 +304,44 @@ def test_account_deletion_removes_health_data(client: TestClient) -> None:
             return await session.scalar(select(func.count()).select_from(HealthDailySummary))
 
     assert client.portal.call(total) == 1
+
+
+def test_link_and_upload_require_the_required_consent(client: TestClient) -> None:
+    token, user = create_user(client, "01040000010", "PARENT", "동의 전")
+
+    linked = link(client, token)
+    assert linked.status_code == 403, linked.text
+    assert linked.json()["code"] == "CONSENT_REQUIRED"
+    uploaded = upload(client, token, day(1, steps=10))
+    assert uploaded.status_code == 403, uploaded.text
+    assert uploaded.json()["code"] == "CONSENT_REQUIRED"
+    assert rows(client, HealthLinkConsent, user["id"]) == []
+    assert rows(client, HealthDailySummary, user["id"]) == []
+
+
+def test_records_at_the_same_instant_follow_their_order(client: TestClient) -> None:
+    _, _, parent_token, parent = onboard_family(client)
+    assert link(client, parent_token).status_code == 200
+    assert client.delete("/v1/health/link", headers=auth(parent_token)).status_code == 204
+    assert sorted(item.seq for item in rows(client, HealthLinkConsent, parent["id"])) == [1, 2]
+
+    async def add(decision: str, seq: int, at: datetime) -> None:
+        async with client.app.state.container.database.sessions() as session:
+            session.add(HealthLinkConsent(
+                user_id=parent["id"], document_version=HEALTH_LINK_VERSION, decision=decision,
+                platform="HEALTH_CONNECT", agreed_at=at, seq=seq,
+            ))
+            await session.commit()
+
+    def connected() -> bool:
+        return client.get("/v1/health/link", headers=auth(parent_token)).json()["connected"]
+
+    # 시계가 같은 값을 돌려줘도 seq가 큰 기록이 최신이다. 넣은 순서와는 상관없다.
+    instant = datetime.now(UTC) + timedelta(minutes=1)
+    client.portal.call(add, "GRANTED", 3, instant)
+    client.portal.call(add, "REVOKED", 4, instant)
+    assert connected() is False
+    later = instant + timedelta(minutes=1)
+    client.portal.call(add, "GRANTED", 6, later)
+    client.portal.call(add, "REVOKED", 5, later)
+    assert connected() is True

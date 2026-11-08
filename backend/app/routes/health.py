@@ -9,10 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.consent import HEALTH_LINK_ITEMS, HEALTH_LINK_TITLE, HEALTH_LINK_VERSION
 from app.models import HealthDailySummary, HealthLinkConsent, HealthLinkDecision, User
-from app.routes.shared import aware
+from app.routes.shared import aware, settings_from
 from app.schemas import HealthDailyUpload, HealthLinkRequest
 from app.security import CurrentUser, SessionDep
-from app.services.domain import ensure_subject_access
+from app.services.domain import ensure_subject_access, has_consent
 from app.services.reports import REPORT_TIMEZONE
 
 router = APIRouter()
@@ -32,7 +32,8 @@ class HealthApiError(HTTPException):
 
 def client_ip(request: Request) -> str | None:
     # 운영은 Caddy 뒤라 request.client가 프록시 주소다. 마지막 X-Forwarded-For 값은
-    # Caddy가 붙인 실제 접속 주소다.
+    # Caddy가 붙인 실제 접속 주소다. Caddy 한 단이 바로 앞에 있다고 가정한다(앞에 프록시가
+    # 더 붙으면 이 값은 그 프록시 주소가 된다).
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[-1].strip()[:45] or None
@@ -43,9 +44,16 @@ async def latest_link(session: AsyncSession, user_id: str) -> HealthLinkConsent 
     return await session.scalar(
         select(HealthLinkConsent)
         .where(HealthLinkConsent.user_id == user_id)
-        .order_by(HealthLinkConsent.agreed_at.desc())
+        .order_by(HealthLinkConsent.agreed_at.desc(), HealthLinkConsent.seq.desc())
         .limit(1)
     )
+
+
+async def next_link_seq(session: AsyncSession, user_id: str) -> int:
+    latest = await session.scalar(
+        select(func.max(HealthLinkConsent.seq)).where(HealthLinkConsent.user_id == user_id)
+    )
+    return (latest or 0) + 1
 
 
 def is_linked(record: HealthLinkConsent | None) -> bool:
@@ -83,6 +91,14 @@ async def lock_user(session: AsyncSession, user: User) -> None:
     await session.scalar(select(User).where(User.id == user.id).with_for_update())
 
 
+async def ensure_required_consent(request: Request, session: AsyncSession, user: User) -> None:
+    # 건강 앱 연결은 선택 동의지만, 콜록 필수 동의(v5)를 마친 사람만 쓸 수 있다.
+    if not await has_consent(session, user.id, settings_from(request).consent_document_version):
+        raise HealthApiError(
+            status.HTTP_403_FORBIDDEN, "CONSENT_REQUIRED", "서비스 이용 동의를 먼저 완료해주세요"
+        )
+
+
 @router.get("/health/link", tags=["Health"])
 async def get_health_link(user: CurrentUser, session: SessionDep) -> dict:
     return await link_view(session, user.id)
@@ -92,6 +108,7 @@ async def get_health_link(user: CurrentUser, session: SessionDep) -> dict:
 async def link_health(
     payload: HealthLinkRequest, request: Request, user: CurrentUser, session: SessionDep
 ) -> dict:
+    await ensure_required_consent(request, session, user)
     if payload.version != HEALTH_LINK_VERSION:
         raise HealthApiError(
             status.HTTP_409_CONFLICT,
@@ -105,6 +122,7 @@ async def link_health(
         decision=HealthLinkDecision.GRANTED.value,
         platform=payload.platform,
         agreed_at=datetime.now(UTC),
+        seq=await next_link_seq(session, user.id),
         ip=client_ip(request),
         user_agent=(request.headers.get("user-agent") or "")[:255] or None,
     ))
@@ -123,6 +141,7 @@ async def unlink_health(request: Request, user: CurrentUser, session: SessionDep
             decision=HealthLinkDecision.REVOKED.value,
             platform=record.platform,
             agreed_at=datetime.now(UTC),
+            seq=await next_link_seq(session, user.id),
             ip=client_ip(request),
             user_agent=(request.headers.get("user-agent") or "")[:255] or None,
         ))
@@ -133,8 +152,9 @@ async def unlink_health(request: Request, user: CurrentUser, session: SessionDep
 
 @router.put("/health/daily", tags=["Health"])
 async def put_health_daily(
-    payload: HealthDailyUpload, user: CurrentUser, session: SessionDep
+    payload: HealthDailyUpload, request: Request, user: CurrentUser, session: SessionDep
 ) -> dict:
+    await ensure_required_consent(request, session, user)
     await lock_user(session, user)
     if not is_linked(await latest_link(session, user.id)):
         raise HealthApiError(
@@ -142,7 +162,9 @@ async def put_health_daily(
         )
     today = datetime.now(REPORT_TIMEZONE).date()
     oldest = today - timedelta(days=MAX_UPLOAD_AGE_DAYS)
-    if any(not oldest <= item.day <= today for item in payload.days):
+    # 자정 무렵 기기 시계가 조금 빠르면 「내일」이 섞여 온다. 하루 뒤까지는 받는다.
+    newest = today + timedelta(days=1)
+    if any(not oldest <= item.day <= newest for item in payload.days):
         raise HTTPException(422, "보낼 수 없는 날짜가 있어요")
     now = datetime.now(UTC)
     for item in payload.days:

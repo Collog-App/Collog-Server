@@ -257,6 +257,8 @@ class HealthLinkConsent(Base):
     decision: Mapped[str] = mapped_column(String(16))
     platform: Mapped[str] = mapped_column(String(16))
     agreed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # 한 사람의 기록 순서(1부터). 같은 시각에 남은 GRANTED/REVOKED의 앞뒤를 가른다.
+    seq: Mapped[int] = mapped_column(Integer)
     ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
