@@ -16,6 +16,10 @@ backend/private/*
 # HAI-DEF 약관 대상 모델 가중치. scripts/fetch_cough_model.py로 각자 받는다.
 backend/models/
 
+# 통화 시나리오 시험(scripts/scenario_audio.py·run_call_scenarios.py)이 만드는 음성과 결과 표.
+backend/.scenario-audio/
+backend/.scenario-results/
+
 # Python
 .venv/
 __pycache__/

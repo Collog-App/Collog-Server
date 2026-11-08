@@ -285,6 +285,21 @@ uv run python scripts/evaluate_extraction.py --provider mock
 uv run python scripts/evaluate_extraction.py --provider gemini --start 0 --limit 5 --delay 13
 ```
 
+통화 전체(STT → 가드레일 → 응급 안내 → 제외 판정 → 리포트)는 `evals/call_scenarios.json`의
+시나리오 12개로 휴대폰 없이 시험한다. 임시 SQLite DB에서 돌고 끝나면 지운다. 결과 표는
+터미널과 `.scenario-results/<시각>.md`에 남고, 실패가 있으면 종료 코드가 1이다.
+
+```bash
+# 가짜 모드: 대사를 전사 결과로, fakeFacts를 Gemini 답으로 쓴다. 외부 호출 없음
+uv run python -m scripts.run_call_scenarios
+# 음성 준비: 새로 만들 문장 수만 세기 → ElevenLabs로 만들기(.scenario-audio/에 캐시)
+uv run python -m scripts.scenario_audio --dry-run
+COLLOG_TEST_VOICE_PARENT=... COLLOG_TEST_VOICE_CHILD=... uv run python -m scripts.scenario_audio
+# 실제 모드: 생성 음성으로 Deepgram·Gemini를 부른다. 키는 환경변수 또는 맥 키체인(-a collog)
+COLLOG_TEST_VOICE_PARENT=... COLLOG_TEST_VOICE_CHILD=... \
+  uv run python -m scripts.run_call_scenarios --real --only cough
+```
+
 테스트는 초대→동의→질환 프로필→통화→이중 업로드→STT/LLM→폐기→리포트 전체 흐름과
 Deepgram word timing 정규화, Gemini 부모 근거 semantic validation/키 redaction, 되묻기 규칙,
 실제 WAV 음향 4종, calendar-week 기준선, LiveKit Track Egress 요청·웹훅, APNs VoIP 요청

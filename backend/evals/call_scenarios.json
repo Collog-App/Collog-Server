@@ -1,0 +1,237 @@
+[
+  {
+    "id": "sleep-trouble",
+    "description": "수면 문제: 새벽에 자꾸 깨서 잠을 설친다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 저예요. 요즘 잠은 좀 주무세요?"},
+      {"speaker": "PARENT", "text": "아이고, 말도 마라. 어젯밤에도 새벽 두 시에 깨서 세 시간을 뒤척였어.", "fakeFacts": {"sleep": "PRESENT"}},
+      {"speaker": "CHILD", "text": "또 깨셨어요? 며칠째 그러세요?"},
+      {"speaker": "PARENT", "text": "한 일주일 됐나. 누우면 금방 잠드는데 꼭 중간에 깨더라. 다시 잠들기가 영 어려워.", "fakeFacts": {"sleep": "PRESENT"}},
+      {"speaker": "CHILD", "text": "낮에 졸리진 않으세요?"},
+      {"speaker": "PARENT", "text": "낮에는 텔레비전 보다가 꾸벅꾸벅 졸기도 하고 그래. 그래도 밥은 세 끼 잘 챙겨 먹고 있으니까 너무 걱정하지 마라."},
+      {"speaker": "CHILD", "text": "네, 그래도 너무 못 주무시면 힘드실 텐데요."},
+      {"speaker": "PARENT", "text": "요새 날이 추워져서 그런가 싶기도 해. 이불을 두꺼운 걸로 바꿨으니까 이번 주는 좀 나아지겠지. 너도 날 추운데 옷 따뜻하게 입고 다녀라.", "pauseBefore": 0.6},
+      {"speaker": "CHILD", "text": "그럼 이번 주말에 전기요 하나 사 갈게요."},
+      {"speaker": "PARENT", "text": "아이고, 됐어. 돈 쓰지 마라. 작년에 산 것도 있는데 그게 어디 들어갔는지 모르겠어. 찾아보면 나오겠지. 그거나 꺼내서 깔아야겠다. 너는 주말에 그냥 집에서 쉬어."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"sleep": "PRESENT"},
+      "summaryIncludes": ["잠|수면"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "daily-walk",
+    "description": "걸음·산책: 매일 공원을 사십 분 걷는다",
+    "lines": [
+      {"speaker": "CHILD", "text": "아빠, 오늘은 뭐 하셨어요?"},
+      {"speaker": "PARENT", "text": "아침 먹고 동네 공원에 산책 나갔다 왔지. 한 바퀴 돌고 오니까 사십 분쯤 걸리더라.", "fakeFacts": {"activity": "PRESENT"}},
+      {"speaker": "CHILD", "text": "와, 매일 나가세요?"},
+      {"speaker": "PARENT", "text": "요즘은 거의 매일 나가. 옆집 김 씨랑 같이 걸으니까 심심하지도 않고 좋아. 오늘은 만 보 넘게 걸었다.", "fakeFacts": {"activity": "PRESENT"}},
+      {"speaker": "CHILD", "text": "만 보요? 대단하세요."},
+      {"speaker": "PARENT", "text": "공원에 국화가 한창이라 사진도 몇 장 찍었어. 이따 가족 단톡방에 올려 줄 테니까 손주들한테도 보여 줘라. 다음 주말에 오면 같이 한번 가 보자.", "pauseBefore": 0.6},
+      {"speaker": "CHILD", "text": "좋아요. 엄마도 같이 가실까요?"},
+      {"speaker": "PARENT", "text": "네 엄마는 요즘 노래 교실 다닌다고 바빠. 다음 달에 구민회관에서 발표회를 한다더라. 그때 너도 시간 되면 와서 박수 좀 쳐 줘라. 꽃다발도 하나 사 오고. 엄마가 엄청 좋아할 거야."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"activity": "PRESENT"},
+      "summaryIncludes": ["산책|걸|걷"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "medication-reduced",
+    "description": "복약 변화: 부모가 직접 「혈압약을 좀 줄였어」라고 말하면 사실로 남는다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 지난주에 진료 받으신 건 어떻게 됐어요?"},
+      {"speaker": "PARENT", "text": "응, 의사 선생님이 혈압이 많이 안정됐다고 하더라. 그래서 이번부터 혈압약을 좀 줄였어. 아침에 한 알 먹던 걸 반 알만 먹어.", "fakeFacts": {"medication": "PRESENT"}},
+      {"speaker": "CHILD", "text": "줄여도 괜찮대요?"},
+      {"speaker": "PARENT", "text": "어, 대신 아침마다 혈압을 재서 수첩에 적어 오래. 그래서 요즘 아침 먹기 전에 꼭 재고 있어. 오늘 아침에도 재 봤는데 괜찮게 나왔어."},
+      {"speaker": "CHILD", "text": "다행이에요. 반 알은 잊지 말고 꼭 챙겨 드세요."},
+      {"speaker": "PARENT", "text": "그럼, 밥 먹고 바로 먹으니까 잊어버릴 일이 없어. 너는 요즘 회사 일 바쁘다더니 괜찮니? 끼니 거르지 말고 다녀."},
+      {"speaker": "CHILD", "text": "저는 괜찮아요. 요즘 좀 바쁘긴 해도 할 만해요."},
+      {"speaker": "PARENT", "text": "그래도 너무 무리하지 마라. 일은 끝이 없는 거야. 이번 설에는 며칠 쉴 수 있니? 네 동생도 내려온다니까 오랜만에 다 같이 모여서 떡국이나 끓여 먹자."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"medication": "PRESENT"},
+      "summaryIncludes": ["혈압약", "줄|반 알|감량"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "cough",
+    "description": "증상(기침): 사흘째 저녁마다 기침이 난다, 응급은 아니다",
+    "lines": [
+      {"speaker": "CHILD", "text": "아빠, 목소리가 좀 쉬셨네요. 괜찮으세요?"},
+      {"speaker": "PARENT", "text": "응, 사흘 전부터 기침이 좀 나. 낮에는 괜찮은데 저녁만 되면 콜록콜록 해.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "열은 없으시고요?"},
+      {"speaker": "PARENT", "text": "몸이 뜨겁지는 않아. 목만 좀 칼칼하고 가래가 조금 끼는 정도야.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "따뜻한 물 많이 드세요."},
+      {"speaker": "PARENT", "text": "그래, 네 엄마가 배랑 생강을 넣고 차를 끓여 줘서 그거 마시고 있어. 오늘 아침에는 어제보다 훨씬 덜하더라. 주말쯤이면 다 나을 거야. 너는 회사 다니느라 바쁜데 신경 쓰지 마라."},
+      {"speaker": "CHILD", "text": "네, 그래도 심해지시면 꼭 말씀하세요. 손주들은 요즘 잘 지내요."},
+      {"speaker": "PARENT", "text": "그래, 큰애는 이번에 반장 됐다며? 네 엄마가 얼마나 자랑을 하는지 모른다. 작은애는 피아노 학원 다닌다던데 재미있어 하니? 다음에 오면 한 곡 쳐 달라고 해야겠다."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"symptom": "PRESENT"},
+      "summaryIncludes": ["기침"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "chest-pain-denied",
+    "description": "부정: 「가슴이 아프진 않아」는 응급 안내를 띄우지 않고 증상 없음으로 남는다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 지난번에 가슴이 답답하다고 하셨잖아요. 요즘은 어떠세요?"},
+      {"speaker": "PARENT", "text": "아니야, 가슴이 아프진 않아. 그때는 체해서 그랬던 거고 지금은 아무렇지도 않다.", "fakeFacts": {"symptom": "ABSENT"}},
+      {"speaker": "CHILD", "text": "그래도 혹시 또 그러시면 꼭 말씀하세요."},
+      {"speaker": "PARENT", "text": "알았어, 알았어. 너는 꼭 엄마를 환자 취급하더라. 요새는 손주가 영상 통화를 자주 해 줘서 그 재미로 산다. 어제는 유치원에서 만든 종이 꽃을 보여 주더라."},
+      {"speaker": "CHILD", "text": "하하, 걔가 엄마를 제일 좋아해요."},
+      {"speaker": "PARENT", "text": "그러게 말이다. 아, 김치도 담가 놨으니까 주말에 와서 가져가라. 이번에는 갓김치도 조금 했어. 네가 좋아하잖아.", "pauseBefore": 0.6},
+      {"speaker": "CHILD", "text": "네, 주말에 갈게요."},
+      {"speaker": "PARENT", "text": "그리고 네 아빠가 요새 바둑 두는 재미에 빠져서 저녁만 먹으면 휴대폰만 들여다본다. 너도 아빠한테 전화 좀 자주 해라. 겉으로는 무뚝뚝해도 엄청 기다린다."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"symptom": "ABSENT"},
+      "summaryIncludes": ["가슴"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "chest-pain-emergency",
+    "description": "응급: 「가슴이 너무 아파」는 응급 안내를 띄우고 증상으로 남는다",
+    "lines": [
+      {"speaker": "CHILD", "text": "아빠, 목소리가 왜 그렇게 힘이 없으세요?"},
+      {"speaker": "PARENT", "text": "어, 아까 저녁 먹고 나서부터 가슴이 너무 아파. 꽉 쥐어짜는 것 같아.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "어디가 어떻게 그러세요?"},
+      {"speaker": "PARENT", "text": "가슴 한가운데가 꽉 막힌 것처럼 무거워. 왼쪽 팔까지 저리고 뻐근하네.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "지금도 그러세요?"},
+      {"speaker": "PARENT", "text": "지금도 좀 그래. 식은땀이 나서 옷이 다 젖었어. 네 엄마는 체한 거라는데 손을 따도 그대로야.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "아빠, 그거 체한 게 아닐 수도 있어요. 지금 바로 119 부를게요."},
+      {"speaker": "CHILD", "text": "아빠, 지금 어디 계세요? 엄마는 옆에 계세요?"},
+      {"speaker": "PARENT", "text": "응, 거실 소파에 누워 있어. 네 엄마는 부엌에서 따뜻한 물 데우고 있고. 아까는 그냥 체한 줄 알고 참았는데 시간이 지나도 안 가라앉네."},
+      {"speaker": "PARENT", "text": "괜찮을 거야, 너무 호들갑 떨지 마라. 그래도 네가 그렇게 걱정하면 엄마랑 같이 큰 병원에 한번 가 볼게. 옷 갈아입고 바로 나갈 테니까 너무 놀라지 말고 기다려라."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"symptom": "PRESENT"},
+      "summaryIncludes": ["가슴"],
+      "safetyNotice": true
+    }
+  },
+  {
+    "id": "breathless-after-stairs",
+    "description": "운동 뒤 숨참: 「계단 오르니 숨이 찼어」는 증상이지만 응급 안내는 없다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 오늘 아파트 엘리베이터 점검한다고 하지 않았어요?"},
+      {"speaker": "PARENT", "text": "맞아, 그래서 오늘은 오 층까지 걸어서 올라왔지. 계단 오르니 숨이 찼어. 중간에 두 번이나 서서 쉬었다.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "지금은 괜찮으세요?"},
+      {"speaker": "PARENT", "text": "응, 집에 와서 물 한 잔 마시고 나니까 금방 괜찮아졌어. 가만히 있으면 숨이 안 차.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "엘리베이터는 언제 고쳐진대요?"},
+      {"speaker": "PARENT", "text": "내일 오후면 끝난다더라. 관리실에서 안내 방송을 몇 번이나 하더라고. 그래도 내일부터는 편하게 다닐 수 있겠지. 너도 요새 날 추운데 옷 따뜻하게 입고 다녀라."},
+      {"speaker": "CHILD", "text": "네, 옷 따뜻하게 입을게요. 아빠는 요즘 어떠세요?"},
+      {"speaker": "PARENT", "text": "네 아빠는 요새 아침마다 경로당 가서 장기 두고 온다. 점심때 들어와서 국수 한 그릇 먹고 또 나가더라. 집에 있으면 심심하다나 뭐라나."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"symptom": "PRESENT", "activity": "ANY"},
+      "summaryIncludes": ["숨"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "breathless-at-rest",
+    "description": "안정 시 숨참: 「가만히 있어도 숨이 차」는 응급 안내를 띄운다",
+    "lines": [
+      {"speaker": "CHILD", "text": "아빠, 요즘 숨 차신 건 좀 어떠세요?"},
+      {"speaker": "PARENT", "text": "그게 말이야, 요즘은 가만히 있어도 숨이 차. 텔레비전 보고 앉아 있는데도 숨이 가빠서 자꾸 크게 쉬게 돼.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "언제부터 그러셨어요?"},
+      {"speaker": "PARENT", "text": "한 사흘 됐나. 밤에 누우면 더 답답해서 베개를 두 개 겹쳐 베고 자. 다리도 좀 부은 것 같고.", "fakeFacts": {"symptom": "PRESENT"}},
+      {"speaker": "CHILD", "text": "그건 바로 진료 받으셔야 해요."},
+      {"speaker": "CHILD", "text": "엄마는 뭐라세요?"},
+      {"speaker": "PARENT", "text": "네 엄마도 걱정이 돼서 아까부터 계속 옆에 앉아 있어. 괜히 나 때문에 다들 마음 쓰는 것 같아서 미안하다. 별일 아니었으면 좋겠다."},
+      {"speaker": "PARENT", "text": "그래, 안 그래도 내일 아침에 네 엄마랑 내과에 가 보려고 했다. 너무 걱정하지 말고 일 봐라. 다녀오면 바로 전화할게. 내일 아침 일찍 나갈 거니까 오늘은 일찍 들어가서 쉴게."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"symptom": "PRESENT", "sleep": "ANY"},
+      "summaryIncludes": ["숨"],
+      "safetyNotice": true
+    }
+  },
+  {
+    "id": "child-only-symptoms",
+    "description": "자녀만 증상·복약을 말하고 부모는 「응」으로만 답한다. 부모는 다른 이야기를 길게 해 분석은 되지만 사실은 없다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 요즘 기침 많이 하시죠? 밤에 잠도 잘 못 주무시고, 혈압약도 자꾸 깜빡하신다면서요."},
+      {"speaker": "PARENT", "text": "응.", "fakeFacts": {"symptom": "PRESENT", "sleep": "PRESENT", "medication": "ABSENT"}},
+      {"speaker": "CHILD", "text": "무릎도 아프시고 산책도 통 못 나가신다고 아빠가 그러던데요."},
+      {"speaker": "PARENT", "text": "응, 그래.", "fakeFacts": {"activity": "ABSENT"}},
+      {"speaker": "CHILD", "text": "제가 이번 주말에 내려갈게요."},
+      {"speaker": "PARENT", "text": "그래, 오면 좋지. 마침 막내 이모가 감을 한 상자 보내 줬는데 너무 많아서 혼자 다 못 먹겠다. 올 때 큰 가방 하나 들고 와라. 손주들 좋아하는 식혜도 만들어 놓을게."},
+      {"speaker": "CHILD", "text": "식혜 좋아요. 다른 건 필요한 거 없으세요?"},
+      {"speaker": "PARENT", "text": "없어, 없어. 너 오는 것만으로도 충분해. 아, 그리고 거실 형광등이 하나 나갔는데 올 때 시간 되면 그것 좀 갈아 줘. 사다리는 베란다에 있을 거야. 네 아빠는 높은 데 올라가는 걸 무서워해서."},
+      {"speaker": "CHILD", "text": "알았어요. 형광등은 제가 사 갈게요."},
+      {"speaker": "PARENT", "text": "그래 주면 고맙지. 아, 그리고 지난번에 네가 고쳐 준 텔레비전 리모컨이 또 말을 안 듣는다. 건전지를 갈아 봐도 그대로야. 그것도 올 때 한번 봐 줘라."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {},
+      "summaryExcludes": ["기침", "혈압약", "무릎"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "disease-name-from-child",
+    "description": "자녀가 병명(당뇨)을 넣어 물어도 부모가 말하지 않았으면 요약에 병명이 없다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 당뇨 있으시니까 식사 조절 잘하고 계시죠? 당뇨약은 오늘 드셨어요?"},
+      {"speaker": "PARENT", "text": "응, 아침 먹고 바로 약 챙겨 먹었지. 저녁 약도 식탁 위에 꺼내 놨어.", "fakeFacts": {"medication": "PRESENT"}},
+      {"speaker": "CHILD", "text": "혈당은 재 보셨어요? 당뇨는 관리가 제일 중요하대요."},
+      {"speaker": "PARENT", "text": "그건 이따 저녁 먹고 잴 거야. 너는 엄마 걱정은 그만하고 네 몸이나 신경 써. 요새 회사에서 야근한다며. 밥은 제때 먹고 다니니?"},
+      {"speaker": "CHILD", "text": "네, 잘 먹고 있어요."},
+      {"speaker": "PARENT", "text": "그래야지. 지난번에 보내 준 반찬은 다 먹었니? 이번에 무를 많이 얻어서 깍두기를 담갔는데 맛이 아주 잘 들었어. 택배로 부칠 테니까 받으면 바로 냉장고에 넣어라."},
+      {"speaker": "CHILD", "text": "고마워요, 엄마. 깍두기 기다릴게요."},
+      {"speaker": "PARENT", "text": "그래, 받으면 꼭 전화하고. 이번 주에 비 온다니까 우산 들고 다니고. 아, 네 아빠가 요새 너 보고 싶다고 노래를 부른다. 시간 날 때 아빠한테도 전화 한 통 해 줘라."}
+    ],
+    "expected": {
+      "state": "ANALYZED",
+      "facts": {"medication": "PRESENT"},
+      "summaryIncludes": ["약"],
+      "summaryExcludes": ["당뇨"],
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "short-call",
+    "description": "짧은 통화: 부모 발화가 20초 미만이면 분석에서 빠진다",
+    "lines": [
+      {"speaker": "CHILD", "text": "엄마, 지금 통화 괜찮으세요?"},
+      {"speaker": "PARENT", "text": "응, 나 지금 버스 안이야. 이따 집에 가서 전화할게."},
+      {"speaker": "CHILD", "text": "네, 조심히 들어가세요."}
+    ],
+    "expected": {
+      "state": "EXCLUDED",
+      "facts": {},
+      "safetyNotice": false
+    }
+  },
+  {
+    "id": "short-call-emergency",
+    "description": "짧은 통화라도 응급 표현이 있으면 분석에서 빠져도 응급 안내는 남는다",
+    "lines": [
+      {"speaker": "CHILD", "text": "아빠, 무슨 일이세요?"},
+      {"speaker": "PARENT", "text": "얘야, 가슴이 너무 아파. 숨 쉬기가 힘들어."},
+      {"speaker": "CHILD", "text": "아빠, 지금 바로 119 부를게요!"}
+    ],
+    "expected": {
+      "state": "EXCLUDED",
+      "facts": {},
+      "safetyNotice": true
+    }
+  }
+]
