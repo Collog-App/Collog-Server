@@ -7,6 +7,7 @@ from app.routes.calls import router as calls_router
 from app.routes.consents import router as consents_router
 from app.routes.devices import router as devices_router
 from app.routes.families import router as families_router
+from app.routes.health import router as health_router
 from app.routes.profiles import router as profiles_router
 from app.routes.questions import router as questions_router
 from app.routes.reports import router as reports_router
@@ -23,4 +24,5 @@ router.include_router(calls_router)
 router.include_router(call_audio_router)
 router.include_router(analysis_router)
 router.include_router(reports_router)
+router.include_router(health_router)
 router.include_router(webhooks_router)

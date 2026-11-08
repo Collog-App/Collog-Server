@@ -26,6 +26,7 @@ from app.services.acoustics import AcousticAnalysisInput, AcousticAnalyzer
 from app.services.deepgram import SttGateway, SttResult
 from app.services.domain import participants_consented
 from app.services.gemini import ExtractionGateway
+from app.services.guardrail import safety_notice
 from app.services.repeat_detector import detect_repeat_events
 from app.services.signals import SignalService
 from app.services.storage import StorageGateway
@@ -325,6 +326,8 @@ class ProcessingPipeline:
         repeat_events = detect_repeat_events(segments)
         parent_speech_sec = round(parent_stt.speech_seconds)
         provider = parent_stt.provider
+        # 응급 표현은 분석 제외(부모 발화가 짧은 통화)나 추출 성공 여부와 상관없이 먼저 찾는다.
+        notice = safety_notice(segments)
         excluded = parent_speech_sec < self.settings.parent_min_speech_seconds
 
         if not await self.processing_allowed(call_id):
@@ -368,6 +371,15 @@ class ProcessingPipeline:
             async with self.database.sessions() as session:
                 call = await session.get(CallRecord, call_id)
                 if call:
+                    if notice:
+                        # 분석하지 않는 통화도 응급 안내는 통화 조회·리포트에 남긴다.
+                        extraction = await session.scalar(
+                            select(HealthExtraction).where(HealthExtraction.call_id == call_id)
+                        )
+                        if extraction is None:
+                            extraction = HealthExtraction(call_id=call_id, parse_status="EXCLUDED")
+                            session.add(extraction)
+                        extraction.safety_notice = notice
                     call.state = CallState.ANALYSIS_EXCLUDED.value
                     call.processing_claimed_at = None
                     await session.commit()
@@ -424,6 +436,7 @@ class ProcessingPipeline:
             extraction.activity = extraction_values["activity"]
             extraction.sleep = extraction_values["sleep"]
             extraction.raw_transcript = raw_transcript
+            extraction.safety_notice = notice
             evidence = await session.scalar(
                 select(ExtractionEvidence).where(ExtractionEvidence.call_id == call_id)
             )

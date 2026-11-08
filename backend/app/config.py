@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-3.6-flash"
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_max_output_tokens: int = 2048
+    # 규칙 검사를 통과한 fact를 Gemini에 한 번 더 보내 덧붙인 진단·병명·지시가 없는지 본다.
+    # mock 외부 서비스 모드에서는 Gemini를 부르지 않으므로 꺼진다.
+    guardrail_llm_review: bool = True
 
     question_tts_provider: Literal["ios_local", "elevenlabs", "elevenlabs_direct"] = "ios_local"
     elevenlabs_api_key: str = ""

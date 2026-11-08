@@ -5,7 +5,14 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from app.models import BaselineKind, CallState, Metric, TimeSlot, User, UserRole
 
@@ -188,6 +195,45 @@ class ConsentSubmit(ApiModel):
     agreed_items: list[str]
 
 
+HealthPlatform = Literal["HEALTH_CONNECT", "HEALTHKIT"]
+
+
+class HealthLinkRequest(ApiModel):
+    version: str
+    platform: HealthPlatform
+
+
+class HealthDayInput(ApiModel):
+    """하루 요약. 그날 기록이 없는 값은 null."""
+
+    day: date = Field(alias="date")
+    sleep_minutes: int | None = Field(default=None, ge=0, le=1440)
+    steps: int | None = Field(default=None, ge=0, le=100_000)
+    resting_heart_rate: int | None = Field(default=None, ge=25, le=220)
+    blood_pressure_systolic: int | None = Field(default=None, ge=50, le=260)
+    blood_pressure_diastolic: int | None = Field(default=None, ge=30, le=200)
+    blood_glucose_mg_dl: float | None = Field(default=None, ge=20, le=600)
+
+    @model_validator(mode="after")
+    def diastolic_below_systolic(self) -> HealthDayInput:
+        systolic, diastolic = self.blood_pressure_systolic, self.blood_pressure_diastolic
+        if systolic is not None and diastolic is not None and diastolic >= systolic:
+            raise ValueError("이완기 혈압은 수축기 혈압보다 낮아야 해요")
+        return self
+
+
+class HealthDailyUpload(ApiModel):
+    platform: HealthPlatform
+    days: list[HealthDayInput] = Field(min_length=1, max_length=35)
+
+    @field_validator("days")
+    @classmethod
+    def unique_days(cls, value: list[HealthDayInput]) -> list[HealthDayInput]:
+        if len({item.day for item in value}) != len(value):
+            raise ValueError("같은 날짜를 두 번 보낼 수 없어요")
+        return value
+
+
 Condition = Literal[
     # Figma final design (2026-10-30)
     "FORGETFULNESS",
@@ -359,8 +405,10 @@ class GeminiExtractionResponse(ApiModel):
 
 class ExtractionView(ExtractionPayload):
     call_id: str
-    parse_status: Literal["OK", "FAILED"]
+    # EXCLUDED: 분석에서 빠진 통화에 응급 안내만 남긴 행
+    parse_status: Literal["OK", "FAILED", "EXCLUDED"]
     raw_transcript: str | None = None
+    safety_notice: str | None = None
 
 
 class AcousticFeatureView(ApiModel):
@@ -426,3 +474,5 @@ class ReportView(ApiModel):
     acoustic_trends: list[dict[str, Any]]
     analyzed_call_count: int
     issued_at: datetime
+    # [{callId, observedAt, text}] 응급 표현이 있었던 통화. 없으면 빈 배열.
+    safety_notices: list[dict[str, Any]] = Field(default_factory=list)
