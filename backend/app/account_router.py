@@ -27,7 +27,9 @@ from app.models import (
     Family,
     FamilyMember,
     FamilyShare,
+    HealthDailySummary,
     HealthExtraction,
+    HealthLinkConsent,
     Invitation,
     OtpChallenge,
     ParentProfile,
@@ -304,7 +306,10 @@ async def delete_account(
         await session.execute(delete(FamilyShare).where(
             or_(FamilyShare.owner_id == user.id, FamilyShare.viewer_id == user.id)
         ))
-        for model in (ConsentRecord, QuestionTtsGrant, Device, RefreshSession):
+        for model in (
+            ConsentRecord, QuestionTtsGrant, Device, RefreshSession,
+            HealthDailySummary, HealthLinkConsent,
+        ):
             await session.execute(delete(model).where(model.user_id == user.id))
         if user.phone:
             await session.execute(delete(OtpChallenge).where(OtpChallenge.phone == user.phone))

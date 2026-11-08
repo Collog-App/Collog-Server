@@ -45,6 +45,11 @@ class ConsentDecision(StrEnum):
     DENIED = "DENIED"
 
 
+class HealthLinkDecision(StrEnum):
+    GRANTED = "GRANTED"
+    REVOKED = "REVOKED"
+
+
 class CallState(StrEnum):
     CREATED = "CREATED"
     RINGING = "RINGING"
@@ -241,6 +246,38 @@ class ConsentRecord(Base):
     agreed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class HealthLinkConsent(Base):
+    """건강 앱 연결 선택 동의 이력. 필수 동의(ConsentRecord)와 따로 남긴다."""
+
+    __tablename__ = "health_link_consents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    document_version: Mapped[str] = mapped_column(String(40))
+    decision: Mapped[str] = mapped_column(String(16))
+    platform: Mapped[str] = mapped_column(String(16))
+    agreed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class HealthDailySummary(Base):
+    """휴대폰 건강 앱에서 올린 하루 요약. 분 단위 원본은 받지 않는다. 날짜는 Asia/Seoul 기준."""
+
+    __tablename__ = "health_daily_summaries"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    day: Mapped[date] = mapped_column(Date, primary_key=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    sleep_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    steps: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resting_heart_rate: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blood_pressure_systolic: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blood_pressure_diastolic: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    blood_glucose_mg_dl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ParentProfile(Base):
     __tablename__ = "parent_profiles"
 
@@ -365,6 +402,8 @@ class HealthExtraction(Base):
     activity: Mapped[str | None] = mapped_column(Text, nullable=True)
     sleep: Mapped[str | None] = mapped_column(Text, nullable=True)
     raw_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 부모 발화에 응급 표현이 있을 때 저장하는 고정 안내 문구(guardrail.SAFETY_NOTICE).
+    safety_notice: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

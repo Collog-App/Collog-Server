@@ -12,6 +12,7 @@ from app.schemas import (
     ExtractionPayload,
     GeminiExtractionResponse,
 )
+from app.services.guardrail import adds_medical_claim, review_facts
 from app.services.http import request_with_retry
 
 
@@ -121,6 +122,9 @@ def validate_facts(
             # Precision-first: generic replies such as "아니, 괜찮아" must not import a
             # symptom noun that only appeared in a CHILD question.
             continue
+        if adds_medical_claim(fact.summary, evidence_text):
+            # 부모가 한 말을 옮긴 병명은 남기고, 모델이 덧붙인 진단·병명·지시는 버린다.
+            continue
         grounded_facts.append(fact)
     return project_facts(grounded_facts)
 
@@ -208,27 +212,15 @@ class GeminiExtractionGateway(ExtractionGateway):
         if not settings.gemini_api_key:
             raise ExtractionError("GEMINI_API_KEY가 필요합니다")
 
-    async def extract(self, transcript: TranscriptInput) -> ExtractionPayload:
-        segments = normalize_transcript_input(transcript)
+    async def generate_json(
+        self, system_instruction: str, text: str, schema: dict[str, Any]
+    ) -> str:
         body = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "text": json.dumps(
-                                {"schemaVersion": "v2", "segments": segments},
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            )
-                        }
-                    ],
-                }
-            ],
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseJsonSchema": GeminiExtractionResponse.model_json_schema(),
+                "responseJsonSchema": schema,
                 "temperature": 0,
                 # Thinking-capable Gemini models count internal reasoning against this limit.
                 "maxOutputTokens": self.settings.gemini_max_output_tokens,
@@ -238,30 +230,45 @@ class GeminiExtractionGateway(ExtractionGateway):
             f"{self.settings.gemini_base_url.rstrip('/')}/v1beta/models/"
             f"{self.settings.gemini_model}:generateContent"
         )
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await request_with_retry(
+                client,
+                "POST",
+                url,
+                headers={"x-goog-api-key": self.settings.gemini_api_key},
+                json=body,
+            )
+            payload = response.json()
+        candidate = payload["candidates"][0]
+        finish_reason = candidate.get("finishReason")
+        if finish_reason not in (None, "STOP"):
+            raise ExtractionError(
+                f"Gemini 응답이 완성되지 않았습니다 (finishReason={finish_reason})"
+            )
+        return candidate["content"]["parts"][0]["text"]
+
+    async def extract(self, transcript: TranscriptInput) -> ExtractionPayload:
+        segments = normalize_transcript_input(transcript)
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                response = await request_with_retry(
-                    client,
-                    "POST",
-                    url,
-                    headers={"x-goog-api-key": self.settings.gemini_api_key},
-                    json=body,
-                )
-                payload = response.json()
-            candidate = payload["candidates"][0]
-            finish_reason = candidate.get("finishReason")
-            if finish_reason not in (None, "STOP"):
-                raise ExtractionError(
-                    f"Gemini 응답이 완성되지 않았습니다 (finishReason={finish_reason})"
-                )
-            text = candidate["content"]["parts"][0]["text"]
+            text = await self.generate_json(
+                SYSTEM_INSTRUCTION,
+                json.dumps(
+                    {"schemaVersion": "v2", "segments": segments},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                GeminiExtractionResponse.model_json_schema(),
+            )
             parsed = GeminiExtractionResponse.model_validate(json.loads(text))
-            return validate_facts(parsed, segments)
+            extracted = validate_facts(parsed, segments)
         except ExtractionError:
             raise
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
             safe_message = re.sub(r"([?&]key=)[^&\s]+", r"\1[REDACTED]", str(exc))
             raise ExtractionError(f"Gemini 구조화 추출 실패: {safe_message}") from exc
+        if not self.settings.guardrail_llm_review or self.settings.mock_external_services:
+            return extracted
+        return project_facts(await review_facts(extracted.facts, segments, self.generate_json))
 
 
 def create_extraction_gateway(settings: Settings) -> ExtractionGateway:

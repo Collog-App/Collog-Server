@@ -26,6 +26,7 @@ from app.services.acoustics import AcousticAnalysisInput, AcousticAnalyzer
 from app.services.deepgram import SttGateway, SttResult
 from app.services.domain import participants_consented
 from app.services.gemini import ExtractionGateway
+from app.services.guardrail import safety_notice
 from app.services.repeat_detector import detect_repeat_events
 from app.services.signals import SignalService
 from app.services.storage import StorageGateway
@@ -391,6 +392,8 @@ class ProcessingPipeline:
             extraction_facts = []
             parse_status = "FAILED"
             raw_transcript = transcript_text
+        # 추출 성공 여부와 상관없이 부모 발화에서 직접 찾는다.
+        notice = safety_notice(segments)
 
         acoustic_asset = raw_asset or parent_source
         acoustic_audio = await self.storage.read(acoustic_asset.uri)
@@ -424,6 +427,7 @@ class ProcessingPipeline:
             extraction.activity = extraction_values["activity"]
             extraction.sleep = extraction_values["sleep"]
             extraction.raw_transcript = raw_transcript
+            extraction.safety_notice = notice
             evidence = await session.scalar(
                 select(ExtractionEvidence).where(ExtractionEvidence.call_id == call_id)
             )

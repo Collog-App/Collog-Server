@@ -133,7 +133,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(
             status_code=exc.status_code,
             content={
-                "code": code_by_status.get(exc.status_code, "REQUEST_FAILED"),
+                "code": getattr(exc, "error_code", None)
+                or code_by_status.get(exc.status_code, "REQUEST_FAILED"),
                 "message": message,
             },
             headers=exc.headers,

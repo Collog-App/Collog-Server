@@ -88,7 +88,8 @@ class ReportService:
                 or latest_call_at <= aware_datetime(existing.issued_at)
             )
         ):
-            return {**existing.snapshot, "issuedAt": existing.issued_at}
+            # safetyNotices가 생기기 전에 만든 스냅샷도 같은 모양으로 준다.
+            return {"safetyNotices": [], **existing.snapshot, "issuedAt": existing.issued_at}
         extractions = []
         features = []
         signals = []
@@ -156,6 +157,20 @@ class ReportService:
             trends.setdefault(feature.metric, []).append(
                 {"date": feature.observed_at.date().isoformat(), "value": feature.value}
             )
+        ended_at_by_call = {call.id: call.ended_at for call in calls}
+        safety_notices = [
+            {
+                "callId": row.call_id,
+                "observedAt": aware_datetime(ended_at_by_call[row.call_id]).isoformat(),
+                "text": row.safety_notice,
+            }
+            for row in sorted(
+                extractions,
+                key=lambda row: aware_datetime(ended_at_by_call[row.call_id]),
+                reverse=True,
+            )
+            if row.safety_notice
+        ]
         promoted = [signal_to_dict(item) for item in signals if item.promoted]
         acute = [signal_to_dict(item) for item in signals if item.acute]
         issued_at = datetime.now(UTC)
@@ -181,6 +196,7 @@ class ReportService:
                 {"metric": metric, "points": points} for metric, points in trends.items()
             ],
             "analyzedCallCount": len(analyzed_ids),
+            "safetyNotices": safety_notices,
         }
         session.add(
             Report(
