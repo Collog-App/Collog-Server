@@ -42,7 +42,9 @@ SYSTEM_INSTRUCTION = """
 TranscriptInput = str | list[dict[str, Any]]
 
 CATEGORY_GROUNDING_PATTERNS = {
-    "symptom": re.compile(r"기침|아프|통증|어지|열|숨|목|불편|붓|가래|두통"),
+    # 「아프」만으로는 흔한 활용형 「아파·아팠·아픈·아퍼」를 놓친다
+    # (시나리오 chest-pain-emergency).
+    "symptom": re.compile(r"기침|아프|아파|아팠|아픈|아퍼|통증|어지|열|숨|목|불편|붓|가래|두통"),
     "medication": re.compile(r"약|복용|먹었|먹어|챙겨"),
     "activity": re.compile(r"산책|운동|걸었|걸어|외출|움직|공원"),
     "sleep": re.compile(r"잠|수면|깨|졸|잤|자다"),

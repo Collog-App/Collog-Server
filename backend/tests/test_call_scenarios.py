@@ -149,11 +149,7 @@ async def test_scenario_audio_calls_elevenlabs_once_per_line(tmp_path: Path) -> 
 
 
 # 기대값은 고치지 않고 지금 코드와 어긋난 곳을 여기 적어 둔다. 코드를 고치면 이 항목을 지운다.
-KNOWN_FAKE_MODE_GAPS = {
-    # 증상 근거 규칙(gemini.CATEGORY_GROUNDING_PATTERNS["symptom"])이 「아프」만 보고 「아파」를
-    # 모른다. 「가슴이 너무 아파」가 근거인 증상 사실이 버려져 응급 안내만 남고 증상 요약이 없다.
-    "chest-pain-emergency": ["사실", "요약"],
-}
+KNOWN_FAKE_MODE_GAPS: dict[str, list[str]] = {}
 
 
 async def test_fake_mode_runs_every_scenario_without_network(monkeypatch) -> None:
