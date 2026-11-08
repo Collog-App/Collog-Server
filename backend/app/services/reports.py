@@ -77,11 +77,37 @@ class ReportService:
             (aware_datetime(call.ended_at) for call in calls if call.ended_at), default=None
         )
         analyzed_ids = [call.id for call in calls if call.state == "ANALYZED"]
+        # 응급 안내는 분석에서 빠진 짧은 통화에도 남는다(pipeline).
+        notice_rows: list[HealthExtraction] = []
+        if calls:
+            notice_rows = list(
+                await session.scalars(
+                    select(HealthExtraction).where(
+                        HealthExtraction.call_id.in_([call.id for call in calls]),
+                        HealthExtraction.safety_notice.is_not(None),
+                    )
+                )
+            )
+        ended_at_by_call = {call.id: call.ended_at for call in calls}
+        safety_notices = [
+            {
+                "callId": row.call_id,
+                "observedAt": aware_datetime(ended_at_by_call[row.call_id]).isoformat(),
+                "text": row.safety_notice,
+            }
+            for row in sorted(
+                notice_rows,
+                # 스냅샷과 비교하므로 같은 시각이어도 순서가 매번 같아야 한다.
+                key=lambda row: (aware_datetime(ended_at_by_call[row.call_id]), row.call_id),
+                reverse=True,
+            )
+        ]
         # 분석은 통화가 끝나고 몇 분 뒤에 끝난다. 그 사이에 만든 스냅샷은 종료 시각만 보면
-        # 최신으로 보이므로, 분석된 통화 수가 달라졌으면(지난 기간도) 다시 만든다.
+        # 최신으로 보이므로, 분석된 통화 수나 응급 안내가 달라졌으면(지난 기간도) 다시 만든다.
         if (
             existing
             and existing.snapshot.get("analyzedCallCount") == len(analyzed_ids)
+            and existing.snapshot.get("safetyNotices", []) == safety_notices
             and (
                 to_date < date.today()
                 or latest_call_at is None
@@ -157,20 +183,6 @@ class ReportService:
             trends.setdefault(feature.metric, []).append(
                 {"date": feature.observed_at.date().isoformat(), "value": feature.value}
             )
-        ended_at_by_call = {call.id: call.ended_at for call in calls}
-        safety_notices = [
-            {
-                "callId": row.call_id,
-                "observedAt": aware_datetime(ended_at_by_call[row.call_id]).isoformat(),
-                "text": row.safety_notice,
-            }
-            for row in sorted(
-                extractions,
-                key=lambda row: aware_datetime(ended_at_by_call[row.call_id]),
-                reverse=True,
-            )
-            if row.safety_notice
-        ]
         promoted = [signal_to_dict(item) for item in signals if item.promoted]
         acute = [signal_to_dict(item) for item in signals if item.acute]
         issued_at = datetime.now(UTC)

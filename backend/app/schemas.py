@@ -405,7 +405,8 @@ class GeminiExtractionResponse(ApiModel):
 
 class ExtractionView(ExtractionPayload):
     call_id: str
-    parse_status: Literal["OK", "FAILED"]
+    # EXCLUDED: 분석에서 빠진 통화에 응급 안내만 남긴 행
+    parse_status: Literal["OK", "FAILED", "EXCLUDED"]
     raw_transcript: str | None = None
     safety_notice: str | None = None
 

@@ -24,38 +24,78 @@ SAFETY_NOTICE = (
 DISEASE_NAMES = (
     "치매", "알츠하이머", "인지장애", "파킨슨", "뇌졸중", "중풍", "우울증", "조현병", "섬망",
     "당뇨", "고혈압", "저혈압", "폐렴", "천식", "만성폐쇄성", "비염", "부정맥", "심근경색",
-    "협심증", "심부전", "암",
+    "협심증", "심부전", "관절염", "고지혈증", "골다공증", "디스크",
+)
+# 「암」은 「암만」 같은 말과 헷갈리지 않게 낱말로 쓰였을 때만 병명으로 본다. 앞이 한글이면 낱말이
+# 아니지만, 폐암·위암처럼 장기 이름이 붙은 병명은 그대로 잡는다.
+CANCER = (
+    r"(?<![가-힣])(?:폐|위|간|대장|췌장|갑상선|유방|자궁|전립선|피부|혈액|식도|방광)?암"
+    r"(?=[이은을도에의과와인일입으]|[^가-힣]|$)"
 )
 MEDICAL_CLAIM_PATTERNS = (
     # 진단·평가 표현
     re.compile(
-        r"진단|의심|가능성이\s*(?:높|있)|위험(?:군|도|이\s*있|하다)|소견|증후군"
-        r"|증상(?:입니다|이다)|질환"
+        r"진단|의심|가능성(?:이|도)?\s*(?:높|있)|위험군|위험(?:이|도)?\s*(?:있|높|하|해)|소견"
+        r"|증후군|증상(?:입니다|이다)|질환"
     ),
-    re.compile("|".join(DISEASE_NAMES)),
-    # 약·치료 지시
-    re.compile(
-        r"복용\s*(?:하세요|해야|하십시오)|약[을은].{0,6}(?:끊|줄이|늘리|바꾸)|처방|치료\s*(?:하|받)"
-    ),
+    re.compile("|".join((*DISEASE_NAMES, CANCER))),
+    re.compile(r"치료\s*(?:하|받)"),
 )
+# 약·치료 지시. 부모가 비슷한 말을 했더라도 요약이 지시하면 버린다.
+MEDICATION_DIRECTIVE_PATTERN = re.compile(
+    r"(?:복용|줄이|줄여|끊|늘리|늘려|바꾸|바꿔)(?:하|해|으|어)?(?:세요|십시오|야(?!겠|지))"
+    r"|(?:복용하|줄이|끊|늘리|바꾸)는\s*(?:게|것이)\s*좋"
+)
+# 약 바뀜·처방 서술. 근거 발화에 「약」과 같은 어간이 있으면 부모가 한 말을 옮긴 것으로 본다.
+_MEDICINE = r"약(?:[을은도이]|\s)[^.!?\n]{0,6}?"
+MEDICATION_CHANGE_RULES = tuple(
+    (re.compile(claim), re.compile(stem))
+    for claim, stem in (
+        (_MEDICINE + r"(?:줄이|줄였|줄여|줄인)", r"줄이|줄였|줄여|줄인"),
+        (_MEDICINE + r"(?:늘리|늘렸|늘려|늘린)", r"늘리|늘렸|늘려|늘린"),
+        (_MEDICINE + r"끊", r"끊"),
+        (_MEDICINE + r"(?:바꾸|바꿨|바꿔|바꾼)", r"바꾸|바꿨|바꿔|바꾼"),
+        (_MEDICINE + r"받|처방", r"받|처방"),
+    )
+)
+MEDICINE_IN_SPEECH = re.compile(r"약(?!간|속)|처방")
+
+# 응급 표현. 사이에 조사·부사가 0~6글자 끼어도 잡되, 문장·절은 넘지 않는다.
+_GAP = r"[^.!?,\n]{0,6}?"
+# 바로 앞의 「안」(안 아파)과 바로 뒤의 「~지 않」「~진 않」(아프지 않아)은 부정이라 뺀다.
+_NOT_BEFORE = r"(?<!안)(?<!안\s)"
+_NOT_AFTER = r"(?!하?(?:지|진)(?:는|도)?\s*않)"
+
+
+def _phrase(subject: str, predicate: str) -> str:
+    return f"{subject}{_GAP}{_NOT_BEFORE}(?:{predicate}){_NOT_AFTER}"
+
+
 # 한국어 활용형(아프/아파/아팠, 막히/막혀 …)을 함께 본다. 응급 안내는 놓치지 않는 쪽이 우선이다.
-EMERGENCY_PATTERN = re.compile(
-    r"가슴이\s*(?:아프|아파|아팠|아픈|답답|조이|조여|조였|쥐어짜)"
-    r"|흉통"
-    r"|숨[이을]\s*(?:안|못)\s*(?:쉬|쉴|쉰)"
-    r"|숨이\s*(?:차|찼|막히|막혀|막혔)"
-    r"|마비"
-    r"|한쪽이\s*(?:안|저리|저려|저렸)"
-    r"|감각이\s*없"
-    r"|말이\s*(?:어눌|안\s*나|꼬이|꼬여|꼬였)"
-    r"|쓰러"
-    r"|의식을\s*잃"
-    r"|기절"
-    r"|피를\s*토"
-    r"|토혈"
-    r"|죽고\s*싶"
-    r"|자살"
-)
+# 「숨이 차」만으로는 띄우지 않는다. 계단·걷기·운동 뒤 숨이 차는 것은 흔하다(2026-11-08 결정).
+# 가만히 있거나 누워 있어도 숨이 찬 경우만 잡는다.
+_BREATH = r"숨(?![겨기어었])"  # 숨겨·숨기·숨어(감추다)는 뺀다
+EMERGENCY_PATTERN = re.compile("|".join((
+    _phrase("가슴", r"아프|아파|아팠|아픈|답답|조이|조여|조였|쥐어짜"),
+    r"흉통",
+    _phrase(_BREATH, r"(?:안|못)\s*(?:쉬|쉴|쉰)|막히|막혀|막혔"),
+    _phrase(r"숨\s*쉬", r"힘들|힘드|힘든|어렵|어려|곤란"),
+    r"(?:가만히|누워|쉬어도|앉아\s*있어도)[^.!?,\n]{0,8}?" + _phrase(_BREATH, r"차|찼"),
+    r"마비",
+    _phrase("한쪽", r"저리|저려|저렸|안\s*움직"),
+    # 「한쪽이 안 움직여」는 잡고 「한쪽이 안 아파」는 뺀다.
+    r"한쪽이\s*안(?!\s*(?:저리|저려|저렸|아프|아파|아팠))",
+    r"감각이\s*없",
+    _phrase(r"(?<![가-힣])말", r"어눌|꼬이|꼬여|꼬였"),
+    r"(?<![가-힣])말이\s*(?:잘\s*|좀\s*)?안\s*나",
+    _NOT_BEFORE + r"쓰러(?:지|졌|질|진|져)" + _NOT_AFTER,  # 쓰러뜨리(물건)는 안 잡힌다
+    _phrase(r"(?:의식|정신)(?!없)", r"잃"),
+    _NOT_BEFORE + r"기절(?!할\s*뻔|하는\s*줄)" + _NOT_AFTER,  # 「기절할 뻔」은 관용 표현
+    _phrase(r"(?<![가-힣])피(?:를|도)?(?=\s|토)", r"토(?:했|하|해|할|함)"),  # 피곤은 뺀다
+    r"토혈",
+    r"죽고\s*싶",
+    r"자살",
+)))
 
 REVIEW_INSTRUCTION = """
 당신은 가족 통화 건강 기록의 검토자다. 각 fact의 summary가 근거 PARENT 발화에 없는 내용을
@@ -93,11 +133,19 @@ def _compact(text: str) -> str:
 
 def adds_medical_claim(summary: str, evidence_text: str) -> bool:
     """요약에 진단·병명·약/치료 지시 표현이 있는데 근거 발화에 그 말이 없으면 True."""
+    if MEDICATION_DIRECTIVE_PATTERN.search(summary):
+        return True
     said = _compact(evidence_text)
-    return any(
+    if any(
         _compact(match.group(0)) not in said
         for pattern in MEDICAL_CLAIM_PATTERNS
         for match in pattern.finditer(summary)
+    ):
+        return True
+    return any(
+        claim.search(summary)
+        and not (MEDICINE_IN_SPEECH.search(evidence_text) and stem.search(evidence_text))
+        for claim, stem in MEDICATION_CHANGE_RULES
     )
 
 

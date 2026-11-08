@@ -20,10 +20,11 @@ from app.services.gemini import GeminiExtractionGateway, validate_facts
 from app.services.guardrail import (
     REVIEW_INSTRUCTION,
     SAFETY_NOTICE,
+    adds_medical_claim,
     review_facts,
     safety_notice,
 )
-from app.services.reports import ReportService, period_bounds
+from app.services.reports import ReportService, aware_datetime, period_bounds
 from tests.conftest import auth
 from tests.test_api_flow import onboard_family, tone_wav
 
@@ -44,9 +45,22 @@ def one_fact(category: str, summary: str) -> GeminiExtractionResponse:
         ("medication", "당뇨약을 먹었음", "당뇨약은 아침에 먹었어"),
         ("symptom", "비염이라 코가 불편하다고 함", "병원에서 비염이래, 코가 불편해"),
         ("medication", "의사가 약을 줄이자고 해서 줄였음", "의사가 약을 줄이자고 해서 줄였어"),
+        # 부모가 직접 말한 복약 변화(서술형)는 어간이 근거에 있으면 남긴다.
+        ("medication", "혈압약을 줄이셨다", "혈압약을 좀 줄였어"),
+        ("medication", "약은 최근 줄이는 중", "약은 요즘 줄이고 있어"),
+        ("medication", "새 처방약을 받아옴", "병원에서 약 새로 받아왔어"),
+        # 부모가 말한 위험 표현은 옮겨도 된다.
+        (
+            "symptom",
+            "의사가 넘어질 위험이 있다고 했다고 함",
+            "의사가 넘어질 위험이 있대, 다리가 아프대",
+        ),
+        # 「암만」(아무리)은 병명이 아니다.
+        ("activity", "암만 걸어도 괜찮다고 함", "아무리 걸어도 괜찮아"),
     ],
 )
 def test_rule_check_keeps_what_the_parent_said(category: str, summary: str, said: str) -> None:
+    assert not adds_medical_claim(summary, said)
     result = validate_facts(one_fact(category, summary), parent_says(said))
     assert [fact.summary for fact in result.facts] == [summary]
 
@@ -60,9 +74,26 @@ def test_rule_check_keeps_what_the_parent_said(category: str, summary: str, said
         ("medication", "혈압약을 꾸준히 복용하세요", "혈압약 먹었어"),
         ("medication", "약을 줄이는 게 좋겠음", "약 먹는 게 귀찮아"),
         ("symptom", "어지러움은 빈혈 증상이다", "아침에 좀 어지러웠어"),
+        # 지시형은 부모가 비슷한 말을 했어도 버린다.
+        ("medication", "혈압약을 줄이세요", "혈압약을 좀 줄였어"),
+        ("medication", "혈압약을 바꿔야 함", "혈압약을 바꿨어"),
+        # 서술형이라도 근거에 같은 어간이 없으면 버린다.
+        ("medication", "혈압약을 줄이셨다", "혈압약 먹었어"),
+        ("medication", "새 처방약을 받아옴", "약 먹었어"),
+        # 위험·가능성 평가
+        ("symptom", "다리가 불편해 넘어질 위험도 높음", "다리가 좀 불편해"),
+        ("sleep", "잠을 못 자 수면장애 가능성 있음", "요즘 잠을 못 자"),
+        # 병명 사전
+        ("symptom", "무릎이 불편해 관절염이 있음", "무릎이 불편해"),
+        ("medication", "고지혈증 약을 먹었음", "콜레스테롤 약 먹었어"),
+        ("symptom", "골다공증 때문에 허리가 불편함", "허리가 불편해"),
+        ("symptom", "허리가 불편해 디스크로 보임", "허리가 불편해"),
+        ("symptom", "목이 아파 암이 걱정됨", "목이 아파"),
+        ("symptom", "기침이 계속되어 폐암이 걱정됨", "기침이 계속 나"),
     ],
 )
 def test_rule_check_drops_added_medical_claims(category: str, summary: str, said: str) -> None:
+    assert adds_medical_claim(summary, said)
     assert validate_facts(one_fact(category, summary), parent_says(said)).facts == []
 
 
@@ -75,11 +106,59 @@ def test_rule_check_drops_added_medical_claims(category: str, summary: str, said
         "숨을 못 쉬겠더라",
         "아침부터 말이 꼬여",
         "한쪽이 저려서 숟가락을 놓쳤어",
+        # 조사가 없거나 사이에 말이 끼는 흔한 말투
+        "가슴 아파",
+        "가슴이 너무 아파",
+        "가슴이 좀 답답해",
+        "숨을 잘 못 쉬겠어",
+        "숨이 안 쉬어져",
+        "숨 막혀",
+        "숨쉬기 힘들어",
+        "말이 좀 어눌해",
+        "한쪽 팔이 저려",
+        "정신을 잃었어",
+        "피 토했어",
+        # 가만히 있어도 숨이 찬 것은 잡는다.
+        "가만히 있어도 숨이 차",
+        "누워 있어도 숨이 차",
+        "쉬어도 숨이 차",
+        "앉아 있어도 숨이 차",
     ],
 )
 def test_safety_notice_finds_emergency_words_in_parent_speech(text: str) -> None:
     segments = [{"speaker": "CHILD", "text": "잘 지내셨어요?"}, {"speaker": "PARENT", "text": text}]
     assert safety_notice(segments) == SAFETY_NOTICE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # 부정
+        "가슴이 아프지 않아",
+        "가슴이 안 아파",
+        "가슴이 답답하진 않아",
+        "쓰러지진 않았어",
+        # 물건이 쓰러진 것, 관용 표현
+        "컵을 쓰러뜨렸어",
+        "기절할 뻔했어",
+        "기절하는 줄 알았어",
+        "피곤해서 토했어",
+        # 움직인 뒤 숨이 차는 것은 흔해서 띄우지 않는다(2026-11-08 결정).
+        "숨이 좀 차",
+        "운동하고 나니 숨이 차더라",
+        "가만히 있으면 숨이 안 차",
+    ],
+)
+def test_safety_notice_skips_negations_and_idioms(text: str) -> None:
+    assert safety_notice([{"speaker": "PARENT", "text": text}]) is None
+
+
+def test_eval_dyspnea_case_is_not_an_emergency() -> None:
+    # evals의 「계단을 오르니 숨이 찼어」는 증상으로 기록하되 응급 안내는 띄우지 않는다.
+    cases = json.loads((Path(__file__).parents[1] / "evals/extraction_cases.json").read_text())
+    [case] = [item for item in cases if item["id"] == "dyspnea"]
+    assert case["segments"][0]["text"] == "계단을 오르니 숨이 찼어"
+    assert safety_notice(case["segments"]) is None
 
 
 def test_safety_notice_ignores_child_speech_and_ordinary_talk() -> None:
@@ -199,7 +278,9 @@ async def test_gateway_runs_llm_review_after_rules(
         assert "violations" in review_body["generationConfig"]["responseJsonSchema"]["properties"]
 
 
-def analyze_call(client: TestClient, parent_text: str) -> tuple[str, str, str]:
+def analyze_call(
+    client: TestClient, parent_text: str, state: str = "ANALYZED"
+) -> tuple[str, str, str]:
     """mock 외부 서비스로 통화 한 건을 끝까지 분석한다(test_complete_call_pipeline 흐름)."""
     child_token, _, parent_token, parent = onboard_family(client)
     created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
@@ -245,9 +326,7 @@ def analyze_call(client: TestClient, parent_text: str) -> tuple[str, str, str]:
             },
         )
         assert webhook.status_code == 204, webhook.text
-    assert client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()["state"] == (
-        "ANALYZED"
-    )
+    assert client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()["state"] == state
     return call_id, child_token, parent["id"]
 
 
@@ -268,6 +347,33 @@ def test_pipeline_saves_safety_notice_and_reports_it(client: TestClient) -> None
     assert notice["callId"] == call_id
     assert notice["text"] == SAFETY_NOTICE
     assert datetime.fromisoformat(notice["observedAt"]).tzinfo is not None
+
+
+def test_short_excluded_call_still_keeps_safety_notice(client: TestClient) -> None:
+    # 부모 발화가 기준(parent_min_speech_seconds)보다 짧아 분석에서 빠지는 통화
+    call_id, child_token, parent_id = analyze_call(
+        client, "PARENT: 가슴이 아파", state="ANALYSIS_EXCLUDED"
+    )
+
+    extraction = client.get(f"/v1/calls/{call_id}/extraction", headers=auth(child_token))
+    assert extraction.status_code == 200, extraction.text
+    body = extraction.json()
+    assert body["safetyNotice"] == SAFETY_NOTICE
+    assert body["parseStatus"] == "EXCLUDED"
+    assert body["facts"] == []
+
+    report = client.get(f"/v1/parents/{parent_id}/reports?period=WEEKLY", headers=auth(child_token))
+    assert report.status_code == 200, report.text
+    assert report.json()["analyzedCallCount"] == 0
+    assert [item["callId"] for item in report.json()["safetyNotices"]] == [call_id]
+
+
+def test_short_excluded_call_without_emergency_has_no_extraction(client: TestClient) -> None:
+    call_id, child_token, _ = analyze_call(
+        client, "PARENT: 응 잘 지내", state="ANALYSIS_EXCLUDED"
+    )
+    extraction = client.get(f"/v1/calls/{call_id}/extraction", headers=auth(child_token))
+    assert extraction.status_code == 404
 
 
 def test_pipeline_leaves_safety_notice_empty_for_ordinary_call(client: TestClient) -> None:
@@ -340,3 +446,39 @@ async def test_report_lists_newest_notice_first_and_fills_old_snapshots(
     assert [item["callId"] for item in report["safetyNotices"]] == [call_ids[2], call_ids[0]]
     assert report["safetyNotices"][0]["observedAt"] == ended[2].isoformat()
     assert old["safetyNotices"] == []
+
+
+async def test_report_reissues_when_an_excluded_call_adds_a_notice(database: Database) -> None:
+    # 짧은 통화는 분석된 통화 수를 바꾸지 않는다. 그래도 그 통화의 응급 안내가 생기면
+    # 앞서 만든 스냅샷을 다시 만든다.
+    async with database.sessions() as session:
+        parent = User(phone="01012345678", name="Parent", role="PARENT")
+        child = User(phone="01087654321", name="Child", role="CHILD")
+        session.add_all([parent, child])
+        await session.flush()
+        call = CallRecord(
+            parent_id=parent.id, child_id=child.id, room_name="short",
+            state=CallState.ANALYSIS_EXCLUDED.value,
+            ended_at=datetime.now(UTC) - timedelta(minutes=5),
+        )
+        session.add(call)
+        await session.commit()
+        parent_id, call_id = parent.id, call.id
+
+    async with database.sessions() as session:
+        first = await ReportService().get_or_issue(session, parent_id, "WEEKLY", None)
+    assert first["safetyNotices"] == []
+
+    async with database.sessions() as session:
+        session.add(HealthExtraction(
+            call_id=call_id, parse_status="EXCLUDED", safety_notice=SAFETY_NOTICE,
+        ))
+        await session.commit()
+
+    async with database.sessions() as session:
+        second = await ReportService().get_or_issue(session, parent_id, "WEEKLY", None)
+        again = await ReportService().get_or_issue(session, parent_id, "WEEKLY", None)
+    assert [item["callId"] for item in second["safetyNotices"]] == [call_id]
+    assert second["analyzedCallCount"] == 0
+    # 바뀐 것이 없으면 새로 만든 스냅샷을 그대로 쓴다.
+    assert aware_datetime(again["issuedAt"]) == second["issuedAt"]
