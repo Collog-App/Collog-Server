@@ -40,6 +40,16 @@ def one_fact(category: str, summary: str) -> GeminiExtractionResponse:
 
 
 @pytest.mark.parametrize(
+    "said", ["가슴이 너무 아파", "머리가 아파", "허리가 아팠어", "배가 아픈 것 같아", "다리가 아퍼"]
+)
+def test_symptom_grounding_accepts_common_forms_of_apeuda(said: str) -> None:
+    # 「아프」만 보던 근거 규칙이 「아파·아팠·아픈·아퍼」로 말한 증상을 버리던 문제
+    # (시나리오 chest-pain-emergency).
+    result = validate_facts(one_fact("symptom", said), parent_says(said))
+    assert [fact.summary for fact in result.facts] == [said]
+
+
+@pytest.mark.parametrize(
     ("category", "summary", "said"),
     [
         ("medication", "당뇨약을 먹었음", "당뇨약은 아침에 먹었어"),
