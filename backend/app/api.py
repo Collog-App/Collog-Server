@@ -11,6 +11,7 @@ from app.routes.health import router as health_router
 from app.routes.profiles import router as profiles_router
 from app.routes.questions import router as questions_router
 from app.routes.reports import router as reports_router
+from app.routes.todos import router as todos_router
 from app.routes.webhooks import router as webhooks_router
 
 router = APIRouter()
@@ -25,4 +26,5 @@ router.include_router(call_audio_router)
 router.include_router(analysis_router)
 router.include_router(reports_router)
 router.include_router(health_router)
+router.include_router(todos_router)
 router.include_router(webhooks_router)

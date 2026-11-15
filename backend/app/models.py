@@ -280,6 +280,26 @@ class HealthDailySummary(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class TodoItem(Base):
+    """개인 할 일. 가족에게 보이지 않는다.
+
+    USER = 본인이 쓴 할 일(완료하거나 지울 때까지 남는다). SUGGESTED = 그날(Asia/Seoul) 처음 열 때
+    질환·걸음 수로 골라 둔 추천 활동. 추천을 지우면 그날 다시 만들지 않도록 dismissed 로 남긴다.
+    """
+
+    __tablename__ = "todo_items"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(100))
+    source: Mapped[str] = mapped_column(String(16))
+    suggestion_key: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    day: Mapped[date | None] = mapped_column(Date, nullable=True)
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dismissed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ParentProfile(Base):
     __tablename__ = "parent_profiles"
 
