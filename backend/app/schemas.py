@@ -476,3 +476,19 @@ class ReportView(ApiModel):
     issued_at: datetime
     # [{callId, observedAt, text}] 응급 표현이 있었던 통화. 없으면 빈 배열.
     safety_notices: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TodoCreate(ApiModel):
+    title: str = Field(min_length=1, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def stripped_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("할 일을 적어주세요")
+        return value
+
+
+class TodoUpdate(ApiModel):
+    done: bool

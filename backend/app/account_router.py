@@ -37,6 +37,7 @@ from app.models import (
     RefreshSession,
     RepeatEvent,
     Report,
+    TodoItem,
     Transcript,
     User,
     UserRole,
@@ -308,7 +309,7 @@ async def delete_account(
         ))
         for model in (
             ConsentRecord, QuestionTtsGrant, Device, RefreshSession,
-            HealthDailySummary, HealthLinkConsent,
+            HealthDailySummary, HealthLinkConsent, TodoItem,
         ):
             await session.execute(delete(model).where(model.user_id == user.id))
         if user.phone:
