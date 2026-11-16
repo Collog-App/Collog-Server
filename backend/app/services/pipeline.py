@@ -418,6 +418,11 @@ class ProcessingPipeline:
                 ),
                 parent_segments=[item for item in segments if item["speaker"] == "PARENT"],
                 parent_speech_seconds=parent_stt.speech_seconds,
+                child_segments=(
+                    [item for item in segments if item["speaker"] == "CHILD"]
+                    if child_egress
+                    else None
+                ),
             )
         )
 
