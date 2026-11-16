@@ -67,17 +67,21 @@ STT model/version끼리만 기준선을 비교한다.
 
 ### 4-2. 휴지 비율 `PAUSE_RATIO`
 
-전체 통화 침묵을 사용하면 자녀 말을 듣는 시간이 pause로 잘못 계산된다. 따라서 부모
-Deepgram utterance 안의 연속 word timing만 사용한다.
+전체 통화 침묵을 사용하면 자녀 말을 듣는 시간이 pause로 잘못 계산된다. 반대로 utterance
+안의 간격만 세면 Deepgram이 쉬는 지점에서 utterance를 나누기 때문에 값이 0이 된다(v5까지).
+v6부터는 자녀 발화가 끼지 않고 이어진 부모 utterance들을 한 묶음(run)으로 본다.
 
 ```text
-internal_pause = consecutive word gap in [300ms, 2000ms]
-pause_ratio = sum(internal_pause) / sum(utterance first-word → last-word window)
-unit = ratio (0..1)
+run          = 부모 utterance 연속, 사이 gap ≤ 2000ms 이고 그 gap에 자녀 utterance가 겹치지 않음
+pause        = run 안의 연속 word gap in [300ms, 2000ms] (utterance 경계 포함)
+pause_ratio  = sum(pause) / sum(run first-word → last-word window) × 100
+unit         = %
 ```
 
-2초보다 긴 gap과 utterance 사이 gap은 turn-taking으로 보고 제외한다. word timing이 없거나
-유효 utterance가 3개 미만이면 측정하지 않는다.
+2초보다 긴 gap과 자녀가 말한 gap은 turn-taking으로 보고 제외한다. 자녀 트랙이 없으면 이를
+구분할 수 없으므로 `UNMEASURABLE(NO_CHILD_TRACK)`, 단어 2개 이상인 run이 없으면
+`UNMEASURABLE(INSUFFICIENT_WORD_TIMING)`이다. 턴 전환 지연(자녀 발화 끝 → 부모 응답)은 이
+지표에 넣지 않는다.
 
 ### 4-3. 기본주파수 변동 `F0_VARIATION`
 
