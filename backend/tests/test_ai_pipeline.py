@@ -187,12 +187,14 @@ async def test_acoustic_analyzer_computes_all_four_metrics(sample_rate: int) -> 
             source="DEVICE_RAW",
             parent_segments=timing_segments(),
             parent_speech_seconds=25,
+            child_segments=[],
         )
     )
     by_metric = {item.metric: item for item in results}
     assert set(by_metric) == set(Metric)
     assert by_metric[Metric.SPEECH_RATE].value == pytest.approx(480, rel=0.01)
-    assert by_metric[Metric.PAUSE_RATIO].value == pytest.approx(40, abs=0.1)
+    # segment 안 간격 8개와 경계 간격 3개가 모두 500ms: 5500 / 11500
+    assert by_metric[Metric.PAUSE_RATIO].value == pytest.approx(47.83, abs=0.01)
     assert by_metric[Metric.F0_VARIATION].value is not None
     assert by_metric[Metric.F0_VARIATION].value < 0.2
     assert by_metric[Metric.SPEECH_RATE].status == "OK"
@@ -201,6 +203,67 @@ async def test_acoustic_analyzer_computes_all_four_metrics(sample_rate: int) -> 
     # 기침은 검증 전까지 숫자를 만들지 않는다.
     assert by_metric[Metric.COUGH_EVENTS].status == "UNMEASURABLE"
     assert by_metric[Metric.COUGH_EVENTS].value is None
+
+
+def pause_ratio(
+    parent_segments: list[dict], child_segments: list[dict] | None
+) -> AcousticMeasurement:
+    analyzer = CollogAcousticAnalyzer(Settings(mock_external_services=True))
+    return analyzer._pause_ratio(
+        AcousticAnalysisInput(
+            audio=b"",
+            content_type="audio/wav",
+            declared_sample_rate=16_000,
+            source="WEBRTC_EGRESS",
+            parent_segments=parent_segments,
+            parent_speech_seconds=25,
+            child_segments=child_segments,
+        )
+    )
+
+
+def test_pause_ratio_counts_pauses_at_segment_boundaries() -> None:
+    # Deepgram은 쉬는 지점에서 segment를 나눈다. 단어마다 segment가 따로 있어도 휴지는 잡혀야 한다.
+    segments = [
+        {
+            "speaker": "PARENT",
+            "startMs": index * 1_000,
+            "endMs": index * 1_000 + 500,
+            "words": [{"text": "가나", "startMs": index * 1_000, "endMs": index * 1_000 + 500}],
+        }
+        for index in range(4)
+    ]
+    result = pause_ratio(segments, [])
+    assert result.status == "OK"
+    assert result.value == pytest.approx(1_500 / 3_500 * 100)
+
+
+def test_pause_ratio_excludes_gaps_where_the_child_spoke() -> None:
+    # 0번과 1번 segment 사이에 자녀가 말했으면 그 간격은 턴 전환이다.
+    child = [{"speaker": "CHILD", "startMs": 2_600, "endMs": 2_900, "words": []}]
+    result = pause_ratio(timing_segments(), child)
+    # 묶음 [0], [1..3]: 내부 간격 8개 + 경계 간격 2개 = 5000, 창 2500 + 8500 = 11000
+    assert result.value == pytest.approx(5_000 / 11_000 * 100)
+
+
+def test_pause_ratio_splits_runs_on_gaps_longer_than_the_max() -> None:
+    segments = timing_segments()
+    for segment in segments[2:]:
+        for word in segment["words"]:
+            word["startMs"] += 5_000
+            word["endMs"] += 5_000
+    result = pause_ratio(segments, [])
+    # 묶음 [0,1], [2,3]: 각각 내부 4개 + 경계 1개 = 2500, 창 5500
+    assert result.value == pytest.approx(5_000 / 11_000 * 100)
+
+
+def test_pause_ratio_needs_the_child_track() -> None:
+    # 자녀 트랙이 없으면 부모 발화 사이에 자녀가 말했는지 알 수 없다. 턴 전환을 휴지로 셀 수
+    # 있으므로 숫자를 만들지 않는다.
+    result = pause_ratio(timing_segments(), None)
+    assert result.status == "UNMEASURABLE"
+    assert result.unmeasurable_reason == "NO_CHILD_TRACK"
+    assert result.value is None
 
 
 def transient_wav(sample_rate: int = 16_000) -> bytes:

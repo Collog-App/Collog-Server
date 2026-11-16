@@ -32,6 +32,8 @@ class AcousticAnalysisInput:
     source: Literal["DEVICE_RAW", "WEBRTC_EGRESS"]
     parent_segments: list[dict[str, Any]]
     parent_speech_seconds: float
+    # 자녀 트랙 STT 결과. None은 자녀 트랙이 없다는 뜻이고, []는 자녀가 말하지 않았다는 뜻이다.
+    child_segments: list[dict[str, Any]] | None = None
 
 
 @dataclass(slots=True)
@@ -235,24 +237,47 @@ class CollogAcousticAnalyzer(AcousticAnalyzer):
         return measured(Metric.SPEECH_RATE, 60 * syllables / articulation_seconds, "음절/분")
 
     def _pause_ratio(self, item: AcousticAnalysisInput) -> AcousticMeasurement:
+        """부모가 자녀 발화 없이 이어서 말한 구간 안의 휴지 비율.
+
+        Deepgram은 쉬는 지점에서 segment를 나누므로 segment 안의 단어 간격만 세면 휴지가 대부분
+        경계로 빠져 값이 0이 된다. 그래서 자녀 발화가 끼지 않고 `pause_max_gap_ms` 이하로 이어진
+        부모 segment들을 한 묶음으로 보고 묶음 안의 모든 단어 간격을 센다. 자녀가 끼어든 간격은
+        턴 전환이라 세지 않는다. 자녀 트랙이 없으면 이를 구분할 수 없으므로 측정하지 않는다.
+        """
+        if item.child_segments is None:
+            return unmeasurable(Metric.PAUSE_RATIO, "%", "NO_CHILD_TRACK")
+        child_spans = [
+            (int(segment.get("startMs", 0)), int(segment.get("endMs", 0)))
+            for segment in item.child_segments
+        ]
+        runs: list[list[dict[str, Any]]] = []
+        for segment in sorted(item.parent_segments, key=lambda seg: int(seg.get("startMs", 0))):
+            words = sorted(valid_words([segment]), key=lambda word: int(word.get("startMs", 0)))
+            if not words:
+                continue
+            if runs:
+                gap_start = int(runs[-1][-1].get("endMs", 0))
+                gap_end = int(words[0].get("startMs", 0))
+                child_spoke = any(start < gap_end and end > gap_start for start, end in child_spans)
+                if not child_spoke and gap_end - gap_start <= self.settings.pause_max_gap_ms:
+                    runs[-1].extend(words)
+                    continue
+            runs.append(words)
+
         pause_ms = 0
         window_ms = 0
-        usable_utterances = 0
-        for segment in item.parent_segments:
-            words = valid_words([segment])
+        for words in runs:
             if len(words) < 2:
                 continue
-            words.sort(key=lambda word: int(word.get("startMs", 0)))
             current_window = int(words[-1].get("endMs", 0)) - int(words[0].get("startMs", 0))
             if current_window <= 0:
                 continue
-            usable_utterances += 1
             window_ms += current_window
             for previous, current in zip(words, words[1:], strict=False):
                 gap = int(current.get("startMs", 0)) - int(previous.get("endMs", 0))
                 if self.settings.pause_min_gap_ms <= gap <= self.settings.pause_max_gap_ms:
                     pause_ms += gap
-        if usable_utterances < 1 or window_ms <= 0:
+        if window_ms <= 0:
             return unmeasurable(Metric.PAUSE_RATIO, "%", "INSUFFICIENT_WORD_TIMING")
         return measured(Metric.PAUSE_RATIO, pause_ms / window_ms * 100, "%")
 

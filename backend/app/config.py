@@ -112,7 +112,7 @@ class Settings(BaseSettings):
     baseline_window_weeks: int = 4
     robust_z_threshold: float = 1.5
     promoted_consecutive_weeks: int = 4
-    acoustic_analyzer_version: str = "collog-acoustic-v5"
+    acoustic_analyzer_version: str = "collog-acoustic-v6"
     cough_score_threshold: float = 0.65
 
     # transient-heuristic-v1은 라벨 음원에서 재현율이 사실상 0이다. 공개 도메인 기침 녹음
