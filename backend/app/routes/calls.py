@@ -38,8 +38,32 @@ async def create_call(
     if user.id == callee.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "자기 자신에게는 전화할 수 없습니다")
     await ensure_same_family(session, user.id, callee.id)
+    await finish_own_stale_calls(request, session, user.id)
     async with request.app.state.container.calls.reserve_participants([user.id, callee.id]):
         return await create_reserved_call(request, user, callee, session)
+
+
+async def finish_own_stale_calls(request: Request, session: SessionDep, user_id: str) -> None:
+    """거는 사람이 아직 들어 있는 진행 중 통화를 닫는다.
+
+    앱은 통화 중에 새로 걸 수 없으니, 이런 통화는 앱이 강제 종료돼 끝을 알리지 못한 것이다.
+    LiveKit 이 끊김을 알아채기(약 20초)를 기다리지 않고 닫아 다시 걸기가 409 에 막히지 않게 하고,
+    남아 있던 상대도 방이 지워지면서 그 통화에서 풀린다. 울리는 중인 통화는 상대가 아직 방에 없어
+    정리를 알릴 길이 없으므로 그대로 둔다(지금처럼 409).
+    """
+    stale_ids = list(await session.scalars(
+        select(CallRecord.id).where(
+            CallRecord.state == CallState.ACTIVE.value,
+            CallRecord.ended_at.is_(None),
+            or_(CallRecord.parent_id == user_id, CallRecord.child_id == user_id),
+        )
+    ))
+    if not stale_ids:
+        return
+    # finish 는 자기 세션에서 통화를 잠그고 고친다. 읽기만 한 이 트랜잭션을 먼저 끝낸다.
+    await session.commit()
+    for call_id in stale_ids:
+        await request.app.state.container.calls.finish(call_id)
 
 
 def analysis_subject(caller: User, callee: User) -> tuple[User, User]:

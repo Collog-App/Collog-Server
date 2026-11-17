@@ -83,6 +83,37 @@ def test_busy_participants_reject_new_calls_in_both_directions(client: TestClien
     )
 
 
+def test_redial_closes_the_callers_own_stale_active_call(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert created.status_code == 201
+    stale_id = created.json()["callId"]
+    accepted = client.post(f"/v1/calls/{stale_id}/accept", headers=auth(parent_token))
+    assert accepted.status_code == 200
+
+    # 거는 쪽 앱이 강제 종료돼 /end 없이 다시 앱을 열고 같은 사람에게 건다
+    redial = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert redial.status_code == 201, redial.text
+    assert redial.json()["callId"] != stale_id
+
+    async def stale_call() -> CallRecord:
+        async with client.app.state.container.database.sessions() as session:
+            return await session.get(CallRecord, stale_id)
+
+    stale = client.portal.call(stale_call)
+    assert stale.ended_at is not None
+    assert stale.room_closed_at is not None
+
+
+def test_ringing_call_still_blocks_redial(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert created.status_code == 201
+    # 받는 사람이 아직 방에 없어 정리를 알릴 길이 없으니 울리는 중에는 그대로 409
+    redial = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert redial.status_code == 409
+
+
 def test_concurrent_call_creation_allows_only_one_room(client: TestClient) -> None:
     child_token, child, parent_token, parent = onboard_family(client)
 
