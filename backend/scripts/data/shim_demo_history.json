@@ -1,0 +1,174 @@
+[
+  {
+    "weekOffset": -7,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "hypertension-med",
+      "default-sleep"
+    ],
+    "speechRate": 196,
+    "durationMin": 13,
+    "selfReport": {
+      "medication": "혈압약은 매일 챙겨 드시고 있다고 하셨어요",
+      "sleep": "밤에 깨지 않고 주무셨다고 하셨어요",
+      "activity": "오후에 집 근처를 천천히 걸으셨다고 하셨어요",
+      "symptom": "특별히 불편한 곳은 없다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -6,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "hypertension-med",
+      "default-activity"
+    ],
+    "speechRate": 194,
+    "durationMin": 12,
+    "selfReport": {
+      "medication": "약은 하루도 거르지 않으셨다고 하셨어요",
+      "sleep": "잠은 잘 주무셨다고 하셨어요",
+      "activity": "공원까지 걸어서 다녀오셨다고 하셨어요",
+      "symptom": "어지럽지 않으셨다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -5,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "hypertension-med",
+      "default-meal"
+    ],
+    "speechRate": 197,
+    "durationMin": 14,
+    "selfReport": {
+      "medication": "저녁 약을 잊지 않고 드셨다고 하셨어요",
+      "sleep": "밤에 깨는 일 없이 주무셨다고 하셨어요",
+      "activity": "장을 보러 두 번 다녀오셨다고 하셨어요",
+      "symptom": "별다른 증상은 없다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -4,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "hypertension-med",
+      "hypertension-head"
+    ],
+    "speechRate": 198,
+    "durationMin": 13,
+    "selfReport": {
+      "medication": "복약은 평소처럼 하고 계신다고 하셨어요",
+      "sleep": "잠드는 데 오래 걸리지 않으셨다고 하셨어요",
+      "activity": "날씨가 좋아 매일 산책하셨다고 하셨어요",
+      "symptom": "머리가 아픈 일은 없으셨다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -3,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "hypertension-med",
+      "default-sleep"
+    ],
+    "speechRate": 199,
+    "durationMin": 12,
+    "selfReport": {
+      "medication": "약은 계속 챙겨 드시고 있다고 하셨어요",
+      "sleep": "새벽에 한 번 깬 날이 있으셨다고 하셨어요",
+      "activity": "산책은 평소만큼 다녀오셨다고 하셨어요",
+      "symptom": "특별히 불편한 곳은 없다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -2,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-sleep",
+      "default-activity"
+    ],
+    "speechRate": 202,
+    "durationMin": 13,
+    "selfReport": {
+      "medication": "혈압약은 꾸준히 복용 중이라고 하셨어요",
+      "sleep": "잠드는 데 조금 오래 걸린다고 하셨어요",
+      "activity": "주말에 가벼운 산책을 하셨어요",
+      "symptom": "허리가 조금 뻐근하다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": -1,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-sleep",
+      "hypertension-med"
+    ],
+    "speechRate": 203,
+    "durationMin": 14,
+    "selfReport": {
+      "medication": "혈압약은 꾸준히 복용 중이라고 하셨어요",
+      "sleep": "잠드는 데 오래 걸린다고 하셨어요",
+      "activity": "주말에 가벼운 산책을 하셨어요",
+      "symptom": "허리가 조금 불편하다고 하셨어요"
+    },
+    "dayShift": 2
+  },
+  {
+    "weekOffset": -1,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-sleep",
+      "default-activity"
+    ],
+    "speechRate": 205,
+    "durationMin": 14,
+    "selfReport": {
+      "medication": "혈압약은 꾸준히 복용 중이라고 하셨어요",
+      "sleep": "잠드는 데 오래 걸린다고 하셨어요",
+      "activity": "주말에 가벼운 산책을 하셨어요",
+      "symptom": "허리가 조금 불편하다고 하셨어요"
+    }
+  },
+  {
+    "weekOffset": 0,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-sleep",
+      "hypertension-med"
+    ],
+    "speechRate": 206,
+    "durationMin": 10,
+    "selfReport": {
+      "medication": "혈압약은 꾸준히 복용 중이라고 하셨어요",
+      "sleep": "잠드는 데 오래 걸린다고 하셨어요"
+    },
+    "dayShift": 2
+  },
+  {
+    "weekOffset": 0,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-meal",
+      "default-activity"
+    ],
+    "speechRate": 207,
+    "durationMin": 11,
+    "selfReport": {
+      "activity": "주말에 가벼운 산책을 하셨어요"
+    },
+    "dayShift": 1
+  },
+  {
+    "weekOffset": 0,
+    "timeSlot": "AFTERNOON_EVENING",
+    "askedQuestionIds": [
+      "default-sleep",
+      "default-meal",
+      "default-activity"
+    ],
+    "speechRate": 208,
+    "durationMin": 11,
+    "selfReport": {
+      "symptom": "허리가 조금 불편하다고 하셨어요"
+    }
+  }
+]

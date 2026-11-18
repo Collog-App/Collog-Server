@@ -29,6 +29,7 @@ from app.models import (
     ChangeSignal,
     HealthExtraction,
     Metric,
+    Report,
     User,
 )
 
@@ -59,6 +60,8 @@ def call_moment(week_offset: int, now_kst: datetime) -> datetime:
 
 
 async def purge_previous(session, parent_id: str) -> int:
+    # 이전 조회로 만들어진 리포트 스냅샷이 남아 있으면 새 데이터가 반영되지 않는다.
+    await session.execute(delete(Report).where(Report.parent_id == parent_id))
     call_ids = list(
         await session.scalars(
             select(CallRecord.id).where(
@@ -106,15 +109,19 @@ async def seed(args: argparse.Namespace) -> int:
         for entry in sorted(entries, key=lambda item: item["weekOffset"]):
             offset = int(entry["weekOffset"])
             moment = call_moment(offset, now_kst)
+            # 한 주에 통화를 여러 건 넣고 싶을 때 같은 주 안에서 며칠 앞당긴다(선택).
+            moment -= timedelta(days=int(entry.get("dayShift", 0)))
             week_key = (moment.date() - timedelta(days=moment.weekday())).isoformat()
-            if week_key in seen_weeks:
+            if week_key in seen_weeks and not args.allow_same_week:
                 raise SeedError(
-                    f"W{offset}과 W{seen_weeks[week_key]}가 같은 주({week_key})에 떨어집니다"
+                    f"W{offset}과 W{seen_weeks[week_key]}가 같은 주({week_key})에 떨어집니다. "
+                    "한 주에 여러 건을 넣으려면 --allow-same-week를 쓰세요"
                 )
             seen_weeks[week_key] = offset
+            duration_min = int(entry.get("durationMin", args.duration_min))
 
             ended = moment.astimezone(UTC)
-            started = ended - timedelta(minutes=args.duration_min)
+            started = ended - timedelta(minutes=duration_min)
             call = CallRecord(
                 parent_id=parent.id,
                 child_id=child.id,
@@ -125,7 +132,7 @@ async def seed(args: argparse.Namespace) -> int:
                 started_at=started,
                 accepted_at=started,
                 ended_at=ended,
-                duration_sec=args.duration_min * 60,
+                duration_sec=duration_min * 60,
                 time_slot=entry["timeSlot"],
                 parent_speech_sec=args.parent_speech_sec,
                 # 원본 오디오를 만든 적이 없으므로 폐기 시각을 지금으로 남긴다.
@@ -189,6 +196,11 @@ def main() -> None:
     parser.add_argument("--parent-phone", default="01000000010")
     parser.add_argument("--child-phone", default="01000000002")
     parser.add_argument("--duration-min", type=int, default=3)
+    parser.add_argument(
+        "--allow-same-week",
+        action="store_true",
+        help="같은 주에 통화를 여러 건 넣는 것을 허용한다 (항목의 dayShift·durationMin과 함께 사용)",
+    )
     parser.add_argument("--parent-speech-sec", type=int, default=95)
     args = parser.parse_args()
     try:
