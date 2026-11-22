@@ -6,8 +6,9 @@ x-backend-environment: &backend-environment
   ALLOW_RAW_ONLY_ANALYSIS: "false"
   LOG_STT_TRANSCRIPT: "false"
   TEAM_PORTAL_ENABLED: "false"
-  # 운영 지표 화면 /ops 접속 코드의 SHA-256(코드 자체는 저장소에 없음). 비우면 /ops 가 꺼진다.
-  OPS_ACCESS_CODES: ${OPS_ACCESS_CODES:-yongjin:f3c638df203beea42f23398513b5b76d77c6c7dfad01dbad5608f4e543bb1faa,team:1f3b08364eb776b5e6f97b9820ce7392ee8710a3b3d771ae69cb41b0a266c31d}
+  # 운영 지표 화면 /ops 접속 코드의 SHA-256(코드는 32바이트 무작위, 저장소에는 해시만).
+  # 서버 env 에 `OPS_ACCESS_CODES=` 를 빈 값으로 두면 /ops 가 꺼지고, 다른 값이면 그 값이 쓰인다.
+  OPS_ACCESS_CODES: ${OPS_ACCESS_CODES-yongjin:ba6834da74237370de93315f882c1da8d1bbbdd0f4644bf4f9cd6de51785a247,team:a02dc5538c780af23e1bf224d27f3c1f9836bd41e5942188445994e62ce3bf44}
   JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
   PUBLIC_BASE_URL: https://${API_DOMAIN:?Set API_DOMAIN}
   LIVEKIT_URL: wss://${LIVEKIT_DOMAIN:?Set LIVEKIT_DOMAIN}

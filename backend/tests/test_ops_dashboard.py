@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.ops import Dataset, build_summary
-from tests.conftest import auth
+from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 
 CODE = "test-ops-code"
@@ -52,9 +53,11 @@ def test_ops_is_hidden_without_configured_codes(tmp_path: Path) -> None:
         assert client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).status_code == 404
 
 
-def test_malformed_codes_are_rejected_at_startup() -> None:
-    with pytest.raises(ValueError):
-        Settings(ops_access_codes="tester:not-a-hash")
+def test_code_entries_are_normalized_and_bad_ones_skipped() -> None:
+    digest = hashlib.sha256(CODE.encode()).hexdigest()
+    settings = Settings(ops_access_codes=f"bad:not-a-hash, upper:{digest.upper()} ,:{digest}")
+    assert settings.ops_access_code_hashes == [("upper", digest)]
+    assert Settings(ops_access_codes="bad:not-a-hash").ops_access_code_hashes == []
 
 
 def test_ops_page_loads_but_data_needs_the_code(ops_client: TestClient) -> None:
@@ -100,6 +103,25 @@ def test_marking_an_account_internal_removes_its_calls(ops_client: TestClient) -
         "/ops/api/accounts/nobody/internal", headers=headers, json={"internal": True}
     )
     assert missing.status_code == 404
+
+
+def test_deleting_an_account_removes_its_internal_mark(
+    ops_client: TestClient, tmp_path: Path
+) -> None:
+    token, person = create_user(ops_client, "01055556666", "CHILD", "시험")
+    headers = {"X-Ops-Code": CODE}
+    marked = ops_client.put(
+        f"/ops/api/accounts/{person['id']}/internal", headers=headers, json={"internal": True}
+    )
+    assert marked.status_code == 200
+    assert (
+        ops_client.get("/ops/api/summary", headers=headers).json()["scope"]["internalAccounts"] == 1
+    )
+
+    assert ops_client.delete("/v1/account", headers=auth(token)).status_code == 204
+    with sqlite3.connect(tmp_path / "ops.db") as connection:
+        rows = connection.execute("select count(*) from ops_account_flags").fetchone()[0]
+    assert rows == 0
 
 
 # ------------------------------------------------------------ 계산 규칙

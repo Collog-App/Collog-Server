@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -62,7 +62,7 @@ def match_access_code(settings: Settings, code: str | None) -> str | None:
     if not code:
         return None
     digest = hashlib.sha256(code.encode()).hexdigest()
-    for label, expected in settings.ops_access_code_hashes.items():
+    for label, expected in settings.ops_access_code_hashes:
         if hmac.compare_digest(digest, expected):
             return label
     return None
@@ -253,8 +253,12 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
         if decision == HealthLinkDecision.GRANTED.value
     }
 
+    # 사람마다 마지막으로 올린 시각 하나만 읽는다(하루 요약 전체를 읽지 않음)
     for row in await session.execute(
-        select(HealthDailySummary.user_id, HealthDailySummary.updated_at)
+        select(
+            HealthDailySummary.user_id,
+            func.max(HealthDailySummary.updated_at).label("updated_at"),
+        ).group_by(HealthDailySummary.user_id)
     ):
         data.health_days.append(row)
         data.touch(row.user_id, row.updated_at)
