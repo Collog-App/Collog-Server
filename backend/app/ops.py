@@ -119,6 +119,16 @@ def age_band(birth: date | None, today: date) -> str:
     return f"{age // 10 * 10}대"
 
 
+def masked_name(name: str | None) -> str:
+    """닉네임이 없는 계정(iOS)을 팀이 알아볼 만큼만: 첫 글자와 끝 글자만 남긴다."""
+    name = (name or "").strip()
+    if len(name) <= 1:
+        return name or "(이름 없음)"
+    if len(name) == 2:
+        return name[0] + "*"
+    return name[0] + "*" * (len(name) - 2) + name[-1]
+
+
 def login_method(row: Any) -> str:
     if row.apple:
         return "Apple"
@@ -166,6 +176,7 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             User.id,
             User.role,
             User.nickname,
+            User.name,
             User.gender,
             User.birth_date,
             User.marketing_opt_in,
@@ -314,7 +325,9 @@ def build_summary(
     ago7, ago14, ago28, ago30 = (now - timedelta(days=d) for d in (7, 14, 28, 30))
 
     users = {uid: data.users[uid] for uid in keep}
-    signed = {uid for uid, row in users.items() if row.nickname}
+    # iOS 는 닉네임 단계가 없다. 닉네임이 없어 「가입 중 멈춤」으로 보는 것은 안드로이드 가입
+    # 흐름(Google 로그인 → 닉네임·약관)을 시작했다가 끝내지 않은 계정뿐이다.
+    signed = {uid for uid, row in users.items() if row.nickname or not row.google}
     parents = {uid for uid in signed if users[uid].role == UserRole.PARENT.value}
     children = signed - parents
 
@@ -516,7 +529,8 @@ def build_accounts(data: Dataset) -> list[dict[str, Any]]:
     return [
         {
             "id": row.id,
-            "nickname": row.nickname,
+            "label": row.nickname or masked_name(row.name),
+            "hasNickname": bool(row.nickname),
             "role": row.role,
             "platform": data.platform.get(row.id),
             "login": login_method(row),

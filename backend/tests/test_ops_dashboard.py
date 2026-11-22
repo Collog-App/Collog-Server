@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.ops import Dataset, build_summary
+from app.ops import Dataset, build_summary, masked_name
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 
@@ -86,6 +86,7 @@ def test_marking_an_account_internal_removes_its_calls(ops_client: TestClient) -
     accounts = ops_client.get("/ops/api/accounts", headers=headers).json()["accounts"]
     assert {a["id"] for a in accounts} == {child["id"], parent["id"]}
     assert all("phone" not in a and "email" not in a and "name" not in a for a in accounts)
+    assert {a["label"] for a in accounts} == {"김*수", "김*자"}
 
     marked = ops_client.put(
         f"/ops/api/accounts/{child['id']}/internal", headers=headers, json={"internal": True}
@@ -132,6 +133,7 @@ def user(uid: str, role: str, created: datetime, nickname: str | None = "닉") -
         id=uid,
         role=role,
         nickname=nickname,
+        name="이름",
         gender="FEMALE",
         birth_date=date(1960, 5, 1),
         marketing_opt_in=False,
@@ -222,3 +224,20 @@ def test_weekly_trend_has_twelve_monday_weeks() -> None:
     assert all(date.fromisoformat(w["week"]).weekday() == 0 for w in weekly)
     assert weekly[-1]["week"] == "2026-11-16"
     assert sum(w["connectedCalls"] for w in weekly) == 6
+
+
+def test_ios_accounts_without_nickname_count_as_signed_up() -> None:
+    data = dataset()
+    ios = user("ios", "PARENT", NOW - timedelta(days=3), nickname=None)
+    ios.google, ios.apple = False, True
+    data.users["ios"] = ios
+    h = build_summary(data, now=NOW, include_internal=False, since=None)["headline"]
+    assert h["signedUp"] == 5
+    assert h["loginOnly"] == 1  # 안드로이드(Google) 가입 단계에서 멈춘 late 만
+
+
+def test_masked_name_keeps_first_and_last_character() -> None:
+    assert masked_name("곽용진") == "곽*진"
+    assert masked_name("홍길") == "홍*"
+    assert masked_name("Kwag YongJin") == "K**********n"
+    assert masked_name("") == "(이름 없음)"

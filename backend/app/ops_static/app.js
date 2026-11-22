@@ -192,7 +192,7 @@ function renderCore(s) {
         "가입 완료 사용자",
         `${fmt(h.signedUp)}명`,
         `부모 ${fmt(h.signedUpParents)} · 자녀 ${fmt(h.signedUpChildren)} · 최근 7일 +${fmt(h.new7d)} · 30일 +${fmt(h.new30d)}`,
-        `닉네임까지 마친 계정. 로그인만 하고 멈춘 ${fmt(h.loginOnly)}명은 뺌`,
+        `계정을 만든 사람. 안드로이드 가입 단계(닉네임·약관)에서 멈춘 ${fmt(h.loginOnly)}명은 뺌`,
         true,
       ),
       card(
@@ -387,7 +387,7 @@ function renderAccounts() {
   const filter = el("input", {
     class: "filter",
     type: "search",
-    placeholder: "닉네임으로 찾기",
+    placeholder: "이름·닉네임으로 찾기",
     oninput: () => paint(),
   });
   const body = el("tbody");
@@ -395,7 +395,7 @@ function renderAccounts() {
     const q = filter.value.trim();
     body.replaceChildren(
       ...state.accounts
-        .filter((a) => !q || (a.nickname || "").includes(q))
+        .filter((a) => !q || (a.label || "").includes(q))
         .map((a) => {
           const box = el("input", {
             type: "checkbox",
@@ -422,7 +422,7 @@ function renderAccounts() {
           return el(
             "tr",
             { class: a.internal ? "internal" : null },
-            el("td", { class: "left" }, a.nickname || "(가입 전)"),
+            el("td", { class: "left" }, a.label),
             el("td", { class: "left" }, ROLE[a.role] || a.role),
             el("td", { class: "left" }, PLATFORM[a.platform] || "–"),
             el("td", { class: "left" }, a.login),
@@ -442,7 +442,7 @@ function renderAccounts() {
     el(
       "p",
       { class: "muted" },
-      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈).",
+      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 없는 계정(iOS)은 이름의 첫 글자와 끝 글자만 보입니다.",
     ),
     filter,
     el(
@@ -457,7 +457,7 @@ function renderAccounts() {
           el(
             "tr",
             {},
-            ["닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "팀·시험"].map((h, i) =>
+            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "팀·시험"].map((h, i) =>
               el("th", { class: i < 4 ? "left" : null }, h),
             ),
           ),
