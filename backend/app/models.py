@@ -511,3 +511,17 @@ class Report(Base):
     state: Mapped[str] = mapped_column(String(32))
     snapshot: Mapped[dict[str, Any]] = mapped_column(JSON)
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class OpsAccountFlag(Base):
+    """운영 지표에서 뺄 팀·시험 계정 표시.
+
+    계정 삭제 흐름을 건드리지 않도록 users 에 외래 키를 걸지 않는다. 지워진 계정의 줄은
+    지표 계산에서 그냥 매칭되지 않는다.
+    """
+
+    __tablename__ = "ops_account_flags"
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

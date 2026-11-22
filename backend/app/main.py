@@ -14,6 +14,7 @@ from app.account_router import router as account_router
 from app.api import router
 from app.config import Settings, get_settings
 from app.container import AppContainer
+from app.ops import router as ops_router
 from app.team_portal import build_team_status, render_team_portal
 
 
@@ -90,6 +91,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(router, prefix=settings.api_prefix)
     app.include_router(account_router, prefix=settings.api_prefix)
+    app.include_router(ops_router)
 
     @app.get("/team", include_in_schema=False, response_class=HTMLResponse)
     async def team_portal(request: Request) -> HTMLResponse:

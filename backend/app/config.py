@@ -154,6 +154,23 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     team_portal_enabled: bool = True
     team_portal_repository_url: str = "https://github.com/Collog-App/14th-hackathon"
+    # 운영 지표 화면(/ops) 접속 코드. `이름:코드의SHA-256(16진수)`를 쉼표로 잇는다.
+    # 코드 자체는 저장하지 않고 해시만 두며, 비우면 /ops 전체가 404다.
+    ops_access_codes: str = ""
+
+    @field_validator("ops_access_codes")
+    @classmethod
+    def ops_access_codes_are_label_and_sha256(cls, value: str) -> str:
+        for item in filter(None, (part.strip() for part in value.split(","))):
+            label, _, digest = item.partition(":")
+            if not label or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+                raise ValueError("OPS_ACCESS_CODES must be comma-separated label:sha256hex")
+        return value
+
+    @property
+    def ops_access_code_hashes(self) -> dict[str, str]:
+        pairs = (item.strip().partition(":") for item in self.ops_access_codes.split(","))
+        return {label: digest for label, _, digest in pairs if label}
 
     @field_validator("fcm_service_account_path", mode="before")
     @classmethod

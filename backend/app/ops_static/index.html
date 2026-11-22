@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#ffffff">
+  <title>콜록 운영</title>
+  <link rel="stylesheet" href="/ops/app.css">
+  <script src="/ops/app.js" defer></script>
+</head>
+<body>
+  <main id="login" class="login" hidden>
+    <form id="login-form" class="login-card">
+      <p class="eyebrow">콜록 운영</p>
+      <h1>지표를 보려면<br>접속 코드를 넣어 주세요</h1>
+      <label class="field">
+        <span>접속 코드</span>
+        <input id="code" type="password" autocomplete="current-password" required>
+      </label>
+      <p id="login-error" class="error" hidden></p>
+      <button type="submit" class="primary wide">들어가기</button>
+    </form>
+  </main>
+
+  <div id="app" hidden>
+    <header class="top">
+      <div>
+        <p class="eyebrow">콜록 운영</p>
+        <h1>서비스 지표</h1>
+        <p id="as-of" class="muted"></p>
+      </div>
+      <div class="actions">
+        <button id="copy" type="button" class="primary">숫자 복사</button>
+        <button id="refresh" type="button" class="ghost">새로 고침</button>
+        <button id="logout" type="button" class="ghost">나가기</button>
+      </div>
+    </header>
+
+    <section class="scope">
+      <label class="check">
+        <input id="include-internal" type="checkbox">
+        <span>팀·시험 계정도 포함</span>
+      </label>
+      <label class="since">
+        <span>가입일 이후만</span>
+        <input id="since" type="date">
+      </label>
+      <span id="scope-note" class="muted"></span>
+    </section>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" role="tab" data-tab="core" aria-selected="true">핵심</button>
+      <button type="button" role="tab" data-tab="calls">통화</button>
+      <button type="button" role="tab" data-tab="features">기능 사용</button>
+      <button type="button" role="tab" data-tab="people">가입자</button>
+      <button type="button" role="tab" data-tab="weekly">주별</button>
+      <button type="button" role="tab" data-tab="accounts">계정</button>
+    </nav>
+
+    <p id="status" class="status" hidden></p>
+    <section id="panel" class="panel"></section>
+  </div>
+</body>
+</html>
