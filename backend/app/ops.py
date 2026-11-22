@@ -119,14 +119,13 @@ def age_band(birth: date | None, today: date) -> str:
     return f"{age // 10 * 10}대"
 
 
-def masked_name(name: str | None) -> str:
-    """닉네임이 없는 계정(iOS)을 팀이 알아볼 만큼만: 첫 글자와 끝 글자만 남긴다."""
+def account_label(nickname: str | None, name: str | None) -> str:
+    """운영자가 계정을 알아보도록 닉네임과 가입 이름(Apple·Google·전화)을 함께 보인다."""
+    nickname = (nickname or "").strip()
     name = (name or "").strip()
-    if len(name) <= 1:
-        return name or "(이름 없음)"
-    if len(name) == 2:
-        return name[0] + "*"
-    return name[0] + "*" * (len(name) - 2) + name[-1]
+    if nickname and name and nickname != name:
+        return f"{nickname} ({name})"
+    return nickname or name or "(이름 없음)"
 
 
 def login_method(row: Any) -> str:
@@ -529,7 +528,7 @@ def build_accounts(data: Dataset) -> list[dict[str, Any]]:
     return [
         {
             "id": row.id,
-            "label": row.nickname or masked_name(row.name),
+            "label": account_label(row.nickname, row.name),
             "hasNickname": bool(row.nickname),
             "role": row.role,
             "platform": data.platform.get(row.id),
