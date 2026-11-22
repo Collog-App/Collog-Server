@@ -154,6 +154,20 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     team_portal_enabled: bool = True
     team_portal_repository_url: str = "https://github.com/Collog-App/14th-hackathon"
+    # 운영 지표 화면(/ops) 접속 코드. `이름:코드의SHA-256(16진수)`를 쉼표로 잇는다.
+    # 코드 자체는 저장하지 않고 해시만 둔다. 형식이 틀린 항목은 건너뛰고(부팅은 막지 않음),
+    # 남는 항목이 없으면 /ops 전체가 404다.
+    ops_access_codes: str = ""
+
+    @property
+    def ops_access_code_hashes(self) -> list[tuple[str, str]]:
+        entries = []
+        for item in filter(None, (part.strip() for part in self.ops_access_codes.split(","))):
+            label, _, digest = item.partition(":")
+            digest = digest.strip().lower()
+            if label and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest):
+                entries.append((label.strip(), digest))
+        return entries
 
     @field_validator("fcm_service_account_path", mode="before")
     @classmethod
