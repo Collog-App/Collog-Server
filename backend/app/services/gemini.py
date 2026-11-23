@@ -14,7 +14,12 @@ from app.schemas import (
     GeminiExtractionResponse,
     GeminiSummaryResponse,
 )
-from app.services.guardrail import adds_medical_claim, review_facts
+from app.services.guardrail import (
+    adds_medical_claim,
+    review_facts,
+    review_summary,
+    summary_adds_claim,
+)
 from app.services.http import request_with_retry
 
 logger = logging.getLogger(__name__)
@@ -157,9 +162,9 @@ def transcript_text(segments: list[dict[str, Any]]) -> str:
 
 
 def clean_summary(summary: str, segments: list[dict[str, Any]]) -> str | None:
-    """모델이 쓴 요약을 다듬는다. 대화에 없는 진단·병명·지시가 섞였으면 통째로 버린다."""
+    """모델이 쓴 요약을 다듬는다. 지시·추측이거나 말하지 않은 진단·병명이 섞였으면 통째로 버린다."""
     summary = " ".join(summary.split())
-    if not summary or adds_medical_claim(summary, transcript_text(segments)):
+    if not summary or summary_adds_claim(summary, segments):
         return None
     if len(summary) > SUMMARY_MAX_LENGTH:
         summary = summary[: SUMMARY_MAX_LENGTH - 1].rstrip() + "…"
@@ -338,7 +343,10 @@ class GeminiExtractionGateway(ExtractionGateway):
             # 오류 문구에 대화가 섞일 수 있어 종류만 남긴다.
             logger.warning("call summary failed (%s)", type(exc).__name__)
             return None
-        return clean_summary(parsed.summary, segments)
+        summary = clean_summary(parsed.summary, segments)
+        if summary is None or not self.settings.guardrail_llm_review:
+            return summary
+        return await review_summary(summary, segments, self.generate_json)
 
 
 def create_extraction_gateway(settings: Settings) -> ExtractionGateway:

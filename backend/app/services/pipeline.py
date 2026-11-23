@@ -103,9 +103,10 @@ class ProcessingPipeline:
         lock = self._locks.setdefault(call_id, asyncio.Lock())
         async with lock:
             claimed_at = datetime.now(UTC)
+            analyzed = False
             try:
                 async with asyncio.timeout(self.settings.processing_timeout_seconds):
-                    await self._process(call_id, claimed_at)
+                    analyzed = bool(await self._process(call_id, claimed_at))
             except Exception as error:
                 logger.exception("call processing failed", extra={"call_id": call_id})
                 if not await self.processing_allowed(call_id):
@@ -135,8 +136,15 @@ class ProcessingPipeline:
                             await self.purge_call_audio(call_id)
             finally:
                 self._locks.pop(call_id, None)
+        # 알림은 처리 제한 시간과 통화별 잠금 밖에서 보낸다. 실패해도 주기 작업이 다시 시도한다.
+        if analyzed and self.after_analyzed is not None:
+            try:
+                await self.after_analyzed(call_id)
+            except Exception:
+                logger.exception("post-analysis hook failed", extra={"call_id": call_id})
 
-    async def _process(self, call_id: str, claimed_at: datetime) -> None:
+    async def _process(self, call_id: str, claimed_at: datetime) -> bool | None:
+        """분석을 끝까지 마쳐 ANALYZED로 저장했을 때만 True."""
         async with self.database.sessions() as session:
             call = await session.get(CallRecord, call_id)
             if call is None or call.state in {
@@ -301,7 +309,7 @@ class ProcessingPipeline:
             transcriptions.append(
                 self.stt.transcribe(child_audio, child_egress.content_type, "CHILD")
             )
-        stt_outputs = await asyncio.gather(*transcriptions)
+        stt_outputs = await gather_or_cancel(*transcriptions)
         timing = {
             "waitSec": elapsed_seconds(call_ended_at, claimed_at),
             "sttSec": round(time.monotonic() - stt_started, 1),
@@ -387,6 +395,9 @@ class ProcessingPipeline:
             analysis_started = time.monotonic()
             summary = await self.summarize(call_id, segments)
             timing["analysisSec"] = round(time.monotonic() - analysis_started, 1)
+            # 요약을 만드는 사이에 동의를 철회했으면 저장하지 않는다.
+            if not await self.processing_allowed(call_id):
+                return
             async with self.database.sessions() as session:
                 call = await session.get(CallRecord, call_id)
                 if call:
@@ -413,7 +424,7 @@ class ProcessingPipeline:
         acoustic_audio = await self.storage.read(acoustic_asset.uri)
         # 건강 사실 추출·통화 요약·음향 분석은 서로의 결과를 쓰지 않으므로 함께 돌린다.
         analysis_started = time.monotonic()
-        extraction_result, summary, measurements = await asyncio.gather(
+        extraction_result, summary, measurements = await gather_or_cancel(
             self.extract_facts(call_id, segments),
             self.summarize(call_id, segments),
             self.acoustics.analyze(
@@ -507,14 +518,8 @@ class ProcessingPipeline:
                 call.analysis_timing = finished_timing(timing, call_ended_at)
             await session.commit()
 
-        # 원본 음성을 먼저 지우고 알린다. 알림이 늦어져도 음성이 남아 있지 않게 한다.
         await self.purge_call_audio(call_id)
-        if self.after_analyzed is not None:
-            try:
-                await self.after_analyzed(call_id)
-            except Exception:
-                # 알림은 주기 작업이 다시 시도한다. 분석 결과는 이미 저장됐다.
-                logger.exception("post-analysis hook failed", extra={"call_id": call_id})
+        return True
 
     async def extract_facts(
         self, call_id: str, segments: list[dict[str, Any]]
@@ -654,6 +659,22 @@ class ProcessingPipeline:
                 "PROCESSING에 멈춰 있던 통화 %d건을 재처리 대기로 돌렸습니다", released.rowcount
             )
         return released.rowcount
+
+
+async def gather_or_cancel(*awaitables: Awaitable[Any]) -> list[Any]:
+    """`asyncio.gather`와 같되, 하나가 실패하면 나머지를 취소한 뒤 그 예외를 낸다.
+
+    그냥 두면 통화가 실패 처리되고 음성이 지워진 뒤에도 남은 외부 요청이 끝까지 돈다.
+    예외 종류는 그대로 두어 재시도 판정(`transient_processing_error`)이 바뀌지 않는다.
+    """
+    tasks = [asyncio.ensure_future(item) for item in awaitables]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 def elapsed_seconds(start: datetime, end: datetime) -> float:
