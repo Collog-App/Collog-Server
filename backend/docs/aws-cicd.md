@@ -85,7 +85,11 @@ curl --fail https://api.collog.live/v1/health
 
 On failure, the script attempts to restore the previous application image.
 Database migrations are not reversed. Migrations must remain compatible with the previous application.
-Backups stay in `/opt/collog/backups` with restricted permissions and require an operator retention policy.
+Backups stay in `/opt/collog/backups` with restricted permissions.
+After a successful deployment the script frees disk space on the server.
+It removes application images other than the running one and the one it replaced.
+It removes its own backups older than 14 days, always keeping the ten newest.
+Backups under any other file name are left for the operator.
 ECR images are not automatically expired, so a running or rollback image stays available.
 
 At boot, `collog.service` starts the last successful release in `/opt/collog/current`.
