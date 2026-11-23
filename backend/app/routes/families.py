@@ -4,7 +4,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Path, Request, Response, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, Response, status
 from sqlalchemy import delete, or_, select, update
 
 from app.models import Family, FamilyMember, Invitation, User, UserRole
@@ -106,9 +106,10 @@ RELATION_BY_GENDER = {("MOTHER", "MALE"): "FATHER", ("FATHER", "FEMALE"): "MOTHE
 
 
 def invitation_share_text(code: str) -> str:
-    """받는 사람이 앱이 없어도 바로 설치하도록 두 스토어 주소를 함께 보낸다."""
+    """어디에 넣는지 알려 주고, 앱이 없어도 바로 설치하도록 두 스토어 주소를 함께 보낸다."""
     return (
-        f"콜록 가족 초대 코드 {code}를 앱에 입력해주세요.\n"
+        f"콜록 가족 초대 코드: {code}\n"
+        "콜록 앱 설정의 「초대 코드 입력」에 넣어주세요.\n"
         f"아이폰: {APP_STORE_URL}\n"
         f"안드로이드: {PLAY_STORE_URL}"
     )
@@ -208,10 +209,13 @@ async def remove_member(
     member_id: Annotated[str, Path(alias="memberId")],
     user: CurrentUser,
     session: SessionDep,
+    pending_only: Annotated[bool, Query(alias="pendingOnly")] = False,
 ) -> Response:
     """대기 중 초대는 구성원 누구나, 연결된 구성원은 가족을 만든 사람이나 본인(나가기)만 지운다.
 
     만든 사람이 나가면 가장 먼저 들어온 구성원이 새 주인이 되고, 남은 구성원이 없으면 가족을 지운다.
+    `pendingOnly=true`는 「초대 취소」다. 화면을 열어 둔 사이 상대가 수락했으면 연결된 가족을
+    내보내지 않고 409로 알린다.
     """
     family = await session.get(Family, family_id)
     if family is None or not await is_family_member(session, family, user.id):
@@ -232,6 +236,10 @@ async def remove_member(
         await session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     if member.user_id is not None:
+        if pending_only:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, "이미 수락한 초대예요. 가족 목록을 다시 확인해주세요"
+            )
         if user.id not in {family.created_by, member.user_id}:
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "가족을 만든 사람이나 본인만 내보낼 수 있어요"
