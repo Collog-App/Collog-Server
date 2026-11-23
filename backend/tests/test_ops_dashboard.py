@@ -157,6 +157,8 @@ def call(parent: str, child: str, accepted: datetime | None, state: str = "ANALY
         parent_speech_sec=120 if accepted else None,
         recording_enabled=True,
         report_notified_at=None,
+        ended_at=None,
+        analysis_timing=None,
     )
 
 
@@ -242,3 +244,40 @@ def test_account_label_shows_full_name_with_nickname() -> None:
     assert account_label("홍길동", "홍길동") == "홍길동"
     assert account_label("응애", None) == "응애"
     assert account_label(None, " ") == "(이름 없음)"
+
+
+def test_analysis_time_uses_only_analyzed_calls_that_recorded_it() -> None:
+    data = Dataset()
+    start = NOW - timedelta(days=3)
+    data.users = {"p": user("p", "PARENT", start), "c": user("c", "CHILD", start)}
+    data.family_users = [(start, {"p", "c"})]
+    timed = [
+        {"totalSec": 40.0, "waitSec": 20.0, "sttSec": 8.0, "analysisSec": 10.0},
+        {"totalSec": 60.0, "waitSec": 30.0, "sttSec": 12.0, "analysisSec": 14.0},
+        {"totalSec": 90.0, "waitSec": 50.0, "sttSec": 20.0, "analysisSec": 16.0},
+    ]
+    for index, timing in enumerate(timed):
+        item = call("p", "c", NOW - timedelta(hours=index + 1))
+        item.analysis_timing = timing
+        item.ended_at = item.accepted_at + timedelta(minutes=5)
+        item.report_notified_at = item.ended_at + timedelta(seconds=timing["totalSec"] + 5)
+        data.calls.append(item)
+    old = call("p", "c", NOW - timedelta(hours=9))  # 기록이 생기기 전 통화
+    excluded = call("p", "c", NOW - timedelta(hours=10), state="ANALYSIS_EXCLUDED")
+    excluded.analysis_timing = {"totalSec": 999.0}
+    data.calls += [old, excluded]
+
+    time = build_summary(data, now=NOW, include_internal=False, since=None)["calls"]["analysisTime"]
+    assert time == {
+        "count": 3,
+        "totalSec": 60,
+        "waitSec": 30,
+        "sttSec": 12,
+        "analysisSec": 14,
+        "notifyCount": 3,
+        "notifySec": 65,
+    }
+
+    empty = build_summary(Dataset(), now=NOW, include_internal=False, since=None)
+    assert empty["calls"]["analysisTime"]["totalSec"] is None
+    assert empty["calls"]["analysisTime"]["notifySec"] is None

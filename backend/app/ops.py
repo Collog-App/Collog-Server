@@ -234,6 +234,8 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             CallRecord.parent_speech_sec,
             CallRecord.recording_enabled,
             CallRecord.report_notified_at,
+            CallRecord.ended_at,
+            CallRecord.analysis_timing,
         )
     )
     for row in call_rows:
@@ -377,6 +379,18 @@ def build_summary(
 
     durations = [c.duration_sec for c in connected if c.duration_sec]
     speech = [c.parent_speech_sec for c in connected if c.parent_speech_sec]
+    # 분석이 끝난 통화의 단계별 소요 시간(초). 이 기록이 생기기 전 통화는 빠진다.
+    timings = [
+        c.analysis_timing
+        for c in connected
+        if c.state == CallState.ANALYZED.value and c.analysis_timing
+    ]
+    # 사용자가 느끼는 시간: 통화가 끝나고 리포트 알림이 나가기까지.
+    notify_waits = [
+        (aware(c.report_notified_at) - aware(c.ended_at)).total_seconds()
+        for c in connected
+        if c.state == CallState.ANALYZED.value and c.report_notified_at and c.ended_at
+    ]
 
     def funnel(rows: list[Any]) -> dict[str, Any]:
         accepted = [c for c in rows if c.accepted_at is not None]
@@ -470,6 +484,15 @@ def build_summary(
             "parentSpeechSec": {
                 "count": len(speech),
                 "median": round(median(speech)) if speech else None,
+            },
+            "analysisTime": {
+                "count": len(timings),
+                **{
+                    key: round(median(t.get(key, 0) for t in timings)) if timings else None
+                    for key in ("totalSec", "waitSec", "sttSec", "analysisSec")
+                },
+                "notifyCount": len(notify_waits),
+                "notifySec": round(median(notify_waits)) if notify_waits else None,
             },
         },
         "features": {

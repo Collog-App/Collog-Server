@@ -92,6 +92,7 @@ async def get_extraction(
         "schemaVersion": evidence.schema_version if evidence else "v1",
         "rawTranscript": item.raw_transcript,
         "safetyNotice": item.safety_notice,
+        "summary": item.summary,
     }
 
 

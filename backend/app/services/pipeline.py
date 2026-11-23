@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 from sqlalchemy import delete, func, or_, select, update
@@ -92,6 +95,8 @@ class ProcessingPipeline:
         self.extraction = extraction
         self.acoustics = acoustics
         self.signals = signals
+        # 분석이 끝난 통화를 바로 알릴 때 부른다(없으면 주기 작업이 다음 차례에 알린다).
+        self.after_analyzed: Callable[[str], Awaitable[None]] | None = None
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def process(self, call_id: str) -> None:
@@ -143,6 +148,7 @@ class ProcessingPipeline:
                 return
             if not call.recording_enabled or call.ended_at is None:
                 return
+            call_ended_at = aware_datetime(call.ended_at)
             if (
                 call.processing_retry_at
                 and aware_datetime(call.processing_retry_at) > datetime.now(UTC)
@@ -285,18 +291,25 @@ class ProcessingPipeline:
         # 자녀 음성이 없으므로 transcript에는 부모 발화만 남는다.
         parent_source = parent_egress or raw_asset
         parent_audio = await self.storage.read(parent_source.uri)
+        child_audio = await self.storage.read(child_egress.uri) if child_egress else None
         if not await self.processing_allowed(call_id):
             return
-        parent_stt = await self.stt.transcribe(parent_audio, parent_source.content_type, "PARENT")
-        self.log_stt_result(call_id, "PARENT", parent_stt)
-        stt_results = [("PARENT", parent_stt)]
+        # 두 화자 전사는 서로 기다릴 이유가 없어 함께 보낸다.
+        stt_started = time.monotonic()
+        transcriptions = [self.stt.transcribe(parent_audio, parent_source.content_type, "PARENT")]
         if child_egress:
-            child_audio = await self.storage.read(child_egress.uri)
-            if not await self.processing_allowed(call_id):
-                return
-            child_stt = await self.stt.transcribe(child_audio, child_egress.content_type, "CHILD")
-            self.log_stt_result(call_id, "CHILD", child_stt)
-            stt_results.append(("CHILD", child_stt))
+            transcriptions.append(
+                self.stt.transcribe(child_audio, child_egress.content_type, "CHILD")
+            )
+        stt_outputs = await asyncio.gather(*transcriptions)
+        timing = {
+            "waitSec": elapsed_seconds(call_ended_at, claimed_at),
+            "sttSec": round(time.monotonic() - stt_started, 1),
+        }
+        parent_stt = stt_outputs[0]
+        stt_results = list(zip(("PARENT", "CHILD"), stt_outputs, strict=False))
+        for speaker, result in stt_results:
+            self.log_stt_result(call_id, speaker, result)
 
         raw_segments = sorted(
             [
@@ -368,11 +381,17 @@ class ProcessingPipeline:
             await session.commit()
 
         if excluded:
+            if not await self.processing_allowed(call_id):
+                return
+            # 말이 짧아 건강 분석은 하지 않아도, 무슨 이야기를 했는지는 남긴다.
+            analysis_started = time.monotonic()
+            summary = await self.summarize(call_id, segments)
+            timing["analysisSec"] = round(time.monotonic() - analysis_started, 1)
             async with self.database.sessions() as session:
                 call = await session.get(CallRecord, call_id)
                 if call:
-                    if notice:
-                        # 분석하지 않는 통화도 응급 안내는 통화 조회·리포트에 남긴다.
+                    if notice or summary:
+                        # 분석하지 않는 통화도 응급 안내와 요약은 통화 조회·리포트에 남긴다.
                         extraction = await session.scalar(
                             select(HealthExtraction).where(HealthExtraction.call_id == call_id)
                         )
@@ -380,51 +399,45 @@ class ProcessingPipeline:
                             extraction = HealthExtraction(call_id=call_id, parse_status="EXCLUDED")
                             session.add(extraction)
                         extraction.safety_notice = notice
+                        extraction.summary = summary
                     call.state = CallState.ANALYSIS_EXCLUDED.value
                     call.processing_claimed_at = None
+                    call.analysis_timing = finished_timing(timing, call_ended_at)
                     await session.commit()
             await self.purge_call_audio(call_id)
             return
 
-        transcript_text = "\n".join(f"{item['speaker']}: {item['text']}" for item in segments)
         if not await self.processing_allowed(call_id):
             return
-        try:
-            extracted = await self.extraction.extract(segments)
-            extraction_values = extracted.model_dump()
-            extraction_facts = [fact.model_dump(by_alias=True) for fact in extracted.facts]
-            parse_status = "OK"
-            raw_transcript = None
-        except Exception:
-            logger.exception("health extraction failed", extra={"call_id": call_id})
-            extraction_values = {
-                key: None for key in ("symptom", "medication", "activity", "sleep")
-            }
-            extraction_facts = []
-            parse_status = "FAILED"
-            raw_transcript = transcript_text
-
         acoustic_asset = raw_asset or parent_source
         acoustic_audio = await self.storage.read(acoustic_asset.uri)
-        measurements = await self.acoustics.analyze(
-            AcousticAnalysisInput(
-                audio=acoustic_audio,
-                content_type=acoustic_asset.content_type,
-                declared_sample_rate=acoustic_asset.sample_rate,
-                source=(
-                    "DEVICE_RAW"
-                    if acoustic_asset.kind == AssetKind.DEVICE_RAW.value
-                    else "WEBRTC_EGRESS"
-                ),
-                parent_segments=[item for item in segments if item["speaker"] == "PARENT"],
-                parent_speech_seconds=parent_stt.speech_seconds,
-                child_segments=(
-                    [item for item in segments if item["speaker"] == "CHILD"]
-                    if child_egress
-                    else None
-                ),
-            )
+        # 건강 사실 추출·통화 요약·음향 분석은 서로의 결과를 쓰지 않으므로 함께 돌린다.
+        analysis_started = time.monotonic()
+        extraction_result, summary, measurements = await asyncio.gather(
+            self.extract_facts(call_id, segments),
+            self.summarize(call_id, segments),
+            self.acoustics.analyze(
+                AcousticAnalysisInput(
+                    audio=acoustic_audio,
+                    content_type=acoustic_asset.content_type,
+                    declared_sample_rate=acoustic_asset.sample_rate,
+                    source=(
+                        "DEVICE_RAW"
+                        if acoustic_asset.kind == AssetKind.DEVICE_RAW.value
+                        else "WEBRTC_EGRESS"
+                    ),
+                    parent_segments=[item for item in segments if item["speaker"] == "PARENT"],
+                    parent_speech_seconds=parent_stt.speech_seconds,
+                    child_segments=(
+                        [item for item in segments if item["speaker"] == "CHILD"]
+                        if child_egress
+                        else None
+                    ),
+                )
+            ),
         )
+        timing["analysisSec"] = round(time.monotonic() - analysis_started, 1)
+        extraction_values, extraction_facts, parse_status, raw_transcript = extraction_result
 
         if not await self.processing_allowed(call_id):
             return
@@ -442,6 +455,7 @@ class ProcessingPipeline:
             extraction.sleep = extraction_values["sleep"]
             extraction.raw_transcript = raw_transcript
             extraction.safety_notice = notice
+            extraction.summary = summary
             evidence = await session.scalar(
                 select(ExtractionEvidence).where(ExtractionEvidence.call_id == call_id)
             )
@@ -490,9 +504,46 @@ class ProcessingPipeline:
                 await self.signals.process_call(session, call)
                 call.state = CallState.ANALYZED.value
                 call.processing_claimed_at = None
+                call.analysis_timing = finished_timing(timing, call_ended_at)
             await session.commit()
 
+        # 원본 음성을 먼저 지우고 알린다. 알림이 늦어져도 음성이 남아 있지 않게 한다.
         await self.purge_call_audio(call_id)
+        if self.after_analyzed is not None:
+            try:
+                await self.after_analyzed(call_id)
+            except Exception:
+                # 알림은 주기 작업이 다시 시도한다. 분석 결과는 이미 저장됐다.
+                logger.exception("post-analysis hook failed", extra={"call_id": call_id})
+
+    async def extract_facts(
+        self, call_id: str, segments: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], str, str | None]:
+        """(범주별 값, 근거 fact, parse_status, 실패 때 남기는 전사문)."""
+        try:
+            extracted = await self.extraction.extract(segments)
+        except Exception:
+            logger.exception("health extraction failed", extra={"call_id": call_id})
+            return (
+                {key: None for key in ("symptom", "medication", "activity", "sleep")},
+                [],
+                "FAILED",
+                "\n".join(f"{item['speaker']}: {item['text']}" for item in segments),
+            )
+        return (
+            extracted.model_dump(),
+            [fact.model_dump(by_alias=True) for fact in extracted.facts],
+            "OK",
+            None,
+        )
+
+    async def summarize(self, call_id: str, segments: list[dict[str, Any]]) -> str | None:
+        """요약은 덤이다. 어떤 이유로든 실패하면 없이 간다."""
+        try:
+            return await self.extraction.summarize(segments)
+        except Exception:
+            logger.exception("call summary failed", extra={"call_id": call_id})
+            return None
 
     async def purge_call_audio(self, call_id: str) -> None:
         async with self.database.sessions() as session:
@@ -603,6 +654,14 @@ class ProcessingPipeline:
                 "PROCESSING에 멈춰 있던 통화 %d건을 재처리 대기로 돌렸습니다", released.rowcount
             )
         return released.rowcount
+
+
+def elapsed_seconds(start: datetime, end: datetime) -> float:
+    return round(max((end - start).total_seconds(), 0.0), 1)
+
+
+def finished_timing(timing: dict[str, float], call_ended_at: datetime) -> dict[str, float]:
+    return {**timing, "totalSec": elapsed_seconds(call_ended_at, datetime.now(UTC))}
 
 
 def aware_datetime(value: datetime) -> datetime:

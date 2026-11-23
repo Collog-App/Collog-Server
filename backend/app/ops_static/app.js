@@ -287,6 +287,18 @@ function renderCalls(s) {
         `${fmt(c.parentSpeechSec.count)}건`,
         "분석에서 잰 부모 발화 시간",
       ),
+      card(
+        "통화 끝 → 리포트 알림(중앙값)",
+        minutes(c.analysisTime.notifySec),
+        `${fmt(c.analysisTime.notifyCount)}건`,
+        "분석이 끝난 통화에서, 통화가 끝나고 알림이 나가기까지",
+      ),
+      card(
+        "통화 끝 → 분석 완료(중앙값)",
+        minutes(c.analysisTime.totalSec),
+        `녹음 기다림 ${minutes(c.analysisTime.waitSec)} · 음성 인식 ${minutes(c.analysisTime.sttSec)} · 분석 ${minutes(c.analysisTime.analysisSec)} · ${fmt(c.analysisTime.count)}건`,
+        "단계별 시간은 이 기록을 넣은 뒤의 통화만 셈",
+      ),
     ),
   ];
 }

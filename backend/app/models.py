@@ -343,6 +343,9 @@ class CallRecord(Base):
     report_notified_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # 분석이 어디서 오래 걸리는지 보려고 남기는 단계별 초: waitSec(통화 끝 → 분석 시작),
+    # sttSec, analysisSec(추출·요약·음향), totalSec(통화 끝 → 분석 끝).
+    analysis_timing: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     @property
@@ -426,6 +429,8 @@ class HealthExtraction(Base):
     raw_transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
     # 부모 발화에 응급 표현이 있을 때 저장하는 고정 안내 문구(guardrail.SAFETY_NOTICE).
     safety_notice: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 통화에서 오간 이야기 한두 문장. 분석에서 빠진 짧은 통화(parse_status EXCLUDED)에도 남긴다.
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
