@@ -99,6 +99,21 @@ async def unique_invitation_code(session: SessionDep) -> str:
     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "초대 코드를 만들지 못했습니다")
 
 
+APP_STORE_URL = "https://apps.apple.com/kr/app/id6802965880"
+PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=live.collog.app"
+# 초대한 사람이 고른 관계가 수락한 사람의 성별과 어긋나면 바로잡는다(어머니 ↔ 아버지).
+RELATION_BY_GENDER = {("MOTHER", "MALE"): "FATHER", ("FATHER", "FEMALE"): "MOTHER"}
+
+
+def invitation_share_text(code: str) -> str:
+    """받는 사람이 앱이 없어도 바로 설치하도록 두 스토어 주소를 함께 보낸다."""
+    return (
+        f"콜록 가족 초대 코드 {code}를 앱에 입력해주세요.\n"
+        f"아이폰: {APP_STORE_URL}\n"
+        f"안드로이드: {PLAY_STORE_URL}"
+    )
+
+
 def invitation_dict(invitation: Invitation) -> dict:
     status_value = (
         "ACCEPTED"
@@ -108,7 +123,7 @@ def invitation_dict(invitation: Invitation) -> dict:
     return {
         "invitationId": invitation.id,
         "code": invitation.code,
-        "shareText": f"콜록 가족 초대 코드 {invitation.code}를 앱에 입력해주세요.",
+        "shareText": invitation_share_text(invitation.code),
         "expiresAt": aware(invitation.expires_at),
         "status": status_value,
     }
@@ -322,7 +337,10 @@ async def accept_invitation(
     assigned = await session.execute(
         update(FamilyMember)
         .where(FamilyMember.id == member.id, FamilyMember.user_id.is_(None))
-        .values(user_id=user.id)
+        .values(
+            user_id=user.id,
+            relation=RELATION_BY_GENDER.get((member.relation, user.gender), member.relation),
+        )
     )
     if assigned.rowcount != 1:
         raise HTTPException(status.HTTP_409_CONFLICT, "이미 수락한 초대입니다")

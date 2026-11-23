@@ -244,3 +244,39 @@ def test_family_sees_the_nickname_instead_of_the_login_name(client: TestClient) 
     assert [push.caller_name for push in client.app.state.container.android_voip_push.sent] == [
         "첫째별명"
     ]
+
+
+def test_invitation_share_text_carries_both_store_links(client: TestClient) -> None:
+    token, user = create_user(client, "01020000031", "CHILD", "첫째")
+    invitation = invite(client, token, user["familyId"])
+    lines = invitation["shareText"].splitlines()
+    assert lines[0] == f"콜록 가족 초대 코드 {invitation['code']}를 앱에 입력해주세요."
+    assert lines[1].startswith("아이폰: https://apps.apple.com/")
+    assert lines[2] == "안드로이드: https://play.google.com/store/apps/details?id=live.collog.app"
+
+
+def test_accepting_corrects_a_parent_relation_that_contradicts_the_gender(
+    client: TestClient,
+) -> None:
+    def joined_relation(phone: str, gender: str | None, relation: str) -> str:
+        host_token, host = create_user(client, f"0102100{phone}", "CHILD", "초대한사람")
+        guest_token, _ = create_user(client, f"0102200{phone}", "CHILD", "받은사람")
+        if gender:
+            profile = client.patch(
+                "/v1/account/profile",
+                headers=auth(guest_token),
+                json={"nickname": f"별명{phone}", "gender": gender, "birthDate": "1960-03-15"},
+            )
+            assert profile.status_code == 200, profile.text
+        invitation = invite(client, host_token, host["familyId"], relation)
+        assert accept(client, guest_token, invitation["code"]).status_code == 200
+        members = client.get(
+            f"/v1/families/{host['familyId']}/members", headers=auth(host_token)
+        ).json()["members"]
+        return next(m["relation"] for m in members if not m["isCreator"])
+
+    assert joined_relation("0001", "MALE", "MOTHER") == "FATHER"
+    assert joined_relation("0002", "FEMALE", "FATHER") == "MOTHER"
+    assert joined_relation("0003", "FEMALE", "MOTHER") == "MOTHER"
+    assert joined_relation("0004", None, "MOTHER") == "MOTHER"
+    assert joined_relation("0005", "MALE", "SIBLING") == "SIBLING"
