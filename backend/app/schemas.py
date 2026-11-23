@@ -403,12 +403,17 @@ class GeminiExtractionResponse(ApiModel):
     )
 
 
+class GeminiSummaryResponse(ApiModel):
+    summary: str = Field(default="", description="통화 내용 한두 문장, 내용이 없으면 빈 문자열")
+
+
 class ExtractionView(ExtractionPayload):
     call_id: str
     # EXCLUDED: 분석에서 빠진 통화에 응급 안내만 남긴 행
     parse_status: Literal["OK", "FAILED", "EXCLUDED"]
     raw_transcript: str | None = None
     safety_notice: str | None = None
+    summary: str | None = None
 
 
 class AcousticFeatureView(ApiModel):

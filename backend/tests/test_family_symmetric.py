@@ -244,3 +244,81 @@ def test_family_sees_the_nickname_instead_of_the_login_name(client: TestClient) 
     assert [push.caller_name for push in client.app.state.container.android_voip_push.sent] == [
         "첫째별명"
     ]
+
+
+def test_invitation_share_text_carries_both_store_links(client: TestClient) -> None:
+    token, user = create_user(client, "01020000031", "CHILD", "첫째")
+    invitation = invite(client, token, user["familyId"])
+    assert invitation["shareText"].splitlines() == [
+        f"콜록 가족 초대 코드: {invitation['code']}",
+        "콜록 앱 설정의 「초대 코드 입력」에 넣어주세요.",
+        "아이폰: https://apps.apple.com/kr/app/id6802965880",
+        "안드로이드: https://play.google.com/store/apps/details?id=live.collog.app",
+    ]
+
+
+def test_cancelling_an_invitation_does_not_remove_someone_who_just_accepted(
+    client: TestClient,
+) -> None:
+    host_token, host = create_user(client, "01020000041", "CHILD", "초대한사람")
+    guest_token, guest = create_user(client, "01020000042", "CHILD", "받은사람")
+    family_id = host["familyId"]
+    invitation = invite(client, host_token, family_id)
+
+    def member_id() -> str:
+        rows = client.get(f"/v1/families/{family_id}/members", headers=auth(host_token)).json()
+        return next(m["memberId"] for m in rows["members"] if not m["isCreator"])
+
+    def cancel(pending_only: bool):
+        return client.delete(
+            f"/v1/families/{family_id}/members/{member_id()}",
+            headers=auth(host_token),
+            params={"pendingOnly": "true"} if pending_only else None,
+        )
+
+    # 화면을 열어 둔 사이 상대가 수락했다: 「초대 취소」는 연결된 가족을 내보내지 않는다
+    assert accept(client, guest_token, invitation["code"]).status_code == 200
+    blocked = cancel(pending_only=True)
+    assert blocked.status_code == 409
+    assert "이미 수락한 초대" in blocked.text
+    members = client.get(f"/v1/families/{family_id}/members", headers=auth(host_token)).json()
+    assert guest["id"] in {m["userId"] for m in members["members"]}
+
+    # 아직 수락하지 않은 초대는 그대로 취소되고, 표시 없는 요청은 지금처럼 내보낸다
+    invite(client, host_token, family_id, "FATHER")
+    rows = client.get(f"/v1/families/{family_id}/members", headers=auth(host_token)).json()
+    pending = next(m["memberId"] for m in rows["members"] if m["userId"] is None)
+    cancelled = client.delete(
+        f"/v1/families/{family_id}/members/{pending}",
+        headers=auth(host_token),
+        params={"pendingOnly": "true"},
+    )
+    assert cancelled.status_code == 204
+    assert cancel(pending_only=False).status_code == 204
+
+
+def test_accepting_corrects_a_parent_relation_that_contradicts_the_gender(
+    client: TestClient,
+) -> None:
+    def joined_relation(phone: str, gender: str | None, relation: str) -> str:
+        host_token, host = create_user(client, f"0102100{phone}", "CHILD", "초대한사람")
+        guest_token, _ = create_user(client, f"0102200{phone}", "CHILD", "받은사람")
+        if gender:
+            profile = client.patch(
+                "/v1/account/profile",
+                headers=auth(guest_token),
+                json={"nickname": f"별명{phone}", "gender": gender, "birthDate": "1960-03-15"},
+            )
+            assert profile.status_code == 200, profile.text
+        invitation = invite(client, host_token, host["familyId"], relation)
+        assert accept(client, guest_token, invitation["code"]).status_code == 200
+        members = client.get(
+            f"/v1/families/{host['familyId']}/members", headers=auth(host_token)
+        ).json()["members"]
+        return next(m["relation"] for m in members if not m["isCreator"])
+
+    assert joined_relation("0001", "MALE", "MOTHER") == "FATHER"
+    assert joined_relation("0002", "FEMALE", "FATHER") == "MOTHER"
+    assert joined_relation("0003", "FEMALE", "MOTHER") == "MOTHER"
+    assert joined_relation("0004", None, "MOTHER") == "MOTHER"
+    assert joined_relation("0005", "MALE", "SIBLING") == "SIBLING"

@@ -293,6 +293,18 @@ def analyze_call(
 ) -> tuple[str, str, str]:
     """mock 외부 서비스로 통화 한 건을 끝까지 분석한다(test_complete_call_pipeline 흐름)."""
     child_token, _, parent_token, parent = onboard_family(client)
+    call_id = analyze_family_call(client, child_token, parent_token, parent, parent_text, state)
+    return call_id, child_token, parent["id"]
+
+
+def analyze_family_call(
+    client: TestClient,
+    child_token: str,
+    parent_token: str,
+    parent: dict,
+    parent_text: str,
+    state: str = "ANALYZED",
+) -> str:
     created = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
     assert created.status_code == 201, created.text
     call_id = created.json()["callId"]
@@ -337,7 +349,7 @@ def analyze_call(
         )
         assert webhook.status_code == 204, webhook.text
     assert client.get(f"/v1/calls/{call_id}", headers=auth(child_token)).json()["state"] == state
-    return call_id, child_token, parent["id"]
+    return call_id
 
 
 def test_pipeline_saves_safety_notice_and_reports_it(client: TestClient) -> None:
@@ -378,12 +390,17 @@ def test_short_excluded_call_still_keeps_safety_notice(client: TestClient) -> No
     assert [item["callId"] for item in report.json()["safetyNotices"]] == [call_id]
 
 
-def test_short_excluded_call_without_emergency_has_no_extraction(client: TestClient) -> None:
+def test_short_excluded_call_without_emergency_keeps_only_the_summary(client: TestClient) -> None:
     call_id, child_token, _ = analyze_call(
         client, "PARENT: 응 잘 지내", state="ANALYSIS_EXCLUDED"
     )
     extraction = client.get(f"/v1/calls/{call_id}/extraction", headers=auth(child_token))
-    assert extraction.status_code == 404
+    assert extraction.status_code == 200, extraction.text
+    body = extraction.json()
+    assert body["parseStatus"] == "EXCLUDED"
+    assert body["summary"] == "PARENT: 응 잘 지내"  # mock 전사는 화자 접두어를 그대로 둔다
+    assert body["safetyNotice"] is None
+    assert body["facts"] == []
 
 
 def test_pipeline_leaves_safety_notice_empty_for_ordinary_call(client: TestClient) -> None:
