@@ -28,6 +28,33 @@ compose() {
         --env-file "$directory/image.env" -f "$directory/docker-compose.yml" "$@"
 }
 
+# Every deployment leaves an application image and a database dump behind, which fills the disk
+# over time. Keeps the running image and the one it replaced, the ten newest dumps and every dump
+# from the last 14 days. Only touches image tags and dump files this script created.
+prune_old_artifacts() {
+    local keep_backups=10 keep_days=14 rollback_image='' image cutoff path name
+    if [[ -n "$previous" && -s "$previous/image.env" ]]; then
+        rollback_image=$(sed -n 's/^BACKEND_IMAGE=//p' "$previous/image.env")
+    fi
+    docker image ls --format '{{.Repository}}:{{.Tag}}' "$registry/$ECR_REPOSITORY" |
+        while read -r image; do
+            [[ "$image" =~ ^"$registry/$ECR_REPOSITORY":[a-f0-9]{40}$ ]] || continue
+            [[ "$image" != "$image_uri" && "$image" != "$rollback_image" ]] || continue
+            docker image rm "$image" >/dev/null 2>&1 </dev/null && echo "Removed old image ${image##*:}"
+        done
+    cutoff=$(date -u -d "$keep_days days ago" +%Y%m%dT%H%M%SZ)
+    [[ "$cutoff" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || return 1
+    find "$root/backups" -maxdepth 1 -type f -regextype posix-extended \
+        -regex '.*/[0-9]{8}T[0-9]{6}Z-[a-f0-9]{40}\.dump' | sort -r | tail -n +"$((keep_backups + 1))" |
+        while read -r path; do
+            name=${path##*/}
+            [[ "${name%%-*}" < "$cutoff" ]] || continue
+            rm -f -- "$path" && echo "Removed old backup $name"
+        done
+    echo "Disk after cleanup: $(df -h --output=target,avail,pcent \
+        "$(docker info --format '{{.DockerRootDir}}')" | tail -n 1)"
+}
+
 cleanup() {
     local status=$?
     trap - EXIT
@@ -79,3 +106,5 @@ compose "$release" exec -T backend python -c \
 ln -sfn "$release" "$root/current.next"
 mv -Tf "$root/current.next" "$root/current"
 echo "Deployed $revision"
+# The release is live, so a cleanup problem must not fail the deployment or trigger a rollback.
+( prune_old_artifacts ) || echo 'Skipped part of the cleanup of old images and backups'
