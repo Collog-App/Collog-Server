@@ -7,7 +7,7 @@ from fastapi import APIRouter, Request
 from sqlalchemy import select, update
 
 from app.container import AppContainer
-from app.models import Device
+from app.models import Device, PushResult
 from app.schemas import DeviceCreate
 from app.security import CurrentUser, SessionDep
 from app.services.notifications import (
@@ -26,10 +26,10 @@ async def deliver_incoming_call_push(
     device: Device,
     push: IncomingCallPush,
     container: AppContainer,
-) -> bool:
+) -> PushResult:
     voip_token = device.voip_token
     if voip_token is None:
-        return False
+        return PushResult.TOKEN_INVALID
     try:
         environment = await gateway.send_incoming_call(voip_token, push)
         if environment:
@@ -39,7 +39,7 @@ async def deliver_incoming_call_push(
                     .values(apns_environment=environment)
                 )
                 await session.commit()
-        return True
+        return PushResult.SENT
     except UnregisteredVoipToken as exc:
         async with container.database.sessions() as session:
             await session.execute(
@@ -48,9 +48,10 @@ async def deliver_incoming_call_push(
             )
             await session.commit()
         logger.warning("incoming VoIP token rejected for call %s: %s", push.call_id, exc)
+        return PushResult.TOKEN_INVALID
     except PushNotificationError as exc:
         logger.warning("incoming VoIP push failed for call %s: %s", push.call_id, exc)
-    return False
+    return PushResult.FAILED
 
 
 @router.post("/devices", status_code=201, tags=["Auth"])

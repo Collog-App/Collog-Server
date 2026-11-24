@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from app.models import CallRecord, CallState, ParentProfile, QuestionTtsGrant, User
 from app.routes.shared import aware, settings_from
 from app.security import CurrentUser, SessionDep
+from app.services import usage
 from app.services.domain import ensure_subject_access, has_consent, participants_consented
 from app.services.questions import daily_questions
 from app.services.storage import LocalStorage
@@ -115,6 +116,8 @@ async def create_question_tts_token(
         if question_count >= 2 or user_count >= 20:
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "음성 요청 횟수를 초과했습니다")
         session.add(QuestionTtsGrant(user_id=user.id, call_id=call_id, question_id=question_id))
+        # 앱이 이 토큰으로 ElevenLabs 에 바로 요청하므로 서버는 글자 수를 모른다(빈 값으로 남김).
+        call.ai_usage = usage.merge(call.ai_usage, {"ttsCharacters": None})
         await session.commit()
     try:
         token = await gateway.issue_token()

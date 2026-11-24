@@ -497,3 +497,28 @@ class TodoCreate(ApiModel):
 
 class TodoUpdate(ApiModel):
     done: bool
+
+
+class AppEventIn(ApiModel):
+    """앱 이용 기록 하나. 모르는 이름·코드는 오류가 아니라 서버가 버린다."""
+
+    id: UUID
+    name: str = Field(min_length=1, max_length=64)
+    at: datetime = Field(description="일이 일어난 시각(UTC ISO 8601)")
+    platform: Literal["IOS", "ANDROID"]
+    app_version: str = Field(min_length=1, max_length=40, description="「버전 (빌드)」")
+    code: str | None = Field(default=None, max_length=64)
+    subject_id: str | None = Field(default=None, max_length=64)
+    call_id: str | None = Field(default=None, max_length=64)
+
+
+class AppEventBatch(ApiModel):
+    events: list[AppEventIn] = Field(max_length=50)
+
+
+class AnonymousEventBatch(ApiModel):
+    events: list[AppEventIn] = Field(max_length=20)
+
+
+class EventsAccepted(ApiModel):
+    accepted: int

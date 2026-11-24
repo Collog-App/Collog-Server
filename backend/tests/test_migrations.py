@@ -147,9 +147,98 @@ def test_pause_ratio_saved_before_v6_leaves_the_baseline(tmp_path: Path) -> None
     }
 
 
+def test_app_events_migration_keeps_ops_flags_and_refuses_downgrade(tmp_path: Path) -> None:
+    database = tmp_path / "events.db"
+    assert migrate(database, "upgrade", "0020_call_summary_and_timing").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text("INSERT INTO ops_account_flags VALUES ('tester', 1, :now)"),
+            dict(now=datetime.now(UTC)),
+        )
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        flag = connection.execute(
+            sa.text("SELECT internal, cohort FROM ops_account_flags WHERE user_id='tester'")
+        ).one()
+        assert tuple(flag) == (1, None)
+        inspector = sa.inspect(connection)
+        assert "incoming_push" in {column["name"] for column in inspector.get_columns("calls")}
+        assert "app_events" in inspector.get_table_names()
+    engine.dispose()
+    refused = migrate(database, "downgrade", "0020_call_summary_and_timing")
+    assert refused.returncode != 0
+    assert "Restore a verified backup" in refused.stderr
+
+
+def test_ai_usage_migration_keeps_existing_calls(tmp_path: Path) -> None:
+    database = tmp_path / "usage.db"
+    assert migrate(database, "upgrade", "0021_app_events").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        for user_id in ("p", "c"):
+            connection.execute(
+                sa.text(
+                    "INSERT INTO users (id, role, name, marketing_opt_in, created_at)"
+                    " VALUES (:id, 'PARENT', 'Test', 0, :now)"
+                ),
+                dict(id=user_id, now=now),
+            )
+        connection.execute(
+            sa.text(
+                "INSERT INTO calls (id, parent_id, child_id, state, room_name, recording_enabled,"
+                " started_at, asked_question_ids, processing_attempts, created_at)"
+                " VALUES ('old-call', 'p', 'c', 'ANALYZED', 'room', 1, :now, '[]', 1, :now)"
+            ),
+            dict(now=now),
+        )
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        row = connection.execute(
+            sa.text("SELECT state, ai_usage FROM calls WHERE id='old-call'")
+        ).one()
+        assert tuple(row) == ("ANALYZED", None)
+    engine.dispose()
+    refused = migrate(database, "downgrade", "0021_app_events")
+    assert refused.returncode != 0
+    assert "Restore a verified backup" in refused.stderr
+
+
 def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "rollback.db"
     assert migrate(database, "upgrade", "head").returncode == 0
     result = migrate(database, "downgrade", "base")
     assert result.returncode != 0
     assert "Restore a verified backup" in result.stderr
+
+
+def test_app_event_indexes_serve_the_limit_count_and_account_deletion(tmp_path: Path) -> None:
+    database = tmp_path / "indexes.db"
+    assert migrate(database, "upgrade", "head").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    with engine.connect() as connection:
+        definitions = dict(connection.execute(sa.text(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='app_events'"
+        )).all())
+        assert "ix_app_events_user_id" not in definitions  # 복합 색인이 대신한다
+        assert "(user_id, received_at)" in definitions["ix_app_events_user_id_received_at"]
+        for column in ("subject_id", "call_id"):
+            assert definitions[f"ix_app_events_{column}"].endswith(f"WHERE {column} IS NOT NULL")
+
+        def plan(statement: str) -> str:
+            rows = connection.execute(sa.text(f"EXPLAIN QUERY PLAN {statement}")).all()
+            return " ".join(str(row[-1]) for row in rows)
+
+        assert "ix_app_events_user_id_received_at" in plan(
+            "SELECT count(*) FROM app_events WHERE user_id = 'u' AND received_at >= '2026-11-24'"
+        )
+        assert "ix_app_events_subject_id" in plan(
+            "UPDATE app_events SET subject_id = NULL WHERE subject_id = 'u'"
+        )
+        assert "ix_app_events_call_id" in plan(
+            "UPDATE app_events SET call_id = NULL WHERE call_id IN ('a', 'b')"
+        )
+    engine.dispose()

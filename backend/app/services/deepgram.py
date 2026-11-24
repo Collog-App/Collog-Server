@@ -6,6 +6,7 @@ from typing import Any, Literal
 import httpx
 
 from app.config import Settings
+from app.services import usage
 from app.services.http import request_with_retry
 
 
@@ -51,6 +52,7 @@ class MockSttGateway(SttGateway):
         del content_type
         text = audio.decode("utf-8", errors="ignore").strip()
         duration = max(0.0, len(text) / 4.0)
+        usage.add("sttAudioSec", duration)
         tokens = text.split()
         token_duration = duration / len(tokens) if tokens else 0
         words = [
@@ -106,6 +108,9 @@ class DeepgramSttGateway(SttGateway):
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise SttError(f"Deepgram STT 요청 실패: {exc}") from exc
+        # 처리한 음성 길이(초). 전사를 읽지 못해도 요청은 처리됐으므로 먼저 남긴다.
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        usage.add("sttAudioSec", metadata.get("duration") if isinstance(metadata, dict) else None)
         return self._parse(payload)
 
     def _parse(self, payload: dict[str, Any]) -> SttResult:

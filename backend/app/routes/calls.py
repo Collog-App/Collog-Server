@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import logging
 import random
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Query, Request, status
 from sqlalchemy import or_, select, update
 
-from app.models import AssetKind, AudioAsset, CallRecord, CallState, Device, User, UserRole
+from app.models import (
+    AssetKind,
+    AudioAsset,
+    CallRecord,
+    CallState,
+    Device,
+    PushResult,
+    User,
+    UserRole,
+)
 from app.routes.devices import deliver_incoming_call_push
 from app.routes.questions import questions_for_parent
 from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
 from app.schemas import AudioConstraints, CallAccepted, CallAcceptRequest, CallCreate, CallCreated
 from app.security import CurrentUser, SessionDep
+from app.services import usage
 from app.services.domain import (
     ensure_same_family,
     ensure_subject_access,
@@ -23,6 +35,7 @@ from app.services.livekit import LiveKitError
 from app.services.notifications import IncomingCallPush
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/calls", status_code=201, tags=["Call"])
@@ -123,7 +136,9 @@ async def create_reserved_call(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "상대방의 통화 수신 기기가 등록되지 않았습니다"
             )
-    source, questions = await questions_for_parent(request, session, parent.id, child.id)
+    # 서버가 질문 음성을 새로 만들면(ElevenLabs) 그 글자 수가 이 통화의 사용량이 된다.
+    with usage.metering() as spent:
+        source, questions = await questions_for_parent(request, session, parent.id, child.id)
     del source
     recording_enabled = await participants_consented(
         session, parent.id, child.id, settings_from(request).consent_document_version
@@ -147,6 +162,7 @@ async def create_reserved_call(
         recording_enabled=recording_enabled,
         recording_disabled_reason=disabled_reason,
         asked_question_ids=[item.question_id for item in questions],
+        ai_usage=spent or None,
     )
     session.add(call)
     await session.flush()
@@ -167,10 +183,10 @@ async def create_reserved_call(
         .order_by(Device.created_at.desc())
     ))
     await session.commit()
-    delivered = False
+    pushes: list[dict[str, str]] = []
     for device in devices:
         container = request.app.state.container
-        device_delivered = await deliver_incoming_call_push(
+        result = await deliver_incoming_call_push(
             container.android_voip_push if device.platform == "ANDROID" else container.voip_push,
             device,
             IncomingCallPush(
@@ -184,13 +200,16 @@ async def create_reserved_call(
             ),
             request.app.state.container,
         )
-        delivered = delivered or device_delivered
-    if not delivered and (devices or not settings_from(request).mock_external_services):
-        await request.app.state.container.calls.finish(call.id)
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            "상대방에게 통화 알림을 보내지 못했어요. 상대방 앱에서 다시 로그인한 뒤 시도해주세요",
-        )
+        pushes.append({"platform": device.platform, "result": result.value})
+    results = {push["result"] for push in pushes}
+    delivered = PushResult.SENT.value in results
+    overall = (
+        PushResult.SENT if delivered
+        else PushResult.NO_DEVICE if not pushes
+        else PushResult.TOKEN_INVALID if results == {PushResult.TOKEN_INVALID.value}
+        else PushResult.FAILED
+    )
+    # 아래 기록이 실패해 rollback 하면 세션의 객체 값이 만료되므로 응답을 먼저 만들어 둔다.
     response = CallCreated(
         call_id=call.id,
         caller_id=call.effective_caller_id,
@@ -205,6 +224,30 @@ async def create_reserved_call(
         questions=questions,
         audio_constraints=AudioConstraints(),
     )
+    # 알림 결과 기록은 운영 지표용 덤이다. 실패해도 통화는 그대로 진행한다.
+    try:
+        # 상대가 그새 받았을 수 있으니 통화 줄 전체가 아니라 이 칸만 고친다.
+        await session.execute(
+            update(CallRecord).where(CallRecord.id == response.call_id).values(incoming_push={
+                "result": overall.value,
+                "at": datetime.now(UTC).isoformat(),
+                "devices": pushes,
+            }).execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "incoming call push result was not recorded (%s)", type(exc).__name__,
+            extra={"call_id": response.call_id},
+        )
+        with suppress(Exception):
+            await session.rollback()
+    if not delivered and (devices or not settings_from(request).mock_external_services):
+        await request.app.state.container.calls.finish(response.call_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "상대방에게 통화 알림을 보내지 못했어요. 상대방 앱에서 다시 로그인한 뒤 시도해주세요",
+        )
     return response.model_dump(by_alias=True)
 
 

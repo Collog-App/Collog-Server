@@ -5,7 +5,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.config import Settings
 from app.models import CallRecord, Device
@@ -123,3 +123,102 @@ def test_failed_push_returns_error_before_room_credentials(client: TestClient) -
             assert call.room_closed_at is not None
 
     client.portal.call(check)
+
+
+def call_push_record(client: TestClient, call_id: str | None) -> dict | None:
+    async def read() -> dict | None:
+        async with client.app.state.container.database.sessions() as session:
+            if call_id is None:
+                return (await session.scalar(select(CallRecord))).incoming_push
+            return (await session.get(CallRecord, call_id)).incoming_push
+
+    return client.portal.call(read)
+
+
+@pytest.mark.parametrize(
+    "outcomes,expected",
+    [
+        ({"1": "sent", "2": "gone"}, "SENT"),
+        ({"1": "gone", "2": "gone"}, "TOKEN_INVALID"),
+        ({"1": "gone", "2": "down"}, "FAILED"),
+    ],
+)
+def test_call_records_push_result_per_device(
+    client: TestClient, outcomes: dict[str, str], expected: str
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    for index, platform in (("1", "IOS"), ("2", "ANDROID")):
+        response = client.post("/v1/devices", headers=auth(parent_token), json={
+            "platform": platform, "token": f"device-{index}", "voipToken": index * 64,
+        })
+        assert response.status_code == 201
+
+    class Gateway(VoipPushGateway):
+        async def send_incoming_call(self, token: str, push: IncomingCallPush) -> str | None:
+            outcome = outcomes[token[0]]
+            if outcome == "gone":
+                raise UnregisteredVoipToken("Unregistered")
+            if outcome == "down":
+                raise PushNotificationError("Unavailable")
+            return None
+
+    container = client.app.state.container
+    container.voip_push = container.android_voip_push = Gateway()
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == (201 if expected == "SENT" else 502), response.text
+
+    record = call_push_record(client, response.json().get("callId"))
+    assert record["result"] == expected
+    assert datetime.fromisoformat(record["at"]).tzinfo is not None
+    results = {"sent": "SENT", "gone": "TOKEN_INVALID", "down": "FAILED"}
+    assert sorted(record["devices"], key=lambda d: d["platform"]) == [
+        {"platform": "ANDROID", "result": results[outcomes["2"]]},
+        {"platform": "IOS", "result": results[outcomes["1"]]},
+    ]
+
+
+def test_call_without_receiving_device_records_no_device(client: TestClient) -> None:
+    child_token, _, _, parent = onboard_family(client)
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == 201
+    record = call_push_record(client, response.json()["callId"])
+    assert record["result"] == "NO_DEVICE"
+    assert record["devices"] == []
+
+
+class BrokenPushUpdate:
+    """incoming_push 를 쓰는 UPDATE 대신 DB 오류를 내는 문을 돌려준다."""
+
+    def __init__(self, *args) -> None:
+        del args
+
+    def where(self, *args) -> "BrokenPushUpdate":
+        return self
+
+    def values(self, **kwargs):
+        del kwargs
+        return text("UPDATE no_such_table SET incoming_push = NULL")
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_failing_push_result_record_does_not_block_the_call(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    delivered: bool,
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    if delivered:
+        client.post("/v1/devices", headers=auth(parent_token), json={
+            "platform": "IOS", "token": "device", "voipToken": "a" * 64,
+        })
+    monkeypatch.setattr("app.routes.calls.update", BrokenPushUpdate)
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["accessToken"] and body["roomName"]
+    assert call_push_record(client, body["callId"]) is None
+    assert "incoming call push result was not recorded (OperationalError)" in caplog.text
+
+    # 세션을 되돌렸으니 같은 앱의 다음 요청도 그대로 돈다
+    calls = client.get(f"/v1/parents/{parent['id']}/calls", headers=auth(child_token))
+    assert calls.status_code == 200
+    assert [item["callId"] for item in calls.json()["calls"]] == [body["callId"]]

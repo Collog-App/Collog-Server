@@ -1,20 +1,40 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sa_event
 
 from app.config import Settings
 from app.main import create_app
-from app.ops import Dataset, account_label, build_summary
+from app.models import AppEvent
+from app.ops import (
+    KST,
+    Dataset,
+    account_label,
+    build_ai_usage,
+    build_cohorts,
+    build_delivery,
+    build_health_link,
+    build_quality,
+    build_signup,
+    build_summary,
+    load_dataset,
+    load_events,
+)
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
+from tests.test_app_events import declined_call
+from tests.test_call_summary import LONG_TALK
+from tests.test_guardrail import analyze_family_call
 
 CODE = "test-ops-code"
 NOW = datetime(2026, 11, 22, 3, 0, tzinfo=UTC)  # 한국 시간 12:00
@@ -281,3 +301,564 @@ def test_analysis_time_uses_only_analyzed_calls_that_recorded_it() -> None:
     empty = build_summary(Dataset(), now=NOW, include_internal=False, since=None)
     assert empty["calls"]["analysisTime"]["totalSec"] is None
     assert empty["calls"]["analysisTime"]["notifySec"] is None
+
+
+# ------------------------------------------------------------ 테스트 그룹·전화 알림
+
+
+def test_operator_sets_a_cohort_that_the_app_never_sees(ops_client: TestClient) -> None:
+    child_token, child, _, parent = onboard_family(ops_client)
+    headers = {"X-Ops-Code": CODE}
+    path = f"/ops/api/accounts/{child['id']}/cohort"
+
+    assert ops_client.put(path, json={"cohort": "AWARE"}).status_code == 401
+    saved = ops_client.put(path, headers=headers, json={"cohort": "AWARE"})
+    assert saved.status_code == 200
+    assert saved.json() == {"id": child["id"], "cohort": "AWARE"}
+    accounts = {a["id"]: a for a in ops_client.get("/ops/api/accounts", headers=headers).json()[
+        "accounts"
+    ]}
+    assert accounts[child["id"]]["cohort"] == "AWARE"
+    assert accounts[child["id"]]["internal"] is False
+    assert accounts[parent["id"]]["cohort"] is None
+
+    summary = ops_client.get("/ops/api/summary", headers=headers).json()
+    people = {g["cohort"]: g["people"] for g in summary["cohorts"]["groups"]}
+    assert people == {"AWARE": 1, "UNAWARE": 0, None: 1}
+    assert len(summary["cohorts"]["weeks"]) == 8
+
+    me = ops_client.patch(
+        "/v1/account/preferences", headers=auth(child_token), json={"marketingOptIn": False}
+    )
+    assert me.status_code == 200
+    assert "cohort" not in me.json()
+
+    assert ops_client.put(path, headers=headers, json={"cohort": "BOTH"}).status_code == 422
+    cleared = ops_client.put(path, headers=headers, json={"cohort": None})
+    assert cleared.json() == {"id": child["id"], "cohort": None}
+    missing = ops_client.put(
+        "/ops/api/accounts/nobody/cohort", headers=headers, json={"cohort": "UNAWARE"}
+    )
+    assert missing.status_code == 404
+
+
+def test_summary_counts_push_results_of_new_calls(ops_client: TestClient) -> None:
+    child_token, _, _, parent = onboard_family(ops_client)
+    created = ops_client.post(
+        "/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]}
+    )
+    assert created.status_code == 201
+    delivery = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["delivery"]
+    assert delivery["pushResults"] == {"SENT": 0, "TOKEN_INVALID": 0, "FAILED": 0, "NO_DEVICE": 1}
+    assert delivery["notRung"] == {"n": 0, "d": 0, "pct": None}
+
+
+def app_event(user_id: str, name: str, at: datetime, code: str | None = None,
+              call_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(user_id=user_id, name=name, code=code, call_id=call_id, occurred_at=at)
+
+
+def cohort_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid, role in (("a1", "CHILD"), ("a2", "CHILD"), ("u1", "CHILD"), ("p1", "PARENT"),
+                      ("p2", "PARENT"), ("i1", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.internal = {"i1"}
+    data.cohorts = {"a1": "AWARE", "a2": "AWARE", "i1": "AWARE", "u1": "UNAWARE"}
+    data.calls = [
+        call("p1", "a1", NOW - timedelta(days=2)),
+        call("p1", "a1", NOW - timedelta(days=10)),
+        call("p2", "u1", NOW - timedelta(days=20)),
+        call("p1", "a1", None),  # 안 받은 전화는 통화가 아니다
+        call("p2", "i1", NOW - timedelta(days=1)),
+    ]
+    data.events = [
+        app_event("a1", "report_view", NOW - timedelta(days=2, hours=1), "DIRECT"),  # 통화한 날
+        app_event("a2", "report_view", NOW - timedelta(days=1), "DIRECT"),  # 통화 없는 날
+        app_event("u1", "report_view", NOW - timedelta(days=20), "NOTIFICATION"),
+        app_event("i1", "report_view", NOW - timedelta(days=3), "DIRECT"),
+        app_event("a1", "post_call_answer", NOW - timedelta(days=2), "YES"),
+        app_event("a1", "post_call_answer", NOW - timedelta(days=10), "NO"),
+        app_event("u1", "post_call_answer", NOW - timedelta(days=20), "NOT_SEEN"),
+        app_event("a1", "app_open", NOW - timedelta(hours=1)),
+        app_event("a2", "app_open", NOW - timedelta(days=8)),
+    ]
+    return data
+
+
+def test_cohort_tables_split_people_by_group() -> None:
+    cohorts = build_cohorts(cohort_dataset(), now=NOW, include_internal=False, since=None)
+    groups = {g["cohort"]: g for g in cohorts["groups"]}
+    aware, unaware, undecided = groups["AWARE"], groups["UNAWARE"], groups[None]
+    assert aware["people"] == 2  # 팀·시험 계정 i1 은 빠짐
+    assert aware["calledLast7d"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert aware["reportOnNoCallDay"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert aware["questionUsed"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert unaware["people"] == 1
+    assert unaware["reportOnNoCallDay"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert unaware["questionUsed"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert undecided["people"] == 2
+    assert undecided["calledLast7d"] == {"n": 1, "d": 2, "pct": 50.0}
+
+    assert cohorts["weeks"][-1] == "2026-11-16"
+    this_week, last_week = aware["weekly"][-1], aware["weekly"][-2]
+    assert this_week == {"week": "2026-11-16", "calls": 1, "callsPerPerson": 0.5, "activeUsers": 1}
+    assert last_week == {"week": "2026-11-09", "calls": 1, "callsPerPerson": 0.5, "activeUsers": 1}
+    assert sum(w["calls"] for w in undecided["weekly"]) == 3
+
+    with_internal = build_cohorts(cohort_dataset(), now=NOW, include_internal=True, since=None)
+    assert {g["cohort"]: g["people"] for g in with_internal["groups"]}["AWARE"] == 3
+
+
+def failed(user_id: str, code: str, *, total: int, recent: int) -> SimpleNamespace:
+    return SimpleNamespace(user_id=user_id, code=code, total=total, recent=recent)
+
+
+def push_row(call_id: str, caller: str, started: datetime, result: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        parent_id="p1",
+        child_id="c1",
+        caller_id=caller,
+        started_at=started,
+        incoming_push={"result": result, "at": started.isoformat(), "devices": []},
+    )
+
+
+def test_not_rung_counts_only_calls_the_receiving_app_could_report() -> None:
+    data = dataset()
+    hours3 = NOW - timedelta(hours=3)
+    data.users["i1"] = user("i1", "CHILD", NOW - timedelta(days=40))
+    data.internal = {"i1"}
+    data.pushes = [
+        push_row("rang", "c1", hours3, "SENT"),
+        push_row("silent", "c1", hours3, "SENT"),
+        push_row("too-new", "c1", NOW - timedelta(minutes=10), "SENT"),
+        push_row("expired", "c1", hours3, "TOKEN_INVALID"),
+        push_row("to-child", "p1", hours3, "SENT"),
+        SimpleNamespace(
+            id="old-app", parent_id="p2", child_id="c2", caller_id="c2", started_at=hours3,
+            incoming_push={"result": "SENT", "devices": []},
+        ),
+    ]
+    data.first_event = {"p1": NOW - timedelta(days=1), "c1": hours3 + timedelta(minutes=1)}
+    data.events = [
+        app_event("p1", "incoming_call_shown", hours3, call_id="rang"),
+        app_event("c1", "incoming_call_shown", hours3, call_id="silent"),  # 건 사람 기록은 아님
+        app_event("c1", "incoming_call_shown", hours3, call_id="to-child"),
+    ]
+    # 연결 실패는 load_events 가 사람·코드별로 센 건수(전체, 최근 7일)로 온다
+    data.connect_failed = [
+        failed("c1", "NETWORK", total=1, recent=1),  # 1일 전
+        failed("p1", "NETWORK", total=1, recent=0),  # 10일 전
+        failed("c1", "MIC_PERMISSION", total=1, recent=1),  # 2시간 전
+        failed("i1", "SERVER", total=1, recent=1),
+    ]
+    delivery = build_delivery(data, now=NOW, include_internal=False, since=None)
+    assert delivery["pushResults"] == {"SENT": 5, "TOKEN_INVALID": 1, "FAILED": 0, "NO_DEVICE": 0}
+    # rang·silent·to-child 만 센다(too-new 는 1시간 전, old-app 은 받는 앱이 기록을 보낸 적 없음)
+    assert delivery["notRung"] == {"n": 1, "d": 3, "pct": 33.3}
+    assert delivery["connectFailed"] == {
+        "all": {"NETWORK": 2, "MIC_PERMISSION": 1},
+        "last7d": {"NETWORK": 1, "MIC_PERMISSION": 1},
+    }
+
+
+# ------------------------------------------------------------ 가입 퍼널
+
+
+def counted(user_id: str | None, code: str, platform: str, n: int = 1) -> SimpleNamespace:
+    """load_events 가 사람(익명은 None)·코드·플랫폼별로 센 한 줄."""
+    return SimpleNamespace(user_id=user_id, code=code, platform=platform, n=n)
+
+
+def anonymous_step(code: str, at: datetime) -> dict:
+    return {"id": str(uuid4()), "name": "onboarding_step", "code": code,
+            "at": at.isoformat(), "platform": "ANDROID", "appVersion": "1.2 (44)"}
+
+
+def signup_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid, role in (("c1", "CHILD"), ("p1", "PARENT"), ("c2", "CHILD"), ("p2", "PARENT"),
+                      ("i1", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.users["late"] = user("late", "CHILD", NOW - timedelta(days=1), nickname=None)
+    data.internal = {"i1"}
+    data.consent_latest = {"c1": "GRANTED", "p1": "GRANTED", "c2": "DENIED", "i1": "GRANTED",
+                           "late": "GRANTED"}
+    data.profiles = [SimpleNamespace(parent_id=uid, conditions=[], concerns=None)
+                     for uid in ("p1", "p2", "c2")]
+    data.inviters = {"c1", "c2", "i1"}
+    data.family_users = [(start, {"c1", "p1"}), (start, {"c2"}), (start, {"p2", "i1"})]
+    data.calls = [
+        call("p1", "c1", NOW - timedelta(days=3)),
+        call("p2", "i1", NOW - timedelta(days=3)),  # 팀·시험 계정과 한 통화
+        call("p2", "c2", None),  # 안 받은 전화
+    ]
+    data.reports = [
+        SimpleNamespace(parent_id="p1", issued_at=NOW, state="READY"),
+        SimpleNamespace(parent_id="p2", issued_at=NOW, state="EMPTY"),
+    ]
+    data.onboarding = [
+        counted(None, "WELCOME", "IOS", 2),
+        counted(None, "LOGIN", "ANDROID"),
+        counted("late", "TERMS", "IOS"),
+        counted("i1", "CONDITIONS", "ANDROID"),
+    ]
+    return data
+
+
+def test_signup_funnel_counts_each_stage_among_signed_up_people() -> None:
+    signup = build_signup(signup_dataset(), now=NOW, include_internal=False, since=None)
+    assert signup["signedUp"] == 4
+    assert signup["loginOnly"] == 1
+    assert signup["stages"] == {
+        "consentGranted": {"n": 2, "d": 4, "pct": 50.0},
+        "consentDenied": {"n": 1, "d": 4, "pct": 25.0},
+        "conditions": {"n": 3, "d": 4, "pct": 75.0},
+        "inviteCreated": {"n": 2, "d": 4, "pct": 50.0},
+        # p2 의 가족은 팀·시험 계정 i1 을 빼면 혼자다
+        "connected": {"n": 2, "d": 4, "pct": 50.0},
+        "firstCall": {"n": 2, "d": 4, "pct": 50.0},
+        # p1 리포트 → p1 과 통화한 c1 도 셈. 빈 리포트(p2)는 세지 않는다
+        "firstReport": {"n": 2, "d": 4, "pct": 50.0},
+    }
+    steps = {row["step"]: row for row in signup["onboardingSteps"]}
+    assert list(steps) == ["WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
+                           "INVITE_CODE", "DONE"]
+    assert steps["WELCOME"] == {"step": "WELCOME", "IOS": 2, "ANDROID": 0, "anonymous": 2}
+    assert steps["LOGIN"] == {"step": "LOGIN", "IOS": 0, "ANDROID": 1, "anonymous": 1}
+    # 가입 단계에서 멈춘 계정의 로그인 뒤 기록은 센다. 팀·시험 계정 기록은 뺀다
+    assert steps["TERMS"] == {"step": "TERMS", "IOS": 1, "ANDROID": 0, "anonymous": 0}
+    assert steps["CONDITIONS"]["ANDROID"] == 0
+
+
+def test_signup_funnel_follows_internal_and_since_filters() -> None:
+    with_internal = build_signup(signup_dataset(), now=NOW, include_internal=True, since=None)
+    assert with_internal["signedUp"] == 5
+    assert with_internal["stages"]["inviteCreated"]["n"] == 3
+    assert with_internal["stages"]["connected"]["n"] == 4
+    assert with_internal["stages"]["firstCall"]["n"] == 4
+    assert {r["step"]: r["ANDROID"] for r in with_internal["onboardingSteps"]}["CONDITIONS"] == 1
+
+    recent = build_signup(
+        signup_dataset(), now=NOW, include_internal=False, since=date(2026, 11, 20)
+    )
+    assert recent["signedUp"] == 0
+    assert recent["stages"]["consentGranted"] == {"n": 0, "d": 0, "pct": None}
+    steps = {row["step"]: row for row in recent["onboardingSteps"]}
+    assert steps["TERMS"]["IOS"] == 1  # 11-20 이후 계정 late 의 로그인 뒤 기록
+
+
+def test_anonymous_steps_follow_the_since_filter_by_record_date(ops_client: TestClient) -> None:
+    now = datetime.now(UTC)
+    batch = [anonymous_step("WELCOME", now - timedelta(days=10)),
+             anonymous_step("WELCOME", now - timedelta(hours=1))]
+    assert ops_client.post("/v1/events/anonymous", json={"events": batch}).json() == {
+        "accepted": 2
+    }
+    headers = {"X-Ops-Code": CODE}
+    since = (now.astimezone(KST) - timedelta(days=2)).date().isoformat()
+    for query, expected in (("", 2), (f"?since={since}", 1)):
+        steps = ops_client.get(f"/ops/api/summary{query}", headers=headers).json()["signup"][
+            "onboardingSteps"
+        ]
+        assert steps[0] == {"step": "WELCOME", "IOS": 0, "ANDROID": expected,
+                            "anonymous": expected}
+
+
+def test_signup_funnel_reads_the_real_tables(ops_client: TestClient) -> None:
+    onboard_family(ops_client)
+    anonymous = ops_client.post("/v1/events/anonymous", json={"events": [{
+        "id": str(uuid4()), "name": "onboarding_step", "at": datetime.now(UTC).isoformat(),
+        "platform": "ANDROID", "appVersion": "1.2 (44)", "code": "WELCOME",
+    }]})
+    assert anonymous.json() == {"accepted": 1}
+    signup = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["signup"]
+    assert signup["signedUp"] == 2
+    assert signup["stages"]["consentGranted"]["n"] == 2
+    assert signup["stages"]["inviteCreated"]["n"] == 1  # 초대한 자녀
+    assert signup["stages"]["connected"]["n"] == 2
+    assert signup["stages"]["firstCall"]["n"] == 0
+    assert signup["onboardingSteps"][0] == {
+        "step": "WELCOME", "IOS": 0, "ANDROID": 1, "anonymous": 1
+    }
+
+
+# ------------------------------------------------------------ 분석 품질
+
+
+def quality_call(call_id: str, state: str, *, parent: str = "p", child: str = "c",
+                 error: str | None = None, accepted: bool = True, recording: bool = True,
+                 started: datetime | None = None) -> SimpleNamespace:
+    item = call(parent, child, (started or NOW - timedelta(days=1)) if accepted else None, state)
+    item.id = call_id
+    item.processing_error = error
+    item.recording_enabled = recording
+    item.started_at = started or NOW - timedelta(days=1)
+    return item
+
+
+def pause(call_id: str, status: str, reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(call_id=call_id, status=status, unmeasurable_reason=reason)
+
+
+def quality_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=60)
+    for uid, role in (("p", "PARENT"), ("c", "CHILD"), ("i", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.internal = {"i"}
+    data.calls = [
+        quality_call("a1", "ANALYZED"),
+        quality_call("a2", "ANALYZED"),
+        quality_call("a3", "ANALYZED"),
+        quality_call("a4", "ANALYZED"),
+        quality_call("x1", "ANALYSIS_EXCLUDED"),
+        quality_call("x2", "ANALYSIS_EXCLUDED"),  # 동의 철회 등 다른 이유로 빠짐
+        quality_call("f1", "ANALYSIS_FAILED", error="Analysis failed",
+                     started=NOW - timedelta(days=40)),
+        quality_call("f2", "ANALYSIS_FAILED", error="부모 Egress 녹음이 완료되지 않았습니다"),
+        quality_call("f3", "ANALYSIS_FAILED", error="홍길동 님 통화 처리 실패"),
+        quality_call("e1", "ENDED", error="Analysis retry pending"),
+        quality_call("n1", "ANALYSIS_EXCLUDED", accepted=False),
+        quality_call("r0", "ANALYSIS_EXCLUDED", recording=False),
+        quality_call("i1", "ANALYZED", child="i"),  # 팀·시험 계정
+    ]
+    data.extraction_status = {"a1": "OK", "a2": "FAILED", "a4": "OK", "x1": "EXCLUDED",
+                              "i1": "FAILED"}
+    data.pause_ratio = {
+        "a1": pause("a1", "OK"),
+        "a2": pause("a2", "UNMEASURABLE", "NO_CHILD_TRACK"),
+        "a3": pause("a3", "UNMEASURABLE", "DEFINITION_CHANGED"),
+        "i1": pause("i1", "UNMEASURABLE", "NO_CHILD_TRACK"),
+    }
+    data.short_speech = {"x1", "r0", "i1"}
+    return data
+
+
+def test_analysis_quality_counts_and_hides_error_text() -> None:
+    quality = build_quality(quality_dataset(), now=NOW, include_internal=False, since=None)
+    assert quality["processingErrors"] == {
+        "all": {"ANALYSIS_ERROR": 1, "PARENT_RECORDING_MISSING": 1, "OTHER": 1,
+                "RETRY_PENDING": 1},
+        "last30d": {"PARENT_RECORDING_MISSING": 1, "OTHER": 1, "RETRY_PENDING": 1},
+    }
+    assert "홍길동" not in json.dumps(quality, ensure_ascii=False)
+    # a2 는 추출 실패, a3 는 추출 결과 줄 없음
+    assert quality["analyzedWithoutExtraction"] == {"n": 2, "d": 4, "pct": 50.0}
+    # 정의가 바뀌어 지운 a3 와 기록이 없는 a4 는 빼고 a1·a2 가운데
+    assert quality["pauseUnmeasurable"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert quality["pauseUnmeasurableReasons"] == {"NO_CHILD_TRACK": 1}
+    # 녹음된 통화(받음·녹음 켬) 10건 가운데 말이 짧아 빠진 x1
+    assert quality["shortSpeechExcluded"] == {"n": 1, "d": 10, "pct": 10.0}
+
+    with_internal = build_quality(quality_dataset(), now=NOW, include_internal=True, since=None)
+    assert with_internal["analyzedWithoutExtraction"] == {"n": 3, "d": 5, "pct": 60.0}
+
+
+def test_analysis_quality_reads_the_real_tables(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    analyze_family_call(ops_client, child_token, parent_token, parent, LONG_TALK)
+    analyze_family_call(
+        ops_client, child_token, parent_token, parent, "PARENT: 응 잘 지내",
+        state="ANALYSIS_EXCLUDED",
+    )
+    quality = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["quality"]
+    assert quality["analyzedWithoutExtraction"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert quality["pauseUnmeasurable"]["d"] == 1
+    assert quality["shortSpeechExcluded"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert quality["processingErrors"] == {"all": {}, "last30d": {}}
+
+
+# ------------------------------------------------------------ 건강 연동 결과
+
+
+def test_health_link_counts_people_by_latest_result_and_every_event() -> None:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid in ("a", "b", "i"):
+        data.users[uid] = user(uid, "PARENT", start)
+    data.internal = {"i"}
+    # a: 안드로이드에서 거부했다가 연결 → 사람은 연결 1, 건수는 둘 다. i 는 팀·시험 계정
+    data.health_counts = [
+        counted("a", "PERMISSION_DENIED", "ANDROID"),
+        counted("a", "CONNECTED", "ANDROID"),
+        counted("b", "CONNECTED_NO_RECORDS", "IOS", 2),
+        counted("i", "CONNECTED", "IOS"),
+    ]
+    data.health_latest = [
+        counted("a", "CONNECTED", "ANDROID"),
+        counted("b", "CONNECTED_NO_RECORDS", "IOS"),
+        counted("i", "CONNECTED", "IOS"),
+    ]
+    health = build_health_link(data, now=NOW, include_internal=False, since=None)
+    assert health["people"] == 2
+    assert health["events"] == 4
+    assert health["results"] == [
+        {"code": "CONNECTED", "people": {"IOS": 0, "ANDROID": 1},
+         "events": {"IOS": 0, "ANDROID": 1}},
+        {"code": "PERMISSION_DENIED", "people": {"IOS": 0, "ANDROID": 0},
+         "events": {"IOS": 0, "ANDROID": 1}},
+        {"code": "CONNECTED_NO_RECORDS", "people": {"IOS": 1, "ANDROID": 0},
+         "events": {"IOS": 2, "ANDROID": 0}},
+    ]
+    with_internal = build_health_link(data, now=NOW, include_internal=True, since=None)
+    assert with_internal["results"][0]["people"] == {"IOS": 1, "ANDROID": 1}
+
+
+def test_health_link_reads_the_real_events(ops_client: TestClient) -> None:
+    _, _, parent_token, _ = onboard_family(ops_client)
+    sent = ops_client.post("/v1/events", headers=auth(parent_token), json={"events": [
+        {"id": str(uuid4()), "name": "health_link_result", "code": code,
+         "at": (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(),
+         "platform": "ANDROID", "appVersion": "1.2 (44)"}
+        for code, minutes in (("PERMISSION_DENIED", 5), ("CONNECTED", 1))
+    ]})
+    assert sent.json() == {"accepted": 2}
+    health = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["healthLink"]
+    assert health["people"] == 1
+    assert health["events"] == 2
+    assert health["results"][0]["people"] == {"IOS": 0, "ANDROID": 1}
+
+
+# ------------------------------------------------------------ AI 사용량
+
+
+def usage_call(call_id: str, started: datetime, spent: dict | None, child: str = "c"):
+    item = quality_call(call_id, "ANALYZED", child=child, started=started)
+    item.ai_usage = spent
+    return item
+
+
+def test_ai_usage_sums_each_month_in_provider_units() -> None:
+    data = Dataset()
+    for uid, role in (("p", "PARENT"), ("c", "CHILD"), ("i", "CHILD")):
+        data.users[uid] = user(uid, role, NOW - timedelta(days=90))
+    data.internal = {"i"}
+    data.calls = [
+        usage_call("u1", datetime(2026, 11, 20, tzinfo=UTC), {
+            "sttAudioSec": 100.6, "geminiInputTokens": 1000, "geminiOutputTokens": 300,
+            "geminiThoughtTokens": 200, "ttsCharacters": 0,
+        }),
+        # 한국 시간 11월 1일 00:30 → 11월
+        usage_call("u2", datetime(2026, 10, 31, 15, 30, tzinfo=UTC), {
+            "sttAudioSec": 50.0, "geminiInputTokens": 500, "geminiOutputTokens": 100,
+            "geminiThoughtTokens": 0, "ttsCharacters": None,
+        }),
+        usage_call("u3", datetime(2026, 10, 15, tzinfo=UTC), {"sttAudioSec": 30.0}),
+        usage_call("u4", datetime(2026, 11, 10, tzinfo=UTC), None),  # 기록 전 통화
+        usage_call("u5", datetime(2026, 11, 10, tzinfo=UTC), {"sttAudioSec": 999.0}, child="i"),
+    ]
+    months = build_ai_usage(data, now=NOW, include_internal=False, since=None)["months"]
+    assert [m["month"] for m in months] == ["2026-11", "2026-10"]
+    november, october = months
+    assert november["calls"] == 2
+    assert november["sttAudioSec"] == {"total": 150.6, "calls": 2, "perCall": 75.3, "unknown": 0}
+    assert november["geminiInputTokens"] == {
+        "total": 1500, "calls": 2, "perCall": 750.0, "unknown": 0
+    }
+    assert november["geminiOutputTokens"]["total"] == 400
+    assert november["geminiThoughtTokens"]["perCall"] == 100.0
+    # 앱이 직접 만든 질문 음성(값 없음)은 합에 넣지 않고 따로 센다
+    assert november["ttsCharacters"] == {"total": 0, "calls": 1, "perCall": 0.0, "unknown": 1}
+    assert october["calls"] == 1
+    assert october["geminiInputTokens"] == {
+        "total": 0, "calls": 0, "perCall": None, "unknown": 0
+    }
+
+    with_internal = build_ai_usage(data, now=NOW, include_internal=True, since=None)
+    assert with_internal["months"][0]["sttAudioSec"]["total"] == 1149.6
+
+
+def test_ai_usage_of_an_analyzed_mock_call_reaches_the_summary(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    analyze_family_call(ops_client, child_token, parent_token, parent, LONG_TALK)
+    months = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()[
+        "aiUsage"
+    ]["months"]
+    assert [m["month"] for m in months] == [datetime.now(KST).strftime("%Y-%m")]
+    month = months[0]
+    assert month["calls"] == 1
+    assert month["geminiInputTokens"] == {"total": 200, "calls": 1, "perCall": 200.0, "unknown": 0}
+    assert month["sttAudioSec"]["total"] == pytest.approx(
+        (len(LONG_TALK) + len("CHILD: 쓰러지신 적은 없으시죠?")) / 4, abs=0.1
+    )
+    assert month["ttsCharacters"]["calls"] == 0
+
+
+# ------------------------------------------------------------ 이용 기록 읽기
+
+
+def statements(client: TestClient, path: str) -> list[str]:
+    seen: list[str] = []
+    engine = client.app.state.container.database.engine.sync_engine
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        seen.append(" ".join(statement.split()))
+
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert client.get(path, headers={"X-Ops-Code": CODE}).status_code == 200
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+    return seen
+
+
+def test_accounts_never_read_usage_events_and_summary_reads_them_bounded(
+    ops_client: TestClient,
+) -> None:
+    onboard_family(ops_client)
+    assert not [s for s in statements(ops_client, "/ops/api/accounts") if "app_events" in s]
+    reads = [s for s in statements(ops_client, "/ops/api/summary") if "FROM app_events" in s]
+    assert reads
+    # 표를 통째로 읽는 문이 없다: 모두 SQL 로 묶어 세거나 기간을 둔다
+    assert all("GROUP BY" in s or "app_events.occurred_at >=" in s for s in reads), reads
+
+
+def test_cohort_events_are_read_only_for_the_weekly_window(ops_client: TestClient) -> None:
+    _, child, _, _ = onboard_family(ops_client)
+    now = datetime.now(UTC)
+    container = ops_client.app.state.container
+
+    async def load():
+        async with container.database.sessions() as session:
+            session.add_all([
+                AppEvent(id=name, user_id=child["id"], name="app_open", platform="IOS",
+                         app_version="1.2 (44)", occurred_at=now - age, received_at=now - age)
+                for name, age in (("inside", timedelta(weeks=8)), ("outside", timedelta(weeks=10)))
+            ])
+            await session.commit()
+            data = await load_dataset(session, container.settings)
+            await load_events(session, data, now=now, since=None)
+            return data
+
+    data = ops_client.portal.call(load)
+    assert [(e.user_id, e.name) for e in data.events] == [(child["id"], "app_open")]
+    assert data.first_event[child["id"]] <= now - timedelta(weeks=10)  # 첫 기록은 기간과 무관
+
+
+def test_question_answers_count_once_per_person_and_call(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    first = declined_call(ops_client, child_token, parent_token, parent["id"])
+    second = declined_call(ops_client, child_token, parent_token, parent["id"])
+    now = datetime.now(UTC)
+    answers = [
+        app_event_body("post_call_answer", "YES", first, now - timedelta(minutes=10)),
+        app_event_body("post_call_answer", "NO", first, now - timedelta(minutes=5)),  # 가장 최근
+        app_event_body("post_call_answer", "YES", second, now - timedelta(minutes=1)),
+    ]
+    sent = ops_client.post("/v1/events", headers=auth(child_token), json={"events": answers})
+    assert sent.json() == {"accepted": 3}
+    groups = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["cohorts"][
+        "groups"
+    ]
+    undecided = next(g for g in groups if g["cohort"] is None)
+    assert undecided["questionUsed"] == {"n": 1, "d": 2, "pct": 50.0}
+
+
+def app_event_body(name: str, code: str | None, call_id: str | None, at: datetime) -> dict:
+    return {"id": str(uuid4()), "name": name, "code": code, "callId": call_id,
+            "at": at.isoformat(), "platform": "IOS", "appVersion": "1.2 (44)"}

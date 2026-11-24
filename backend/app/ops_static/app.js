@@ -43,7 +43,61 @@ const pct = (r) => (r && r.pct !== null ? `${r.pct}%` : "–");
 const frac = (r) => (r ? `${fmt(r.n)} / ${fmt(r.d)}` : "–");
 
 const ROLE = { PARENT: "부모", CHILD: "자녀" };
+const COHORT = { AWARE: "인지", UNAWARE: "비인지" };
+const cohortName = (code) => COHORT[code] || "미정";
+const PUSH = {
+  SENT: "보냄",
+  TOKEN_INVALID: "토큰 만료·무효",
+  FAILED: "보내기 실패",
+  NO_DEVICE: "보낼 기기 없음",
+};
+const CONNECT_FAILED = {
+  MIC_PERMISSION: "마이크 권한",
+  NETWORK: "네트워크",
+  TOKEN: "통화 접속 토큰",
+  SERVER: "서버",
+  OTHER: "기타",
+};
 const PLATFORM = { IOS: "iPhone", ANDROID: "Android" };
+const PROCESSING_ERROR = {
+  RETRY_PENDING: "다시 시도 기다리는 중(아직 실패 아님)",
+  ANALYSIS_ERROR: "분석 중 오류",
+  RETRY_LIMIT: "다시 시도 한도·음성 보관 한도 넘음",
+  PARENT_RECORDING_MISSING: "부모님 쪽 통화 녹음 없음",
+  RAW_UPLOAD_EXPIRED: "기기 원음 올리기 시간 지남",
+  AUDIO_EXPIRED: "음성 보관 24시간 지남",
+  OTHER: "기타",
+};
+const HEALTH_RESULT = {
+  CONNECTED: "연결됨(기록 올라감)",
+  PERMISSION_DENIED: "권한 거부",
+  CONNECTED_NO_RECORDS: "연결됐지만 올릴 기록 없음",
+};
+const PAUSE_REASON = {
+  NO_CHILD_TRACK: "자녀 쪽 녹음 없음",
+  INSUFFICIENT_WORD_TIMING: "이어진 말이 짧아 잴 구간 없음",
+  INSUFFICIENT_PARENT_SPEECH: "부모님 말씀이 짧음",
+  UNKNOWN: "이유 없음",
+};
+const FUNNEL = [
+  ["consentGranted", "외부 AI 분석 동의", "마지막 선택이 동의(문서 판이 바뀌어 다시 동의가 필요한 사람도 마지막 선택으로 셈)"],
+  ["consentDenied", "외부 AI 분석 거절", "마지막 선택이 거절"],
+  ["conditions", "질환 등록", "자기 건강 프로필이 저장됨(가족이 대신 저장했거나 질환 없이 저장한 경우 포함)"],
+  ["inviteCreated", "초대 만듦", "자기가 만든 가족에 초대가 하나라도 있음(가족에 들어온 사람이 보낸 초대도 가족을 만든 사람 몫)"],
+  ["connected", "가족과 연결됨(초대 수락)", "가입한 사람이 둘 이상인 가족에 속함(초대를 수락했거나, 내 초대를 누가 수락함)"],
+  ["firstCall", "첫 통화", "받아 연결된 통화가 한 번이라도 있음(건 쪽·받은 쪽 모두)"],
+  ["firstReport", "첫 리포트", "나 또는 내가 통화한 부모님 칸 대상으로 비어 있지 않은 리포트가 발행됨"],
+];
+const ONBOARDING = {
+  WELCOME: "시작 화면",
+  LOGIN: "로그인",
+  TERMS: "약관",
+  AI_CONSENT: "AI 분석 동의",
+  PROFILE: "프로필",
+  CONDITIONS: "질환 선택",
+  INVITE_CODE: "초대 코드",
+  DONE: "가입 끝",
+};
 const GENDER = { MALE: "남성", FEMALE: "여성" };
 const CONDITION = {
   FORGETFULNESS: "건망증",
@@ -300,7 +354,156 @@ function renderCalls(s) {
         "단계별 시간은 이 기록을 넣은 뒤의 통화만 셈",
       ),
     ),
+    renderDelivery(s.delivery),
+    renderQuality(s.quality),
+    renderAiUsage(s.aiUsage),
   ];
+}
+
+const AI_USAGE = [
+  ["sttAudioSec", "음성 인식(초)"],
+  ["geminiInputTokens", "Gemini 입력 토큰"],
+  ["geminiOutputTokens", "Gemini 출력 토큰"],
+  ["geminiThoughtTokens", "그중 생각 토큰"],
+  ["ttsCharacters", "질문 음성 글자 수"],
+];
+
+function renderAiUsage(u) {
+  const cell = (t) =>
+    el(
+      "td",
+      {},
+      fmt(t.total),
+      el("br"),
+      el(
+        "span",
+        { class: "cell-sub" },
+        `통화당 ${fmt(t.perCall)} · ${fmt(t.calls)}건${t.unknown ? ` · 값 없음 ${fmt(t.unknown)}건` : ""}`,
+      ),
+    );
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "통화당 AI 사용량 (달별 합계)"),
+    u.months.length
+      ? table(
+          ["달", "통화", ...AI_USAGE.map(([, label]) => label)],
+          u.months.map((m) =>
+            el("tr", {}, el("td", {}, m.month), el("td", {}, fmt(m.calls)), AI_USAGE.map(([key]) => cell(m[key]))),
+          ),
+        )
+      : el("p", { class: "muted" }, "아직 없음"),
+    el(
+      "p",
+      { class: "muted" },
+      "통화 시작 달(한국 시간)별로 공급자가 응답으로 알려 준 값을 단위 그대로 더했습니다(원화 환산 없음). 통화 = 사용량 기록이 있는 통화, 통화당 = 그 칸 값이 있는 통화 수로 나눈 평균. 음성 인식 = Deepgram 이 처리한 음성 길이(부모·자녀 트랙 합). Gemini = 추출·요약·2차 검토 요청의 합이고 출력 토큰에 생각 토큰이 들어 있음. 다시 시도한 분석도 더함. 질문 음성 = 서버가 ElevenLabs 로 새로 만든 음성의 글자 수(만들어 둔 음성을 다시 쓰면 0, 질문 목록 화면에서 먼저 만든 음성은 어느 통화에도 들어가지 않음). 앱이 ElevenLabs 에 바로 요청하는 방식은 서버가 글자 수를 몰라 「값 없음」으로 셉니다. 응답에 값이 없거나 한 값이 10억을 넘으면(비정상 값) 「값 없음」입니다. 이 기록을 넣기 전 통화는 빠집니다.",
+    ),
+  );
+}
+
+function renderQuality(q) {
+  const known = Object.keys(PROCESSING_ERROR);
+  const seen = [...Object.keys(q.processingErrors.all), ...Object.keys(q.processingErrors.last30d)];
+  const kinds = [...known.filter((k) => seen.includes(k)), ...new Set(seen.filter((k) => !known.includes(k)))];
+  const reasons = Object.entries(q.pauseUnmeasurableReasons)
+    .map(([code, n]) => `${PAUSE_REASON[code] || code} ${fmt(n)}`)
+    .join(" · ");
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "분석 품질"),
+    el(
+      "div",
+      { class: "grid" },
+      card(
+        "추출 없이 「분석 완료」",
+        pct(q.analyzedWithoutExtraction),
+        `${frac(q.analyzedWithoutExtraction)}통화`,
+        "분석 완료 통화 중 건강 사실 추출 결과가 없거나 실패로 남은 통화(리포트에 건강 사실 없이 나감)",
+      ),
+      card(
+        "휴지 비율 측정 불가",
+        pct(q.pauseUnmeasurable),
+        `${frac(q.pauseUnmeasurable)}통화${reasons ? ` · ${reasons}` : ""}`,
+        "분석 완료 통화 중 말 사이 쉼(휴지 비율)을 잴 수 없던 통화. 정의가 바뀌어 지운 옛 값은 뺌",
+      ),
+      card(
+        "말이 짧아 분석 제외",
+        pct(q.shortSpeechExcluded),
+        `${frac(q.shortSpeechExcluded)}통화`,
+        "녹음된 통화(받음·녹음 켬) 중 부모님 말씀이 기준보다 짧아 건강 분석에서 빠진 통화",
+      ),
+    ),
+    el("p", { class: "muted", style: "margin-top:12px" }, "처리 오류 종류"),
+    kinds.length
+      ? table(
+          ["종류", "전체", "최근 30일"],
+          kinds.map((kind) =>
+            el(
+              "tr",
+              {},
+              el("td", {}, PROCESSING_ERROR[kind] || kind),
+              el("td", {}, fmt(q.processingErrors.all[kind] || 0)),
+              el("td", {}, fmt(q.processingErrors.last30d[kind] || 0)),
+            ),
+          ),
+        )
+      : el("p", { class: "muted" }, "아직 없음"),
+    el(
+      "p",
+      { class: "muted" },
+      "통화에 지금 남아 있는 처리 오류 표시를 종류로 묶은 통화 수입니다(다시 시도해 성공하면 지워짐, 최근 30일은 통화 시작 기준). 오류 문구 원문은 보이지 않습니다.",
+    ),
+  );
+}
+
+function renderDelivery(d) {
+  const failed = Object.keys(CONNECT_FAILED);
+  const extra = Object.keys(d.connectFailed.all).filter((code) => !failed.includes(code));
+  return el(
+    "div",
+    { class: "blocks", style: "margin-top:12px" },
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "전화 알림"),
+      el(
+        "div",
+        { class: "grid" },
+        card(
+          "보냈는데 안 울림",
+          pct(d.notRung),
+          `${frac(d.notRung)}통화`,
+          "알림을 보낸 통화 중 받는 사람 앱이 울림 화면 기록을 남기지 않은 비율. 통화 시작 1시간이 지났고, 받는 사람 앱이 그 전에 이용 기록을 보낸 적이 있는 통화만 셈",
+        ),
+      ),
+      el("p", { class: "muted", style: "margin-top:12px" }, "알림 결과 (이 기록을 넣은 뒤의 통화, 한 통화에 기기 하나라도 보내지면 「보냄」)"),
+      table(
+        ["결과", "통화"],
+        Object.keys(PUSH).map((key) =>
+          el("tr", {}, el("td", {}, PUSH[key]), el("td", {}, fmt(d.pushResults[key]))),
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "통화 연결 실패 (앱 기록)"),
+      table(
+        ["까닭", "전체", "최근 7일"],
+        [...failed, ...extra].map((code) =>
+          el(
+            "tr",
+            {},
+            el("td", {}, CONNECT_FAILED[code] || code),
+            el("td", {}, fmt(d.connectFailed.all[code] || 0)),
+            el("td", {}, fmt(d.connectFailed.last7d[code] || 0)),
+          ),
+        ),
+      ),
+      el("p", { class: "muted" }, "건 쪽·받는 쪽 앱이 통화 연결이 실패로 끝났을 때 남긴 기록 수"),
+    ),
+  );
 }
 
 function renderFeatures(s) {
@@ -338,20 +541,97 @@ function renderFeatures(s) {
         CONDITION,
       ),
     ),
+    renderHealthLink(s.healthLink),
+  ];
+}
+
+function renderHealthLink(h) {
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "건강 앱 연결 결과 (앱 기록)"),
+    table(
+      ["결과", "사람 iPhone", "사람 Android", "건수 iPhone", "건수 Android"],
+      h.results.map((row) =>
+        el(
+          "tr",
+          {},
+          el("td", {}, HEALTH_RESULT[row.code] || row.code),
+          el("td", {}, fmt(row.people.IOS)),
+          el("td", {}, fmt(row.people.ANDROID)),
+          el("td", {}, fmt(row.events.IOS)),
+          el("td", {}, fmt(row.events.ANDROID)),
+        ),
+      ),
+    ),
+    el(
+      "p",
+      { class: "muted" },
+      `사람 ${fmt(h.people)}명 · 건수 ${fmt(h.events)}건. 사람 = 그 사람이 가장 최근에 남긴 결과(그때 기기)로 한 번만 셈, 건수 = 연결을 시도할 때마다 남은 기록 수. iPhone 은 읽기 권한 허용 여부를 알 수 없어 「권한 거부」를 보내지 않습니다.`,
+    ),
+  );
+}
+
+function renderSignup(g) {
+  return [
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "가입 흐름 (사람 수)"),
+      table(
+        ["단계", "사람", "가입 대비"],
+        [
+          el("tr", {}, el("td", {}, "가입 완료"), el("td", {}, fmt(g.signedUp)), el("td", {}, g.signedUp ? "100%" : "–")),
+          ...FUNNEL.map(([key, label]) =>
+            el("tr", {}, el("td", {}, label), el("td", {}, fmt(g.stages[key].n)), el("td", {}, pct(g.stages[key]))),
+          ),
+        ],
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        `단계마다 그 단계를 한 가입자를 따로 셉니다(초대를 받아 들어온 사람은 「초대 만듦」을 거치지 않음). 안드로이드 가입 단계에서 멈춘 ${fmt(g.loginOnly)}명은 「가입 완료」에 없습니다.`,
+      ),
+      el("ul", { class: "defs" }, FUNNEL.map(([, label, def]) => el("li", {}, `${label}: ${def}`))),
+    ),
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "가입 단계 화면 기록 (건수)"),
+      table(
+        ["단계", "iPhone", "Android", "합계", "그중 로그인 전"],
+        g.onboardingSteps.map((row) =>
+          el(
+            "tr",
+            {},
+            el("td", {}, ONBOARDING[row.step] || row.step),
+            el("td", {}, fmt(row.IOS)),
+            el("td", {}, fmt(row.ANDROID)),
+            el("td", {}, fmt(row.IOS + row.ANDROID)),
+            el("td", {}, fmt(row.anonymous)),
+          ),
+        ),
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        "앱이 단계 화면에 처음 들어올 때 설치마다 단계당 한 번 남기는 기록 수입니다. 로그인 전 기록은 인증 없는 주소로 오는 익명 기록이라 누가 보냈는지 검증할 수 없는 건수입니다(사람 수가 아님, 모든 기기 합쳐 10분에 200건까지만 받음). 팀·시험 계정 빼기가 적용되지 않으며 「가입일 이후」는 기록 날짜로 거릅니다. 앱마다 있는 단계만 기록됩니다.",
+      ),
+    ),
   ];
 }
 
 function renderPeople(s) {
   const p = s.people;
-  return el(
+  return [...renderSignup(s.signup), el(
     "div",
-    { class: "blocks" },
+    { class: "blocks", style: "margin-top:12px" },
     bars("마지막으로 쓴 기기", p.platform, "가입자 기준", PLATFORM),
     bars("로그인 방식", p.login, "가입자 기준"),
     bars("부모 연령대", p.parentAge, "가입 때 적은 생년월일"),
     bars("자녀 연령대", p.childAge, "가입 때 적은 생년월일"),
     bars("성별", p.gender, "가입자 기준", GENDER),
-  );
+  )];
 }
 
 function renderWeekly(s) {
@@ -389,6 +669,57 @@ function renderWeekly(s) {
     ),
     el("p", { class: "muted" }, "막대 = 받은 통화. 이번 주는 아직 진행 중"),
   );
+}
+
+function renderCohorts(s) {
+  const groups = s.cohorts.groups;
+  const rows = [
+    ["그룹 사람", (g) => `${fmt(g.people)}명`],
+    ["최근 7일 통화한 사람", (g) => `${pct(g.calledLast7d)} (${frac(g.calledLast7d)})`],
+    ["통화 없는 날 리포트를 연 사람", (g) => `${pct(g.reportOnNoCallDay)} (${frac(g.reportOnNoCallDay)})`],
+    ["추천 질문 「써 봤다」", (g) => `${pct(g.questionUsed)} (${frac(g.questionUsed)})`],
+  ];
+  return [
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "테스트 그룹 비교"),
+      table(
+        ["", ...groups.map((g) => cohortName(g.cohort))],
+        rows.map(([label, pick]) => el("tr", {}, el("td", {}, label), groups.map((g) => el("td", {}, pick(g))))),
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        "그룹은 「계정」 탭에서 정합니다(앱에는 보이지 않음). 팀·시험 계정은 빠집니다. 통화 = 상대가 받아 연결된 통화. 리포트 = 그 사람에게 받은 통화가 없던 날(한국 날짜)에 리포트 화면을 연 기록이 하나라도 있는 사람. 추천 질문 = 통화 뒤 질문에 「써 봤어요」라고 답한 수 / 전체 답((사람, 통화)마다 가장 최근 답 하나만 셈). 이용 기록(리포트 보기·통화 뒤 답·앱 열기)은 최근 9주(주별 표 8주와 한 주 여유) 것만 봅니다.",
+      ),
+    ),
+    el(
+      "div",
+      { class: "blocks", style: "margin-top:12px" },
+      groups.map((g) =>
+        el(
+          "div",
+          { class: "block" },
+          el("h2", {}, `${cohortName(g.cohort)} · 주별 (${fmt(g.people)}명)`),
+          table(
+            ["주", "통화", "사람당 통화", "앱 연 사람"],
+            g.weekly.map((w) =>
+              el(
+                "tr",
+                {},
+                el("td", {}, w.week.slice(5).replace("-", ".") + " 주"),
+                el("td", {}, fmt(w.calls)),
+                el("td", {}, w.callsPerPerson ?? "–"),
+                el("td", {}, fmt(w.activeUsers)),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    el("p", { class: "muted", style: "margin-top:8px" }, "주 = 월요일 시작, 한국 시간. 통화 = 그룹 사람이 한쪽이라도 낀 통화 수, 사람당 통화 = 그룹 사람 각자의 통화 수 합 ÷ 그룹 사람, 앱 연 사람 = 그 주에 앱을 연 기록이 있는 사람. 이번 주는 아직 진행 중"),
+  ];
 }
 
 function renderAccounts() {
@@ -431,6 +762,33 @@ function renderAccounts() {
               }
             },
           });
+          const group = el(
+            "select",
+            {
+              class: "cohort",
+              "aria-label": "테스트 그룹",
+              onchange: async () => {
+                group.disabled = true;
+                try {
+                  await api(`/ops/api/accounts/${encodeURIComponent(a.id)}/cohort`, {
+                    method: "PUT",
+                    body: JSON.stringify({ cohort: group.value || null }),
+                  });
+                  a.cohort = group.value || null;
+                  state.summary = null;
+                } catch (error) {
+                  group.value = a.cohort || "";
+                  showStatus(`바꾸지 못했습니다 (${error.message})`);
+                } finally {
+                  group.disabled = false;
+                }
+              },
+            },
+            el("option", { value: "" }, "미정"),
+            el("option", { value: "AWARE" }, "인지"),
+            el("option", { value: "UNAWARE" }, "비인지"),
+          );
+          group.value = a.cohort || "";
           return el(
             "tr",
             { class: a.internal ? "internal" : null },
@@ -441,6 +799,7 @@ function renderAccounts() {
             el("td", {}, kst(a.createdAt)),
             el("td", {}, kst(a.lastSeenAt, true)),
             el("td", {}, fmt(a.connectedCalls)),
+            el("td", {}, group),
             el("td", {}, box),
           );
         }),
@@ -454,7 +813,7 @@ function renderAccounts() {
     el(
       "p",
       { class: "muted" },
-      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다.",
+      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다. 그룹(인지·비인지)은 「그룹」 탭 표에만 쓰이고 앱에는 보이지 않습니다.",
     ),
     filter,
     el(
@@ -469,7 +828,7 @@ function renderAccounts() {
           el(
             "tr",
             {},
-            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "팀·시험"].map((h, i) =>
+            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "그룹", "팀·시험"].map((h, i) =>
               el("th", { class: i < 4 ? "left" : null }, h),
             ),
           ),
@@ -505,6 +864,7 @@ function render() {
     features: renderFeatures,
     people: renderPeople,
     weekly: renderWeekly,
+    cohorts: renderCohorts,
   };
   panel.replaceChildren(...[views[state.tab](s)].flat());
 }
@@ -529,6 +889,20 @@ function summaryText(s) {
     `- 통화 연결률 ${pct(c.all.connected)} (${frac(c.all.connected)}), 분석 완료율 ${pct(c.all.analyzed)} (${frac(c.all.analyzed)})`,
     `- 통화 시간 중앙값 ${minutes(c.durationSec.median)}`,
     `- 리포트 발행 ${fmt(x.reportsIssued)}회, 건강 앱 연동 ${pct(x.healthLinked)} (${frac(x.healthLinked)}명)`,
+    `- 전화 알림 보냈는데 안 울림 ${pct(s.delivery.notRung)} (${frac(s.delivery.notRung)}통화)`,
+    `- 가입 흐름(가입 완료 ${fmt(s.signup.signedUp)}명 기준): ${FUNNEL.map(([key, label]) => `${label} ${fmt(s.signup.stages[key].n)}명`).join(", ")}`,
+    `- 건강 앱 연결 결과(사람, 가장 최근 결과 기준): ${s.healthLink.results.map((r) => `${HEALTH_RESULT[r.code] || r.code} ${fmt(r.people.IOS + r.people.ANDROID)}명`).join(", ")} (건수 ${fmt(s.healthLink.events)}건)`,
+    `- 분석 품질: 추출 없이 분석 완료 ${pct(s.quality.analyzedWithoutExtraction)} (${frac(s.quality.analyzedWithoutExtraction)}통화), 휴지 비율 측정 불가 ${pct(s.quality.pauseUnmeasurable)} (${frac(s.quality.pauseUnmeasurable)}통화), 말이 짧아 분석 제외 ${pct(s.quality.shortSpeechExcluded)} (${frac(s.quality.shortSpeechExcluded)}통화), 처리 오류 ${Object.entries(s.quality.processingErrors.all).map(([k, n]) => `${PROCESSING_ERROR[k] || k} ${fmt(n)}`).join(", ") || "없음"}`,
+    ...(s.aiUsage.months.length
+      ? s.aiUsage.months.map(
+          (m) =>
+            `- AI 사용량 ${m.month} (사용량 기록 통화 ${fmt(m.calls)}건): 음성 인식 ${fmt(m.sttAudioSec.total)}초 (통화당 ${fmt(m.sttAudioSec.perCall)}초), Gemini 입력 ${fmt(m.geminiInputTokens.total)}토큰 (통화당 ${fmt(m.geminiInputTokens.perCall)}), 출력 ${fmt(m.geminiOutputTokens.total)}토큰 (통화당 ${fmt(m.geminiOutputTokens.perCall)}, 그중 생각 ${fmt(m.geminiThoughtTokens.total)}), 질문 음성 ${fmt(m.ttsCharacters.total)}자 (통화당 ${fmt(m.ttsCharacters.perCall)}, 값 없음 ${fmt(m.ttsCharacters.unknown)}건)`,
+        )
+      : ["- AI 사용량: 아직 기록 없음"]),
+    ...s.cohorts.groups.map(
+      (g) =>
+        `- ${cohortName(g.cohort)} 그룹 ${fmt(g.people)}명: 최근 7일 통화 ${pct(g.calledLast7d)}, 통화 없는 날 리포트 연 사람 ${pct(g.reportOnNoCallDay)}, 추천 질문 「써 봤다」 ${pct(g.questionUsed)} (${frac(g.questionUsed)})`,
+    ),
   ].join("\n");
 }
 
@@ -576,9 +950,10 @@ document.addEventListener("DOMContentLoaded", () => {
       headers: { "X-Ops-Code": code },
       cache: "no-store",
     });
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       $("login-error").hidden = false;
-      $("login-error").textContent = "접속 코드가 맞지 않습니다";
+      $("login-error").textContent =
+        response.status === 403 ? "이 접속 코드로는 지표 화면을 볼 수 없습니다" : "접속 코드가 맞지 않습니다";
       return;
     }
     storage("set", code);

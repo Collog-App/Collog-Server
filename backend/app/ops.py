@@ -9,48 +9,98 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
 from collections import Counter, defaultdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from statistics import mean, median
+from types import SimpleNamespace
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import (
+    AcousticFeature,
+    AppEvent,
     CallRecord,
     CallState,
     ChangeSignal,
+    ConsentDecision,
+    ConsentRecord,
     Device,
     Family,
     FamilyMember,
     HealthDailySummary,
+    HealthExtraction,
     HealthLinkConsent,
     HealthLinkDecision,
+    Metric,
     OpsAccountFlag,
+    OpsCohort,
     ParentProfile,
+    PushResult,
     RefreshSession,
     Report,
     TodoItem,
+    Transcript,
     User,
     UserRole,
 )
 from app.security import SessionDep
+from app.services import usage
+from app.services.livekit import LiveKitError, LiveKitGateway
 
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 STATIC = Path(__file__).with_name("ops_static")
 TREND_WEEKS = 12
+COHORT_WEEKS = 8
+COHORTS: tuple[str | None, ...] = (OpsCohort.AWARE.value, OpsCohort.UNAWARE.value, None)
+# 이용 기록은 요약 화면에서만 읽는다(load_events). 그룹 표가 읽는 줄(앱 열기·리포트 보기·통화 뒤
+# 답)은 주별 표 범위에 한 주 여유를 둔 기간만, 나머지는 SQL 로 묶어서 센다. 지표 설명 기록은 아직
+# 화면에 없다.
+COHORT_EVENTS = ("app_open", "report_view")
+COHORT_EVENT_WINDOW = timedelta(weeks=COHORT_WEEKS + 1)
+# 가입 단계 화면(onboarding_step 코드)을 앱 흐름 순서로. 이용 기록 약속 문서와 같다.
+ONBOARDING_STEPS = ("WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
+                    "INVITE_CODE", "DONE")
+PLATFORMS = ("IOS", "ANDROID")
+HEALTH_LINK_RESULTS = ("CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS")
+# 분석 처리가 calls.processing_error 에 남기는 문구(services/pipeline.py) → 종류. 모르는 문구는
+# OTHER 로만 보이고 원문은 화면·응답에 내보내지 않는다.
+PROCESSING_ERROR_KINDS = {
+    "Analysis retry pending": "RETRY_PENDING",
+    "Analysis failed": "ANALYSIS_ERROR",
+    "Analysis retry limit or audio retention limit reached": "RETRY_LIMIT",
+    "부모 Egress 녹음이 완료되지 않았습니다": "PARENT_RECORDING_MISSING",
+    "Raw audio upload expired": "RAW_UPLOAD_EXPIRED",
+    "Audio retention limit reached": "AUDIO_EXPIRED",
+}
+# 휴지 비율 정의가 바뀌어(0018) 옛 값을 지운 표시. 측정하지 못한 것이 아니므로 비율에서 뺀다.
+PAUSE_DEFINITION_CHANGED = "DEFINITION_CHANGED"
+AI_USAGE_MONTHS = 12
+# 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
+# 시작되고 이만큼 지난 통화만 센다.
+RING_REPORT_GRACE = timedelta(hours=1)
+
+# 이 이름표의 접속 코드는 장애 알림(/ops/api/alerts)만 열 수 있다(바깥 감시 작업용).
+ALERTS_ONLY_LABELS = frozenset({"monitor"})
+# 장애 알림 기준
+LIVEKIT_TIMEOUT_SECONDS = 5
+# 원음 업로드 대기(15분) + 처리 제한 시간(10분) + 재시도를 넘겨야 정말 밀린 것으로 본다
+ANALYSIS_BACKLOG_AFTER = timedelta(minutes=30)
+FAILURE_STREAK = 3
+FAILURE_STREAK_WITHIN = timedelta(hours=24)
 
 router = APIRouter(include_in_schema=False)
 
@@ -75,7 +125,7 @@ def enabled_settings(request: Request) -> Settings:
     return settings
 
 
-def require_operator(
+def require_alert_reader(
     request: Request,
     x_ops_code: Annotated[str | None, Header()] = None,
 ) -> str:
@@ -85,7 +135,14 @@ def require_operator(
     return label
 
 
+def require_operator(label: Annotated[str, Depends(require_alert_reader)]) -> str:
+    if label in ALERTS_ONLY_LABELS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "이 접속 코드로는 볼 수 없습니다")
+    return label
+
+
 OperatorDep = Annotated[str, Depends(require_operator)]
+AlertReaderDep = Annotated[str, Depends(require_alert_reader)]
 
 
 # ---------------------------------------------------------------- 계산 도우미
@@ -159,6 +216,20 @@ class Dataset:
         self.todos: list[Any] = []
         self.profiles: list[Any] = []
         self.signals: list[Any] = []
+        self.cohorts: dict[str, str] = {}
+        # 이용 기록(load_events): 그룹 표·「안 울림」이 쓰는 줄, 집계된 건수
+        self.events: list[Any] = []
+        self.first_event: dict[str, datetime] = {}
+        self.connect_failed: list[Any] = []
+        self.onboarding: list[Any] = []
+        self.health_counts: list[Any] = []
+        self.health_latest: list[Any] = []
+        self.pushes: list[Any] = []
+        self.consent_latest: dict[str, str] = {}
+        self.inviters: set[str] = set()
+        self.extraction_status: dict[str, str] = {}
+        self.short_speech: set[str] = set()
+        self.pause_ratio: dict[str, Any] = {}
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -195,6 +266,14 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             select(OpsAccountFlag.user_id).where(OpsAccountFlag.internal.is_(True))
         )
     )
+    data.cohorts = {
+        row.user_id: row.cohort
+        for row in await session.execute(
+            select(OpsAccountFlag.user_id, OpsAccountFlag.cohort).where(
+                OpsAccountFlag.cohort.is_not(None)
+            )
+        )
+    }
 
     latest_device: dict[str, datetime] = {}
     for row in await session.execute(select(Device.user_id, Device.platform, Device.created_at)):
@@ -224,6 +303,8 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
 
     call_rows = await session.execute(
         select(
+            CallRecord.id,
+            CallRecord.processing_error,
             CallRecord.parent_id,
             CallRecord.child_id,
             CallRecord.caller_id,
@@ -236,6 +317,7 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             CallRecord.report_notified_at,
             CallRecord.ended_at,
             CallRecord.analysis_timing,
+            CallRecord.ai_usage,
         )
     )
     for row in call_rows:
@@ -245,7 +327,52 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             data.touch(row.parent_id, row.accepted_at)
             data.touch(row.child_id, row.accepted_at)
 
-    data.reports = list(await session.execute(select(Report.parent_id, Report.issued_at)))
+    data.reports = list(
+        await session.execute(select(Report.parent_id, Report.issued_at, Report.state))
+    )
+
+    # 분석 품질: 결과의 상태·이유 코드만 읽는다(추출 내용·전사·수치는 읽지 않음)
+    data.extraction_status = {
+        row.call_id: row.parse_status
+        for row in await session.execute(
+            select(HealthExtraction.call_id, HealthExtraction.parse_status)
+        )
+    }
+    data.short_speech = set(
+        await session.scalars(
+            select(Transcript.call_id).where(
+                Transcript.exclusion_reason == "INSUFFICIENT_PARENT_SPEECH"
+            )
+        )
+    )
+    data.pause_ratio = {
+        row.call_id: row
+        for row in await session.execute(
+            select(
+                AcousticFeature.call_id,
+                AcousticFeature.status,
+                AcousticFeature.unmeasurable_reason,
+            ).where(AcousticFeature.metric == Metric.PAUSE_RATIO.value)
+        )
+    }
+
+    # 외부 AI 동의: 사람마다 마지막 선택(문서 판과 상관없이)
+    consent_at: dict[str, datetime] = {}
+    for row in await session.execute(
+        select(ConsentRecord.user_id, ConsentRecord.decision, ConsentRecord.agreed_at)
+    ):
+        at = aware(row.agreed_at)
+        if row.user_id not in consent_at or at > consent_at[row.user_id]:
+            consent_at[row.user_id] = at
+            data.consent_latest[row.user_id] = row.decision
+    # 초대한 사람은 남기지 않으므로 초대 줄(구성원)이 있는 가족을 만든 사람으로 본다
+    data.inviters = set(
+        await session.scalars(
+            select(Family.created_by)
+            .join(FamilyMember, FamilyMember.family_id == Family.id)
+            .distinct()
+        )
+    )
 
     latest_consent: dict[str, tuple[datetime, int, str]] = {}
     for row in await session.execute(
@@ -299,7 +426,146 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             select(ChangeSignal.parent_id, ChangeSignal.promoted, ChangeSignal.acute)
         )
     )
+
+    data.pushes = [
+        row
+        for row in await session.execute(
+            select(
+                CallRecord.id,
+                CallRecord.parent_id,
+                CallRecord.child_id,
+                CallRecord.caller_id,
+                CallRecord.started_at,
+                CallRecord.incoming_push,
+            )
+        )
+        if row.incoming_push
+    ]
     return data
+
+
+async def load_events(
+    session: AsyncSession, data: Dataset, *, now: datetime, since: date | None
+) -> None:
+    """요약 화면이 쓰는 이용 기록. 표를 통째로 읽지 않고 기간을 묶거나 SQL 로 센다.
+
+    이용 기록은 「마지막 사용」 계산(last_seen)에 넣지 않는다. 기존 지표가 그대로 남게 한다.
+    """
+    window = now - COHORT_EVENT_WINDOW
+    signed_in = AppEvent.user_id.is_not(None)
+    data.events = list(
+        await session.execute(
+            select(
+                AppEvent.user_id,
+                AppEvent.name,
+                AppEvent.code,
+                AppEvent.call_id,
+                AppEvent.occurred_at,
+            ).where(signed_in, AppEvent.name.in_(COHORT_EVENTS), AppEvent.occurred_at >= window)
+        )
+    )
+    # 통화 뒤 답은 (사용자, 통화)마다 가장 최근 답 하나만
+    answered = (
+        select(
+            AppEvent.user_id, AppEvent.call_id, func.max(AppEvent.occurred_at).label("at")
+        )
+        .where(
+            signed_in,
+            AppEvent.name == "post_call_answer",
+            AppEvent.call_id.is_not(None),
+            AppEvent.occurred_at >= window,
+        )
+        .group_by(AppEvent.user_id, AppEvent.call_id)
+        .subquery()
+    )
+    answers: dict[tuple[str, str], Any] = {}
+    for row in await session.execute(
+        select(
+            AppEvent.user_id, AppEvent.name, AppEvent.code, AppEvent.call_id, AppEvent.occurred_at
+        ).join(
+            answered,
+            and_(
+                AppEvent.user_id == answered.c.user_id,
+                AppEvent.call_id == answered.c.call_id,
+                AppEvent.occurred_at == answered.c.at,
+            ),
+        ).where(AppEvent.name == "post_call_answer")
+    ):
+        answers.setdefault((row.user_id, row.call_id), row)
+    data.events += answers.values()
+    # 「안 울림」: 받는 사람 앱이 울림 기록을 남긴 (사용자, 통화). 통화마다 많아야 두 줄이다.
+    data.events += [
+        SimpleNamespace(
+            user_id=row.user_id, name="incoming_call_shown", code=None, call_id=row.call_id,
+            occurred_at=row.first,
+        )
+        for row in await session.execute(
+            select(
+                AppEvent.user_id, AppEvent.call_id, func.min(AppEvent.occurred_at).label("first")
+            )
+            .where(
+                signed_in, AppEvent.name == "incoming_call_shown", AppEvent.call_id.is_not(None)
+            )
+            .group_by(AppEvent.user_id, AppEvent.call_id)
+        )
+    ]
+    data.first_event = {
+        row.user_id: aware(row.first)
+        for row in await session.execute(
+            select(AppEvent.user_id, func.min(AppEvent.occurred_at).label("first"))
+            .where(signed_in)
+            .group_by(AppEvent.user_id)
+        )
+    }
+    data.connect_failed = list(
+        await session.execute(
+            select(
+                AppEvent.user_id,
+                AppEvent.code,
+                func.count().label("total"),
+                func.sum(
+                    case((AppEvent.occurred_at >= now - timedelta(days=7), 1), else_=0)
+                ).label("recent"),
+            )
+            .where(signed_in, AppEvent.name == "call_connect_failed")
+            .group_by(AppEvent.user_id, AppEvent.code)
+        )
+    )
+
+    # 가입 단계: 로그인 뒤 줄은 사람·단계·플랫폼별로, 익명 줄은 단계·플랫폼별로 센다.
+    # 익명 줄은 계정이 없어 「가입일 이후」를 기록 시각(그 날 한국 시간 0시부터)으로 거른다.
+    steps = (
+        select(AppEvent.user_id, AppEvent.code, AppEvent.platform, func.count().label("n"))
+        .where(AppEvent.name == "onboarding_step")
+        .group_by(AppEvent.user_id, AppEvent.code, AppEvent.platform)
+    )
+    if since is not None:
+        start = datetime.combine(since, time.min, tzinfo=KST).astimezone(UTC)
+        steps = steps.where(or_(signed_in, AppEvent.occurred_at >= start))
+    data.onboarding = list(await session.execute(steps))
+
+    data.health_counts = list(
+        await session.execute(
+            select(AppEvent.user_id, AppEvent.code, AppEvent.platform, func.count().label("n"))
+            .where(signed_in, AppEvent.name == "health_link_result")
+            .group_by(AppEvent.user_id, AppEvent.code, AppEvent.platform)
+        )
+    )
+    linked = (
+        select(AppEvent.user_id, func.max(AppEvent.occurred_at).label("at"))
+        .where(signed_in, AppEvent.name == "health_link_result")
+        .group_by(AppEvent.user_id)
+        .subquery()
+    )
+    latest: dict[str, Any] = {}
+    for row in await session.execute(
+        select(AppEvent.user_id, AppEvent.code, AppEvent.platform).join(
+            linked,
+            and_(AppEvent.user_id == linked.c.user_id, AppEvent.occurred_at == linked.c.at),
+        ).where(AppEvent.name == "health_link_result")
+    ):
+        latest.setdefault(row.user_id, row)
+    data.health_latest = list(latest.values())
 
 
 # ---------------------------------------------------------------- 지표
@@ -560,9 +826,338 @@ def build_accounts(data: Dataset) -> list[dict[str, Any]]:
             "lastSeenAt": data.last_seen.get(row.id, aware(row.created_at)).isoformat(),
             "connectedCalls": calls[row.id],
             "internal": row.id in data.internal,
+            "cohort": data.cohorts.get(row.id),
         }
         for row in rows
     ]
+
+
+def build_cohorts(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """테스트 그룹(인지·비인지·미정)별 통화·리포트·추천 질문·앱 사용.
+
+    그룹 사람은 build_summary 의 가입 완료 사용자와 같은 기준(팀·시험 계정과 안드로이드 가입
+    단계에서 멈춘 계정은 뺌)이고, 통화는 받아 연결된 통화만 센다.
+    """
+    keep = included_users(data, include_internal=include_internal, since=since)
+    signed = {uid for uid in keep if data.users[uid].nickname or not data.users[uid].google}
+    this_week = week_start(now.astimezone(KST).date())
+    weeks = [this_week - timedelta(weeks=i) for i in range(COHORT_WEEKS - 1, -1, -1)]
+    ago7 = now - timedelta(days=7)
+
+    calls: list[tuple[date, set[str]]] = []
+    call_times: dict[str, list[datetime]] = defaultdict(list)
+    for call in data.calls:
+        if call.accepted_at is None or call.parent_id not in keep or call.child_id not in keep:
+            continue
+        at = aware(call.accepted_at)
+        calls.append((week_start(kst_day(at)), {call.parent_id, call.child_id}))
+        for uid in (call.parent_id, call.child_id):
+            call_times[uid].append(at)
+    events: dict[str, list[Any]] = defaultdict(list)
+    for event in data.events:
+        if event.user_id in signed:
+            events[event.user_id].append(event)
+
+    groups = []
+    for cohort in COHORTS:
+        members = {uid for uid in signed if data.cohorts.get(uid) == cohort}
+        people = len(members)
+        called7d = {uid for uid in members if any(at >= ago7 for at in call_times[uid])}
+        # 그 사람에게 받은 통화가 없던 한국 날짜에 리포트를 연 적이 있는가
+        reopened = set()
+        for uid in members:
+            call_days = {kst_day(at) for at in call_times[uid]}
+            if any(
+                e.name == "report_view" and kst_day(e.occurred_at) not in call_days
+                for e in events[uid]
+            ):
+                reopened.add(uid)
+        answers = [e.code for uid in members for e in events[uid] if e.name == "post_call_answer"]
+        weekly = []
+        for week in weeks:
+            in_week = [pair for start, pair in calls if start == week and pair & members]
+            active = {
+                uid
+                for uid in members
+                for e in events[uid]
+                if e.name == "app_open" and week_start(kst_day(e.occurred_at)) == week
+            }
+            weekly.append({
+                "week": week.isoformat(),
+                "calls": len(in_week),
+                "callsPerPerson": (
+                    round(sum(len(pair & members) for pair in in_week) / people, 2)
+                    if people else None
+                ),
+                "activeUsers": len(active),
+            })
+        groups.append({
+            "cohort": cohort,
+            "people": people,
+            "calledLast7d": ratio(len(called7d), people),
+            "reportOnNoCallDay": ratio(len(reopened), people),
+            "questionUsed": ratio(answers.count("YES"), len(answers)),
+            "weekly": weekly,
+        })
+    return {"weeks": [week.isoformat() for week in weeks], "groups": groups}
+
+
+def build_delivery(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """전화 알림 결과와 「보냈는데 안 울림」, 통화 연결 실패 코드.
+
+    「안 울림」은 알림을 성공으로 보낸 통화 가운데 받는 사람 앱이 울림 기록
+    (incoming_call_shown)을 남기지 않은 비율이다. 알림 결과를 남기기 시작한 뒤의 통화만, 그리고
+    받는 사람 앱이 그 통화 전에 이용 기록을 보낸 적이 있는 통화만 센다(기록을 보내지 않는 옛
+    앱이 안 울림으로 잡히지 않게).
+    """
+    keep = included_users(data, include_internal=include_internal, since=since)
+    shown = {
+        (e.user_id, e.call_id) for e in data.events if e.name == "incoming_call_shown" and e.call_id
+    }
+    results: Counter[str] = Counter()
+    pushed = not_rung = 0
+    for row in data.pushes:
+        if row.parent_id not in keep or row.child_id not in keep:
+            continue
+        result = row.incoming_push.get("result")
+        results[result] += 1
+        started = aware(row.started_at)
+        if result != PushResult.SENT.value or started > now - RING_REPORT_GRACE:
+            continue
+        caller = row.caller_id or row.child_id
+        callee = row.child_id if caller == row.parent_id else row.parent_id
+        rang = (callee, row.id) in shown
+        first = data.first_event.get(callee)
+        if not rang and (first is None or first > started):
+            continue
+        pushed += 1
+        not_rung += not rang
+
+    # 연결 실패는 load_events 가 사람·코드별로 센 건수(전체, 최근 7일)를 더한다.
+    failed_all: Counter[str] = Counter()
+    failed_7d: Counter[str] = Counter()
+    for row in data.connect_failed:
+        if row.user_id in keep:
+            failed_all[row.code] += row.total
+            if row.recent:
+                failed_7d[row.code] += row.recent
+    return {
+        "pushResults": {item.value: results.get(item.value, 0) for item in PushResult},
+        "notRung": ratio(not_rung, pushed),
+        "connectFailed": {
+            "all": dict(failed_all.most_common()),
+            "last7d": dict(failed_7d.most_common()),
+        },
+    }
+
+
+def build_signup(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """가입 퍼널(단계마다 거기까지 온 사람 수)과 가입 단계 화면 기록 건수.
+
+    퍼널은 가입 완료 사용자(build_summary 와 같은 기준) 가운데 각 단계를 한 사람을 따로 센다.
+    초대를 받아 들어온 사람은 「초대 만듦」을 거치지 않으므로 앞 단계를 꼭 지나야 셈하지 않는다.
+    """
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    signed = {uid for uid in keep if data.users[uid].nickname or not data.users[uid].google}
+
+    connected: set[str] = set()
+    for _, members in data.family_users:
+        people = members & keep
+        if len(people) >= 2:
+            connected |= people
+    calls = [
+        c for c in data.calls
+        if c.accepted_at is not None and c.parent_id in keep and c.child_id in keep
+    ]
+    called = {uid for c in calls for uid in (c.parent_id, c.child_id)}
+    # 리포트는 분석 대상(부모 칸)마다 발행된다. 통화가 없어 빈 리포트(EMPTY)는 세지 않는다.
+    subjects = {r.parent_id for r in data.reports if r.state != "EMPTY"}
+    reported = subjects | {
+        uid for c in calls if c.parent_id in subjects for uid in (c.parent_id, c.child_id)
+    }
+
+    def reached(people: set[str]) -> dict[str, Any]:
+        return ratio(len(people & signed), len(signed))
+
+    steps: Counter[tuple[str, str]] = Counter()
+    anonymous: Counter[str] = Counter()
+    for row in data.onboarding:
+        if row.user_id is None:
+            # 익명 줄은 계정이 없어 팀·시험 계정을 가릴 수 없다(「가입일 이후」는 load_events 가
+            # 기록 날짜로 거름).
+            anonymous[row.code] += row.n
+        elif row.user_id not in keep:
+            continue
+        steps[(row.code, row.platform)] += row.n
+    return {
+        "signedUp": len(signed),
+        "loginOnly": len(keep - signed),
+        "stages": {
+            "consentGranted": reached({
+                uid for uid, decision in data.consent_latest.items()
+                if decision == ConsentDecision.GRANTED.value
+            }),
+            "consentDenied": reached({
+                uid for uid, decision in data.consent_latest.items()
+                if decision == ConsentDecision.DENIED.value
+            }),
+            "conditions": reached({p.parent_id for p in data.profiles}),
+            "inviteCreated": reached(data.inviters),
+            "connected": reached(connected),
+            "firstCall": reached(called),
+            "firstReport": reached(reported),
+        },
+        "onboardingSteps": [
+            {
+                "step": step,
+                **{platform: steps[(step, platform)] for platform in PLATFORMS},
+                "anonymous": anonymous[step],
+            }
+            for step in ONBOARDING_STEPS
+        ],
+    }
+
+
+def build_quality(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """분석 품질: 처리 오류 종류, 추출 없이 완료된 통화, 휴지 비율 측정 불가, 말이 짧은 통화."""
+    keep = included_users(data, include_internal=include_internal, since=since)
+    calls = [c for c in data.calls if c.parent_id in keep and c.child_id in keep]
+    ago30 = now - timedelta(days=30)
+
+    def error_kinds(rows: list[Any]) -> dict[str, int]:
+        return dict(
+            Counter(
+                PROCESSING_ERROR_KINDS.get(c.processing_error, "OTHER")
+                for c in rows
+                if c.processing_error
+            ).most_common()
+        )
+
+    analyzed = [c for c in calls if c.state == CallState.ANALYZED.value]
+    # 분석 완료인데 추출 결과 줄이 없거나 추출이 OK 가 아닌(FAILED 등) 통화
+    no_extraction = [c for c in analyzed if data.extraction_status.get(c.id) != "OK"]
+    pauses = [
+        data.pause_ratio[c.id]
+        for c in analyzed
+        if c.id in data.pause_ratio
+        and data.pause_ratio[c.id].unmeasurable_reason != PAUSE_DEFINITION_CHANGED
+    ]
+    unmeasurable = [p for p in pauses if p.status == "UNMEASURABLE"]
+    recorded = [c for c in calls if c.accepted_at is not None and c.recording_enabled]
+    short = [
+        c for c in recorded
+        if c.state == CallState.ANALYSIS_EXCLUDED.value and c.id in data.short_speech
+    ]
+    return {
+        "processingErrors": {
+            "all": error_kinds(calls),
+            "last30d": error_kinds([c for c in calls if aware(c.started_at) >= ago30]),
+        },
+        "analyzedWithoutExtraction": ratio(len(no_extraction), len(analyzed)),
+        "pauseUnmeasurable": ratio(len(unmeasurable), len(pauses)),
+        "pauseUnmeasurableReasons": dict(
+            Counter(p.unmeasurable_reason or "UNKNOWN" for p in unmeasurable).most_common()
+        ),
+        "shortSpeechExcluded": ratio(len(short), len(recorded)),
+    }
+
+
+def build_health_link(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """건강 앱 연결 시도 결과(health_link_result). 사람 수는 그 사람의 가장 최근 결과로 센다."""
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    latest = [row for row in data.health_latest if row.user_id in keep]
+    counted: Counter[tuple[str, str]] = Counter()
+    for row in data.health_counts:
+        if row.user_id in keep:
+            counted[(row.code, row.platform)] += row.n
+    people = Counter((row.code, row.platform) for row in latest)
+    return {
+        "people": len(latest),
+        "events": sum(counted.values()),
+        "results": [
+            {
+                "code": code,
+                "people": {platform: people[(code, platform)] for platform in PLATFORMS},
+                "events": {platform: counted[(code, platform)] for platform in PLATFORMS},
+            }
+            for code in HEALTH_LINK_RESULTS
+        ],
+    }
+
+
+def build_ai_usage(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """통화 시작 달(한국 시간)별 외부 AI 사용량 합계. 원화로 바꾸지 않고 공급자 단위 그대로.
+
+    칸마다 값이 있는 통화만 더하고 그 통화 수로 나눠 통화당 평균을 낸다. 공급자를 불렀지만
+    응답에 값이 없던 통화는 unknown 으로 따로 센다.
+    """
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    months: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for c in data.calls:
+        if isinstance(c.ai_usage, dict) and c.ai_usage and c.parent_id in keep \
+                and c.child_id in keep:
+            months[kst_day(c.started_at).strftime("%Y-%m")].append(c.ai_usage)
+
+    def total(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+        present = [r[key] for r in records if key in r]
+        known = [v for v in present if usage.number(v) is not None]
+        amount = sum(known)
+        return {
+            "total": round(amount, 1),
+            "calls": len(known),
+            "perCall": round(amount / len(known), 1) if known else None,
+            "unknown": len(present) - len(known),
+        }
+
+    return {
+        "months": [
+            {
+                "month": month,
+                "calls": len(months[month]),
+                **{key: total(months[month], key) for key in usage.USAGE_KEYS},
+            }
+            for month in sorted(months, reverse=True)[:AI_USAGE_MONTHS]
+        ]
+    }
 
 
 # ---------------------------------------------------------------- 경로
@@ -617,10 +1212,18 @@ async def ops_summary(
     settings: Settings = request.app.state.container.settings
     now = datetime.now(UTC)
     data = await load_dataset(session, settings)
+    await load_events(session, data, now=now, since=since)
     logger.info("ops summary viewed by %s", operator)
+    scope = {"now": now, "include_internal": internal, "since": since}
     return {
         "generatedAt": now.isoformat(),
-        **build_summary(data, now=now, include_internal=internal, since=since),
+        **build_summary(data, **scope),
+        "cohorts": build_cohorts(data, **scope),
+        "delivery": build_delivery(data, **scope),
+        "signup": build_signup(data, **scope),
+        "quality": build_quality(data, **scope),
+        "healthLink": build_health_link(data, **scope),
+        "aiUsage": build_ai_usage(data, **scope),
     }
 
 
@@ -653,3 +1256,101 @@ async def ops_mark_internal(
     await session.commit()
     logger.info("ops account %s internal=%s by %s", user_id, payload.internal, operator)
     return {"id": user_id, "internal": payload.internal}
+
+
+class CohortFlag(BaseModel):
+    cohort: OpsCohort | None
+
+
+@router.put("/ops/api/accounts/{user_id}/cohort")
+async def ops_set_cohort(
+    user_id: str, payload: CohortFlag, operator: OperatorDep, session: SessionDep
+) -> dict[str, Any]:
+    if await session.get(User, user_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "계정을 찾을 수 없습니다")
+    flag = await session.get(OpsAccountFlag, user_id)
+    if flag is None:
+        flag = OpsAccountFlag(user_id=user_id, internal=False)
+        session.add(flag)
+    cohort = payload.cohort.value if payload.cohort else None
+    flag.cohort = cohort
+    flag.updated_at = datetime.now(UTC)
+    await session.commit()
+    logger.info("ops account %s cohort=%s by %s", user_id, cohort, operator)
+    return {"id": user_id, "cohort": cohort}
+
+
+# ---------------------------------------------------------------- 장애 알림
+
+
+async def find_problems(
+    session: AsyncSession, livekit: LiveKitGateway, now: datetime
+) -> list[dict[str, str]]:
+    problems = []
+    try:
+        async with asyncio.timeout(LIVEKIT_TIMEOUT_SECONDS):
+            await livekit.check_reachable()
+    except (LiveKitError, TimeoutError):
+        logger.warning("ops alert: LiveKit check failed", exc_info=True)
+        problems.append({
+            "code": "LIVEKIT_UNREACHABLE",
+            "message": (
+                f"LiveKit 서버가 {LIVEKIT_TIMEOUT_SECONDS}초 안에 답하지 않습니다(통화 연결 불가)"
+            ),
+        })
+
+    # 녹음된 통화가 끝났는데 분석 대기(ENDED)나 분석 중(PROCESSING)에 오래 머물러 있다
+    waiting = await session.scalar(
+        select(func.count(CallRecord.id)).where(
+            CallRecord.recording_enabled.is_(True),
+            CallRecord.state.in_([CallState.ENDED.value, CallState.PROCESSING.value]),
+            CallRecord.ended_at <= now - ANALYSIS_BACKLOG_AFTER,
+        )
+    )
+    if waiting:
+        minutes = int(ANALYSIS_BACKLOG_AFTER.total_seconds() // 60)
+        problems.append({
+            "code": "ANALYSIS_BACKLOG",
+            "message": (
+                f"통화가 끝나고 {minutes}분 넘게 분석을 기다리는 통화가 {waiting}건 있습니다"
+            ),
+        })
+
+    # 분석이 끝난(완료·실패) 통화를 통화 끝난 시각 순으로 본다. 분석 제외(짧은 통화 등)는 건너뛴다.
+    latest = list(
+        await session.execute(
+            select(CallRecord.state, CallRecord.ended_at)
+            .where(
+                CallRecord.state.in_([CallState.ANALYZED.value, CallState.ANALYSIS_FAILED.value]),
+                CallRecord.ended_at.is_not(None),
+            )
+            .order_by(CallRecord.ended_at.desc())
+            .limit(FAILURE_STREAK)
+        )
+    )
+    if (
+        len(latest) == FAILURE_STREAK
+        and all(row.state == CallState.ANALYSIS_FAILED.value for row in latest)
+        and aware(latest[0].ended_at) >= now - FAILURE_STREAK_WITHIN
+    ):
+        problems.append({
+            "code": "ANALYSIS_FAILING",
+            "message": (
+                f"가장 최근에 분석이 끝난 통화 {FAILURE_STREAK}건이 모두 분석에 실패했습니다"
+            ),
+        })
+    return problems
+
+
+@router.get("/ops/api/alerts")
+async def ops_alerts(
+    request: Request, reader: AlertReaderDep, session: SessionDep
+) -> dict[str, Any]:
+    problems = await find_problems(
+        session, request.app.state.container.livekit, datetime.now(UTC)
+    )
+    if problems:
+        logger.warning(
+            "ops alerts checked by %s: %s", reader, ", ".join(p["code"] for p in problems)
+        )
+    return {"ok": not problems, "problems": problems}

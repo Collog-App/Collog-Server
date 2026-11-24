@@ -14,6 +14,7 @@ from app.schemas import (
     GeminiExtractionResponse,
     GeminiSummaryResponse,
 )
+from app.services import usage
 from app.services.guardrail import (
     adds_medical_claim,
     review_facts,
@@ -64,6 +65,8 @@ SUMMARY_INSTRUCTION = """
 SUMMARY_MAX_LENGTH = 200
 # 이보다 짧은 전사는 요약할 내용이 없다고 보고 모델을 부르지 않는다.
 SUMMARY_MIN_TRANSCRIPT_LENGTH = 10
+# 가짜 모드가 요청마다 돌려주는 사용량. 모델을 부르지 않으므로 기록 흐름을 확인하는 고정값이다.
+MOCK_USAGE_METADATA = {"promptTokenCount": 100, "candidatesTokenCount": 20, "thoughtsTokenCount": 5}
 
 TranscriptInput = str | list[dict[str, Any]]
 
@@ -184,6 +187,7 @@ class ExtractionGateway:
 class MockExtractionGateway(ExtractionGateway):
     async def extract(self, transcript: TranscriptInput) -> ExtractionPayload:
         segments = normalize_transcript_input(transcript)
+        usage.add_gemini(MOCK_USAGE_METADATA)
         categories = {
             "symptom": [
                 "기침",
@@ -237,6 +241,7 @@ class MockExtractionGateway(ExtractionGateway):
         segments = normalize_transcript_input(transcript)
         if len(transcript_text(segments)) < SUMMARY_MIN_TRANSCRIPT_LENGTH:
             return None
+        usage.add_gemini(MOCK_USAGE_METADATA)
         spoken = [
             item["text"] for item in segments if item["speaker"] == "PARENT" and item["text"]
         ]
@@ -296,6 +301,8 @@ class GeminiExtractionGateway(ExtractionGateway):
                 json=body,
             )
             payload = response.json()
+        # 답이 완성되지 않아도 토큰은 쓰였으므로 답을 읽기 전에 남긴다.
+        usage.add_gemini(payload.get("usageMetadata") if isinstance(payload, dict) else None)
         candidate = payload["candidates"][0]
         finish_reason = candidate.get("finishReason")
         if finish_reason not in (None, "STOP"):

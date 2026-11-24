@@ -126,6 +126,7 @@ button.wide { width: 100%; padding: 14px; font-size: 16px; }
 .block { background: var(--surface); border-radius: var(--radius); padding: 18px; margin-top: 12px; }
 .blocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .blocks .block { margin-top: 0; }
+.defs { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
 
 /* 막대 */
 .bars { display: grid; gap: 8px; }
@@ -141,8 +142,10 @@ th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: ri
 th:first-child, td:first-child { text-align: left; }
 th { color: var(--muted); font-weight: 600; font-size: 13px; }
 td.left, th.left { text-align: left; }
+.cell-sub { color: var(--muted); font-size: 12px; }
 tr.internal td { color: var(--muted); }
 .filter { width: 100%; max-width: 320px; margin-bottom: 10px; padding: 10px 12px; }
+select.cohort { font: inherit; color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 4px 8px; background: #fff; }
 
 @media (max-width: 560px) {
   .value { font-size: 28px; }

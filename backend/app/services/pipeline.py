@@ -25,6 +25,7 @@ from app.models import (
     RepeatEvent,
     Transcript,
 )
+from app.services import usage
 from app.services.acoustics import AcousticAnalysisInput, AcousticAnalyzer
 from app.services.deepgram import SttGateway, SttResult
 from app.services.domain import participants_consented
@@ -104,9 +105,11 @@ class ProcessingPipeline:
         async with lock:
             claimed_at = datetime.now(UTC)
             analyzed = False
+            spent: usage.Usage = {}
             try:
                 async with asyncio.timeout(self.settings.processing_timeout_seconds):
-                    analyzed = bool(await self._process(call_id, claimed_at))
+                    with usage.metering() as spent:
+                        analyzed = bool(await self._process(call_id, claimed_at))
             except Exception as error:
                 logger.exception("call processing failed", extra={"call_id": call_id})
                 if not await self.processing_allowed(call_id):
@@ -135,13 +138,31 @@ class ProcessingPipeline:
                         if not retry:
                             await self.purge_call_audio(call_id)
             finally:
-                self._locks.pop(call_id, None)
+                try:
+                    # 실패·재시도한 시도도 공급자 요금은 쓰였으므로 결과와 상관없이 더한다.
+                    await self.save_usage(call_id, spent)
+                finally:
+                    # 사용량 저장이 취소·실패해도 통화별 잠금은 반드시 치운다.
+                    self._locks.pop(call_id, None)
         # 알림은 처리 제한 시간과 통화별 잠금 밖에서 보낸다. 실패해도 주기 작업이 다시 시도한다.
         if analyzed and self.after_analyzed is not None:
             try:
                 await self.after_analyzed(call_id)
             except Exception:
                 logger.exception("post-analysis hook failed", extra={"call_id": call_id})
+
+    async def save_usage(self, call_id: str, spent: usage.Usage) -> None:
+        """분석 저장과 따로 남긴다. 실패해도 분석 결과에는 영향을 주지 않는다."""
+        if not spent:
+            return
+        try:
+            async with self.database.sessions() as session:
+                call = await session.get(CallRecord, call_id)
+                if call is not None:
+                    call.ai_usage = usage.merge(call.ai_usage, spent)
+                    await session.commit()
+        except Exception:
+            logger.exception("AI usage record failed", extra={"call_id": call_id})
 
     async def _process(self, call_id: str, claimed_at: datetime) -> bool | None:
         """분석을 끝까지 마쳐 ANALYZED로 저장했을 때만 True."""
