@@ -6,6 +6,7 @@ from app.services.acoustics import create_acoustic_analyzer
 from app.services.apple_auth import AppleIdentityVerifier
 from app.services.calls import CallLifecycle
 from app.services.deepgram import create_stt_gateway
+from app.services.events import EventRetention
 from app.services.fcm import create_android_push_gateways
 from app.services.gemini import create_extraction_gateway
 from app.services.google_auth import GoogleIdentityVerifier
@@ -37,6 +38,7 @@ class AppContainer:
         self.report_notifications = ReportNotifications(
             self.database, self.report_push, self.android_report_push
         )
+        self.event_retention = EventRetention(self.database)
         self.stt = create_stt_gateway(settings)
         self.extraction = create_extraction_gateway(settings)
         self.acoustics = create_acoustic_analyzer(settings)

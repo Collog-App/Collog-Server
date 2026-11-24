@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
+    AppEvent,
     AppleLoginChallenge,
     AssetKind,
     AudioAsset,
@@ -285,6 +286,16 @@ async def delete_account(
         ):
             await session.execute(delete(model).where(model.call_id.in_(call_ids)))
         await session.execute(delete(CallRecord).where(CallRecord.id.in_(call_ids)))
+        # 이용 기록: 이 사람의 줄은 지우고, 다른 사람 줄에 남은 이 사람·지운 통화 ID 는 비운다.
+        await session.execute(delete(AppEvent).where(AppEvent.user_id == user.id))
+        await session.execute(
+            update(AppEvent).where(AppEvent.subject_id == user.id).values(subject_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        await session.execute(
+            update(AppEvent).where(AppEvent.call_id.in_(call_ids)).values(call_id=None)
+            .execution_options(synchronize_session=False)
+        )
         # Reports and baselines can contain summaries derived from the deleted calls.
         for model in (Report, Baseline):
             await session.execute(delete(model).where(model.parent_id.in_(parent_ids)))

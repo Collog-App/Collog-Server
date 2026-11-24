@@ -1,0 +1,171 @@
+"""앱 이용 기록(app_events)의 받기 규칙과 보관 기간 정리.
+
+이벤트 이름·코드값은 서버·iOS·안드로이드가 함께 쓰는 약속(이용 기록 약속 문서)과 같아야 한다.
+모르는 이름·코드나 너무 옛·미래 시각은 오류로 돌려주지 않고 버린다. 앱은 4xx 를 받으면 묶음
+전체를 버리므로, 한 줄 때문에 나머지 기록을 잃지 않게 하려는 것이다.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import delete, func, or_, select
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import Database
+from app.models import AppEvent, CallRecord, Family, FamilyMember
+from app.schemas import AppEventIn
+from app.services.domain import connected_family_ids
+
+logger = logging.getLogger(__name__)
+
+# code 가 없는 이벤트는 None, 정해진 값만 받는 이벤트는 집합, 꼴만 보는 이벤트는 정규식.
+EVENT_CODES: dict[str, frozenset[str] | re.Pattern[str] | None] = {
+    "app_open": None,
+    "report_view": frozenset({"DIRECT", "NOTIFICATION"}),
+    "post_call_answer": frozenset({"YES", "NO", "NOT_SEEN"}),
+    "incoming_call_shown": None,
+    "call_connect_failed": frozenset({"MIC_PERMISSION", "NETWORK", "TOKEN", "SERVER", "OTHER"}),
+    "onboarding_step": frozenset({
+        "WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS", "INVITE_CODE", "DONE",
+    }),
+    "health_link_result": frozenset({"CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS"}),
+    "metric_help_open": re.compile(r"[A-Z0-9_]{1,40}"),
+}
+SUBJECT_EVENTS = frozenset({"report_view", "post_call_answer"})
+CALL_EVENTS = frozenset({"post_call_answer", "incoming_call_shown", "call_connect_failed"})
+ANONYMOUS_EVENTS = frozenset({"onboarding_step"})
+
+MAX_AGE = timedelta(days=30)
+MAX_AHEAD = timedelta(minutes=5)
+# 인증 없는 주소로 남는 줄의 상한. 넘치면 그 사이 익명 기록은 조용히 버린다.
+ANONYMOUS_WINDOW = timedelta(minutes=10)
+ANONYMOUS_WINDOW_LIMIT = 1_000
+
+RETENTION = timedelta(days=365)
+RETENTION_INTERVAL = timedelta(hours=1)
+
+
+def code_allowed(name: str, code: str | None) -> bool:
+    rule = EVENT_CODES[name]
+    if rule is None:
+        return code is None
+    if isinstance(rule, re.Pattern):
+        return code is not None and rule.fullmatch(code) is not None
+    return code in rule
+
+
+def utc(value: datetime) -> datetime:
+    return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+
+
+def accepted_row(
+    event: AppEventIn, *, user_id: str | None, now: datetime
+) -> dict[str, object] | None:
+    allowed_names = ANONYMOUS_EVENTS if user_id is None else EVENT_CODES
+    code = event.code or None
+    occurred_at = utc(event.at)
+    if (
+        event.name not in allowed_names
+        or not code_allowed(event.name, code)
+        or not now - MAX_AGE <= occurred_at <= now + MAX_AHEAD
+    ):
+        return None
+    signed_in = user_id is not None
+    return {
+        "id": str(event.id),
+        "user_id": user_id,
+        "name": event.name,
+        "code": code,
+        "subject_id": event.subject_id if signed_in and event.name in SUBJECT_EVENTS else None,
+        "call_id": event.call_id if signed_in and event.name in CALL_EVENTS else None,
+        "platform": event.platform,
+        "app_version": event.app_version,
+        "occurred_at": occurred_at,
+        "received_at": now,
+    }
+
+
+async def family_people_ids(session: AsyncSession, user_id: str) -> set[str]:
+    """본인과 같은 가족(만든 사람·초대를 수락한 구성원)의 사용자 ID."""
+    families = connected_family_ids(user_id)
+    members = await session.scalars(
+        select(FamilyMember.user_id).where(
+            FamilyMember.family_id.in_(families), FamilyMember.user_id.is_not(None)
+        )
+    )
+    owners = await session.scalars(select(Family.created_by).where(Family.id.in_(families)))
+    return {user_id, *members, *owners}
+
+
+async def store_events(
+    session: AsyncSession, events: Sequence[AppEventIn], *, user_id: str | None
+) -> int:
+    """규칙에 맞는 기록만 남기고 그 수를 돌려준다. 이미 받은 id 는 다시 쓰지 않는다."""
+    now = datetime.now(UTC)
+    rows: dict[str, dict[str, object]] = {}
+    for event in events:
+        row = accepted_row(event, user_id=user_id, now=now)
+        if row is not None:
+            rows.setdefault(str(row["id"]), row)
+    accepted = list(rows.values())
+
+    if user_id is not None:
+        if any(row["subject_id"] for row in accepted):
+            people = await family_people_ids(session, user_id)
+            for row in accepted:
+                if row["subject_id"] not in people:
+                    row["subject_id"] = None
+        call_ids = {row["call_id"] for row in accepted if row["call_id"]}
+        if call_ids:
+            own_calls = set(await session.scalars(
+                select(CallRecord.id).where(
+                    CallRecord.id.in_(call_ids),
+                    or_(CallRecord.parent_id == user_id, CallRecord.child_id == user_id),
+                )
+            ))
+            for row in accepted:
+                if row["call_id"] not in own_calls:
+                    row["call_id"] = None
+    elif accepted:
+        recent = await session.scalar(
+            select(func.count()).select_from(AppEvent).where(
+                AppEvent.user_id.is_(None), AppEvent.received_at >= now - ANONYMOUS_WINDOW
+            )
+        )
+        accepted = accepted[: max(0, ANONYMOUS_WINDOW_LIMIT - (recent or 0))]
+
+    if accepted:
+        dialect = (await session.connection()).dialect.name
+        insert = postgresql.insert if dialect == "postgresql" else sqlite.insert
+        await session.execute(
+            insert(AppEvent).values(accepted).on_conflict_do_nothing(index_elements=["id"])
+        )
+        await session.commit()
+    return len(accepted)
+
+
+class EventRetention:
+    """보관 기간(1년)이 지난 이용 기록을 지운다. 정기 작업이 자주 불러도 한 시간에 한 번만 돈다."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+        self._last_run: datetime | None = None
+
+    async def maintain(self) -> int:
+        now = datetime.now(UTC)
+        if self._last_run is not None and now - self._last_run < RETENTION_INTERVAL:
+            return 0
+        async with self.database.sessions() as session:
+            result = await session.execute(
+                delete(AppEvent).where(AppEvent.occurred_at < now - RETENTION)
+            )
+            await session.commit()
+        self._last_run = now
+        if result.rowcount:
+            logger.info("보관 기간이 지난 이용 기록 %d건을 지웠습니다", result.rowcount)
+        return result.rowcount

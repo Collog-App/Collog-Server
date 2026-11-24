@@ -55,6 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 container.pipeline.process_pending,
                 container.pipeline.purge_expired_audio,
                 container.report_notifications.maintain,
+                container.event_retention.maintain,
             )
         ]
         app.state.maintenance_tasks = tasks
