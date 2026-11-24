@@ -36,6 +36,10 @@ EVENT_CODES: dict[str, frozenset[str] | re.Pattern[str] | None] = {
     "health_link_result": frozenset({"CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS"}),
     "metric_help_open": re.compile(r"[A-Z0-9_]{1,40}"),
 }
+# 「버전 (빌드)」 꼴만 받는다(예: 1.2 (44)). 다른 글자(NUL 등)가 섞인 줄은 버린다.
+APP_VERSION = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,3} \([0-9]{1,9}\)")
+# 사용자·통화 ID 는 UUID 꼴이다. 다른 글자가 섞인 값은 DB 에 묻지 않고 비운다.
+RECORD_ID = re.compile(r"[0-9A-Za-z-]{1,36}")
 SUBJECT_EVENTS = frozenset({"report_view", "post_call_answer"})
 CALL_EVENTS = frozenset({"post_call_answer", "incoming_call_shown", "call_connect_failed"})
 ANONYMOUS_EVENTS = frozenset({"onboarding_step"})
@@ -66,6 +70,11 @@ def utc(value: datetime) -> datetime:
     return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
 
 
+def record_id(value: str | None) -> str | None:
+    """빈 문자열과 ID 꼴이 아닌 값은 없는 것으로 본다."""
+    return value if value and RECORD_ID.fullmatch(value) else None
+
+
 def accepted_row(
     event: AppEventIn, *, user_id: str | None, now: datetime
 ) -> dict[str, object] | None:
@@ -75,17 +84,20 @@ def accepted_row(
     if (
         event.name not in allowed_names
         or not code_allowed(event.name, code)
+        or not APP_VERSION.fullmatch(event.app_version)
         or not now - MAX_AGE <= occurred_at <= now + MAX_AHEAD
     ):
         return None
     signed_in = user_id is not None
+    subject_id = record_id(event.subject_id)
+    call_id = record_id(event.call_id)
     return {
         "id": str(event.id),
         "user_id": user_id,
         "name": event.name,
         "code": code,
-        "subject_id": event.subject_id if signed_in and event.name in SUBJECT_EVENTS else None,
-        "call_id": event.call_id if signed_in and event.name in CALL_EVENTS else None,
+        "subject_id": subject_id if signed_in and event.name in SUBJECT_EVENTS else None,
+        "call_id": call_id if signed_in and event.name in CALL_EVENTS else None,
         "platform": event.platform,
         "app_version": event.app_version,
         "occurred_at": occurred_at,

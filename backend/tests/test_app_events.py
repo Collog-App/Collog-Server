@@ -276,3 +276,65 @@ def test_event_limits_are_the_agreed_numbers() -> None:
     assert event_rules.USER_WINDOW_LIMIT == 500
     assert event_rules.ANONYMOUS_WINDOW == timedelta(minutes=10)
     assert event_rules.ANONYMOUS_WINDOW_LIMIT == 200
+
+
+def test_rows_with_a_bad_app_version_or_odd_ids_are_dropped_not_the_batch(
+    client: TestClient, tmp_path: Path
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    call_id = declined_call(client, child_token, parent_token, parent["id"])
+    good = event("app_open")
+    versions = [
+        {**event("app_open"), "appVersion": version}
+        for version in ("1.2", "1.2(44)", "v1.2 (44)", "1.2 (44) beta", "1.2 (4\u00004)",
+                        "1.2.3.4.5 (1)", "12345 (1)", "1.2 (1234567890)")
+    ]
+    nul_view = event("report_view", code="DIRECT", subject=f"{parent['id']}\u0000")
+    nul_shown = event("incoming_call_shown", call=f"{call_id}\u0000")
+    empty_view = {**event("report_view", code="DIRECT"), "subjectId": ""}
+    nul_name = {**event("app_open"), "name": "app_open\u0000"}
+    nul_code = event("report_view", code="DIRECT\u0000")
+    batch = [good, *versions, nul_view, nul_shown, empty_view, nul_name, nul_code]
+    response = client.post("/v1/events", headers=auth(child_token), json={"events": batch})
+    assert response.status_code == 200, response.text
+    assert response.json() == {"accepted": 4}
+    rows = stored(tmp_path)
+    assert set(rows) == {good["id"], nul_view["id"], nul_shown["id"], empty_view["id"]}
+    assert rows[nul_view["id"]][3] is None
+    assert rows[nul_shown["id"]][4] is None
+    assert rows[empty_view["id"]][3] is None
+
+    # 꼴이 맞는 여러 판
+    ok = [{**event("app_open"), "appVersion": v} for v in ("1 (1)", "1.2.3.4 (123456789)")]
+    assert client.post(
+        "/v1/events", headers=auth(child_token), json={"events": ok}
+    ).json() == {"accepted": 2}
+
+
+def test_empty_subject_and_call_ids_count_as_missing(client: TestClient, tmp_path: Path) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    call_id = declined_call(client, child_token, parent_token, parent["id"])
+    view = {**event("report_view", code="DIRECT"), "subjectId": ""}
+    shown = {**event("incoming_call_shown"), "callId": ""}
+    answer = event("post_call_answer", code="YES", subject="", call=call_id)
+    client.post("/v1/events", headers=auth(child_token), json={"events": [view, shown, answer]})
+    rows = stored(tmp_path)
+    assert rows[view["id"]][3:5] == (None, None)
+    assert rows[shown["id"]][3:5] == (None, None)
+    assert rows[answer["id"]][3:5] == (None, call_id)
+
+
+def test_platform_takes_only_the_two_app_values(client: TestClient) -> None:
+    token, _ = create_user(client, "01055556666", "CHILD", "시험")
+    for platform in ("ios", "Android", "IOS\u0000", "", "WEB"):
+        response = client.post(
+            "/v1/events", headers=auth(token),
+            json={"events": [{**event("app_open"), "platform": platform}]},
+        )
+        assert response.status_code == 422, platform
+    for platform in ("IOS", "ANDROID"):
+        response = client.post(
+            "/v1/events", headers=auth(token),
+            json={"events": [{**event("app_open"), "platform": platform}]},
+        )
+        assert response.json() == {"accepted": 1}
