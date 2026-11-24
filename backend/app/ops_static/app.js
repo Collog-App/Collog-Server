@@ -540,8 +540,8 @@ function renderFeatures(s) {
         `프로필이 있는 부모 ${fmt(x.parentsWithProfile)}명 · 걱정을 직접 쓴 부모 ${fmt(x.concernsWritten)}명`,
         CONDITION,
       ),
-      renderHealthLink(s.healthLink),
     ),
+    renderHealthLink(s.healthLink),
   ];
 }
 
@@ -573,9 +573,7 @@ function renderHealthLink(h) {
 }
 
 function renderSignup(g) {
-  return el(
-    "div",
-    { class: "blocks" },
+  return [
     el(
       "div",
       { class: "block" },
@@ -620,12 +618,12 @@ function renderSignup(g) {
         "앱이 단계 화면에 처음 들어올 때 설치마다 단계당 한 번 남기는 기록 수입니다. 로그인 전 기록은 익명이라 사람 수가 아니라 건수이고, 팀·시험 계정 빼기가 적용되지 않으며 「가입일 이후」는 기록 날짜로 거릅니다. 앱마다 있는 단계만 기록됩니다.",
       ),
     ),
-  );
+  ];
 }
 
 function renderPeople(s) {
   const p = s.people;
-  return [renderSignup(s.signup), el(
+  return [...renderSignup(s.signup), el(
     "div",
     { class: "blocks", style: "margin-top:12px" },
     bars("마지막으로 쓴 기기", p.platform, "가입자 기준", PLATFORM),
