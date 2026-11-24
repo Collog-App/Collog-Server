@@ -138,9 +138,12 @@ class ProcessingPipeline:
                         if not retry:
                             await self.purge_call_audio(call_id)
             finally:
-                # 실패·재시도한 시도도 공급자 요금은 쓰였으므로 결과와 상관없이 더한다.
-                await self.save_usage(call_id, spent)
-                self._locks.pop(call_id, None)
+                try:
+                    # 실패·재시도한 시도도 공급자 요금은 쓰였으므로 결과와 상관없이 더한다.
+                    await self.save_usage(call_id, spent)
+                finally:
+                    # 사용량 저장이 취소·실패해도 통화별 잠금은 반드시 치운다.
+                    self._locks.pop(call_id, None)
         # 알림은 처리 제한 시간과 통화별 잠금 밖에서 보낸다. 실패해도 주기 작업이 다시 시도한다.
         if analyzed and self.after_analyzed is not None:
             try:

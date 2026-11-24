@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -319,3 +320,22 @@ def test_huge_stored_usage_does_not_break_the_ops_summary(tmp_path: Path) -> Non
         month = response.json()["aiUsage"]["months"][0]
         assert month["sttAudioSec"] == {"total": 0, "calls": 0, "perCall": None, "unknown": 1}
         assert month["geminiInputTokens"]["total"] == 12
+
+
+@pytest.mark.parametrize("error", [RuntimeError("db down"), asyncio.CancelledError()])
+def test_call_lock_is_released_even_if_saving_usage_breaks(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    pipeline = client.app.state.container.pipeline
+
+    async def broken(call_id: str, spent: dict) -> None:
+        raise error
+
+    monkeypatch.setattr(pipeline, "save_usage", broken)
+
+    async def run() -> dict:
+        with pytest.raises(type(error)):
+            await pipeline.process("no-such-call")
+        return dict(pipeline._locks)
+
+    assert "no-such-call" not in client.portal.call(run)
