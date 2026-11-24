@@ -43,6 +43,21 @@ const pct = (r) => (r && r.pct !== null ? `${r.pct}%` : "–");
 const frac = (r) => (r ? `${fmt(r.n)} / ${fmt(r.d)}` : "–");
 
 const ROLE = { PARENT: "부모", CHILD: "자녀" };
+const COHORT = { AWARE: "인지", UNAWARE: "비인지" };
+const cohortName = (code) => COHORT[code] || "미정";
+const PUSH = {
+  SENT: "보냄",
+  TOKEN_INVALID: "토큰 만료·무효",
+  FAILED: "보내기 실패",
+  NO_DEVICE: "보낼 기기 없음",
+};
+const CONNECT_FAILED = {
+  MIC_PERMISSION: "마이크 권한",
+  NETWORK: "네트워크",
+  TOKEN: "통화 접속 토큰",
+  SERVER: "서버",
+  OTHER: "기타",
+};
 const PLATFORM = { IOS: "iPhone", ANDROID: "Android" };
 const GENDER = { MALE: "남성", FEMALE: "여성" };
 const CONDITION = {
@@ -300,7 +315,57 @@ function renderCalls(s) {
         "단계별 시간은 이 기록을 넣은 뒤의 통화만 셈",
       ),
     ),
+    renderDelivery(s.delivery),
   ];
+}
+
+function renderDelivery(d) {
+  const failed = Object.keys(CONNECT_FAILED);
+  const extra = Object.keys(d.connectFailed.all).filter((code) => !failed.includes(code));
+  return el(
+    "div",
+    { class: "blocks", style: "margin-top:12px" },
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "전화 알림"),
+      el(
+        "div",
+        { class: "grid" },
+        card(
+          "보냈는데 안 울림",
+          pct(d.notRung),
+          `${frac(d.notRung)}통화`,
+          "알림을 보낸 통화 중 받는 사람 앱이 울림 화면 기록을 남기지 않은 비율. 통화 시작 1시간이 지났고, 받는 사람 앱이 그 전에 이용 기록을 보낸 적이 있는 통화만 셈",
+        ),
+      ),
+      el("p", { class: "muted", style: "margin-top:12px" }, "알림 결과 (이 기록을 넣은 뒤의 통화, 한 통화에 기기 하나라도 보내지면 「보냄」)"),
+      table(
+        ["결과", "통화"],
+        Object.keys(PUSH).map((key) =>
+          el("tr", {}, el("td", {}, PUSH[key]), el("td", {}, fmt(d.pushResults[key]))),
+        ),
+      ),
+    ),
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "통화 연결 실패 (앱 기록)"),
+      table(
+        ["까닭", "전체", "최근 7일"],
+        [...failed, ...extra].map((code) =>
+          el(
+            "tr",
+            {},
+            el("td", {}, CONNECT_FAILED[code] || code),
+            el("td", {}, fmt(d.connectFailed.all[code] || 0)),
+            el("td", {}, fmt(d.connectFailed.last7d[code] || 0)),
+          ),
+        ),
+      ),
+      el("p", { class: "muted" }, "건 쪽·받는 쪽 앱이 통화 연결이 실패로 끝났을 때 남긴 기록 수"),
+    ),
+  );
 }
 
 function renderFeatures(s) {
@@ -391,6 +456,57 @@ function renderWeekly(s) {
   );
 }
 
+function renderCohorts(s) {
+  const groups = s.cohorts.groups;
+  const rows = [
+    ["그룹 사람", (g) => `${fmt(g.people)}명`],
+    ["최근 7일 통화한 사람", (g) => `${pct(g.calledLast7d)} (${frac(g.calledLast7d)})`],
+    ["통화 없는 날 리포트를 연 사람", (g) => `${pct(g.reportOnNoCallDay)} (${frac(g.reportOnNoCallDay)})`],
+    ["추천 질문 「써 봤다」", (g) => `${pct(g.questionUsed)} (${frac(g.questionUsed)})`],
+  ];
+  return [
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "테스트 그룹 비교"),
+      table(
+        ["", ...groups.map((g) => cohortName(g.cohort))],
+        rows.map(([label, pick]) => el("tr", {}, el("td", {}, label), groups.map((g) => el("td", {}, pick(g))))),
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        "그룹은 「계정」 탭에서 정합니다(앱에는 보이지 않음). 팀·시험 계정은 빠집니다. 통화 = 상대가 받아 연결된 통화. 리포트 = 그 사람에게 받은 통화가 없던 날(한국 날짜)에 리포트 화면을 연 기록이 하나라도 있는 사람. 추천 질문 = 통화 뒤 질문에 「써 봤어요」라고 답한 수 / 전체 답",
+      ),
+    ),
+    el(
+      "div",
+      { class: "blocks", style: "margin-top:12px" },
+      groups.map((g) =>
+        el(
+          "div",
+          { class: "block" },
+          el("h2", {}, `${cohortName(g.cohort)} · 주별 (${fmt(g.people)}명)`),
+          table(
+            ["주", "통화", "사람당 통화", "앱 연 사람"],
+            g.weekly.map((w) =>
+              el(
+                "tr",
+                {},
+                el("td", {}, w.week.slice(5).replace("-", ".") + " 주"),
+                el("td", {}, fmt(w.calls)),
+                el("td", {}, w.callsPerPerson ?? "–"),
+                el("td", {}, fmt(w.activeUsers)),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    el("p", { class: "muted", style: "margin-top:8px" }, "주 = 월요일 시작, 한국 시간. 통화 = 그룹 사람이 한쪽이라도 낀 통화 수, 사람당 통화 = 그룹 사람 각자의 통화 수 합 ÷ 그룹 사람, 앱 연 사람 = 그 주에 앱을 연 기록이 있는 사람. 이번 주는 아직 진행 중"),
+  ];
+}
+
 function renderAccounts() {
   if (!state.accounts) {
     loadAccounts();
@@ -431,6 +547,33 @@ function renderAccounts() {
               }
             },
           });
+          const group = el(
+            "select",
+            {
+              class: "cohort",
+              "aria-label": "테스트 그룹",
+              onchange: async () => {
+                group.disabled = true;
+                try {
+                  await api(`/ops/api/accounts/${encodeURIComponent(a.id)}/cohort`, {
+                    method: "PUT",
+                    body: JSON.stringify({ cohort: group.value || null }),
+                  });
+                  a.cohort = group.value || null;
+                  state.summary = null;
+                } catch (error) {
+                  group.value = a.cohort || "";
+                  showStatus(`바꾸지 못했습니다 (${error.message})`);
+                } finally {
+                  group.disabled = false;
+                }
+              },
+            },
+            el("option", { value: "" }, "미정"),
+            el("option", { value: "AWARE" }, "인지"),
+            el("option", { value: "UNAWARE" }, "비인지"),
+          );
+          group.value = a.cohort || "";
           return el(
             "tr",
             { class: a.internal ? "internal" : null },
@@ -441,6 +584,7 @@ function renderAccounts() {
             el("td", {}, kst(a.createdAt)),
             el("td", {}, kst(a.lastSeenAt, true)),
             el("td", {}, fmt(a.connectedCalls)),
+            el("td", {}, group),
             el("td", {}, box),
           );
         }),
@@ -454,7 +598,7 @@ function renderAccounts() {
     el(
       "p",
       { class: "muted" },
-      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다.",
+      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다. 그룹(인지·비인지)은 「그룹」 탭 표에만 쓰이고 앱에는 보이지 않습니다.",
     ),
     filter,
     el(
@@ -469,7 +613,7 @@ function renderAccounts() {
           el(
             "tr",
             {},
-            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "팀·시험"].map((h, i) =>
+            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "그룹", "팀·시험"].map((h, i) =>
               el("th", { class: i < 4 ? "left" : null }, h),
             ),
           ),
@@ -505,6 +649,7 @@ function render() {
     features: renderFeatures,
     people: renderPeople,
     weekly: renderWeekly,
+    cohorts: renderCohorts,
   };
   panel.replaceChildren(...[views[state.tab](s)].flat());
 }
@@ -529,6 +674,11 @@ function summaryText(s) {
     `- 통화 연결률 ${pct(c.all.connected)} (${frac(c.all.connected)}), 분석 완료율 ${pct(c.all.analyzed)} (${frac(c.all.analyzed)})`,
     `- 통화 시간 중앙값 ${minutes(c.durationSec.median)}`,
     `- 리포트 발행 ${fmt(x.reportsIssued)}회, 건강 앱 연동 ${pct(x.healthLinked)} (${frac(x.healthLinked)}명)`,
+    `- 전화 알림 보냈는데 안 울림 ${pct(s.delivery.notRung)} (${frac(s.delivery.notRung)}통화)`,
+    ...s.cohorts.groups.map(
+      (g) =>
+        `- ${cohortName(g.cohort)} 그룹 ${fmt(g.people)}명: 최근 7일 통화 ${pct(g.calledLast7d)}, 통화 없는 날 리포트 연 사람 ${pct(g.reportOnNoCallDay)}, 추천 질문 「써 봤다」 ${pct(g.questionUsed)} (${frac(g.questionUsed)})`,
+    ),
   ].join("\n");
 }
 

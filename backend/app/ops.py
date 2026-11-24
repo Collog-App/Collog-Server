@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import (
+    AppEvent,
     CallRecord,
     CallState,
     ChangeSignal,
@@ -37,7 +38,9 @@ from app.models import (
     HealthLinkConsent,
     HealthLinkDecision,
     OpsAccountFlag,
+    OpsCohort,
     ParentProfile,
+    PushResult,
     RefreshSession,
     Report,
     TodoItem,
@@ -51,6 +54,14 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 STATIC = Path(__file__).with_name("ops_static")
 TREND_WEEKS = 12
+COHORT_WEEKS = 8
+COHORTS: tuple[str | None, ...] = (OpsCohort.AWARE.value, OpsCohort.UNAWARE.value, None)
+# 운영 지표에 쓰는 이용 기록. 가입 단계·건강 연동·지표 설명 기록은 아직 화면에 없다.
+OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_shown",
+              "call_connect_failed")
+# 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
+# 시작되고 이만큼 지난 통화만 센다.
+RING_REPORT_GRACE = timedelta(hours=1)
 
 router = APIRouter(include_in_schema=False)
 
@@ -159,6 +170,10 @@ class Dataset:
         self.todos: list[Any] = []
         self.profiles: list[Any] = []
         self.signals: list[Any] = []
+        self.cohorts: dict[str, str] = {}
+        self.events: list[Any] = []
+        self.first_event: dict[str, datetime] = {}
+        self.pushes: list[Any] = []
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -195,6 +210,14 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             select(OpsAccountFlag.user_id).where(OpsAccountFlag.internal.is_(True))
         )
     )
+    data.cohorts = {
+        row.user_id: row.cohort
+        for row in await session.execute(
+            select(OpsAccountFlag.user_id, OpsAccountFlag.cohort).where(
+                OpsAccountFlag.cohort.is_not(None)
+            )
+        )
+    }
 
     latest_device: dict[str, datetime] = {}
     for row in await session.execute(select(Device.user_id, Device.platform, Device.created_at)):
@@ -299,6 +322,41 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             select(ChangeSignal.parent_id, ChangeSignal.promoted, ChangeSignal.acute)
         )
     )
+
+    # 이용 기록은 「마지막 사용」 계산(last_seen)에 넣지 않는다. 기존 지표가 그대로 남게 한다.
+    data.events = list(
+        await session.execute(
+            select(
+                AppEvent.user_id,
+                AppEvent.name,
+                AppEvent.code,
+                AppEvent.call_id,
+                AppEvent.occurred_at,
+            ).where(AppEvent.user_id.is_not(None), AppEvent.name.in_(OPS_EVENTS))
+        )
+    )
+    data.first_event = {
+        row.user_id: aware(row.first)
+        for row in await session.execute(
+            select(AppEvent.user_id, func.min(AppEvent.occurred_at).label("first"))
+            .where(AppEvent.user_id.is_not(None))
+            .group_by(AppEvent.user_id)
+        )
+    }
+    data.pushes = [
+        row
+        for row in await session.execute(
+            select(
+                CallRecord.id,
+                CallRecord.parent_id,
+                CallRecord.child_id,
+                CallRecord.caller_id,
+                CallRecord.started_at,
+                CallRecord.incoming_push,
+            )
+        )
+        if row.incoming_push
+    ]
     return data
 
 
@@ -560,9 +618,137 @@ def build_accounts(data: Dataset) -> list[dict[str, Any]]:
             "lastSeenAt": data.last_seen.get(row.id, aware(row.created_at)).isoformat(),
             "connectedCalls": calls[row.id],
             "internal": row.id in data.internal,
+            "cohort": data.cohorts.get(row.id),
         }
         for row in rows
     ]
+
+
+def build_cohorts(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """테스트 그룹(인지·비인지·미정)별 통화·리포트·추천 질문·앱 사용.
+
+    그룹 사람은 build_summary 의 가입 완료 사용자와 같은 기준(팀·시험 계정과 안드로이드 가입
+    단계에서 멈춘 계정은 뺌)이고, 통화는 받아 연결된 통화만 센다.
+    """
+    keep = included_users(data, include_internal=include_internal, since=since)
+    signed = {uid for uid in keep if data.users[uid].nickname or not data.users[uid].google}
+    this_week = week_start(now.astimezone(KST).date())
+    weeks = [this_week - timedelta(weeks=i) for i in range(COHORT_WEEKS - 1, -1, -1)]
+    ago7 = now - timedelta(days=7)
+
+    calls: list[tuple[date, set[str]]] = []
+    call_times: dict[str, list[datetime]] = defaultdict(list)
+    for call in data.calls:
+        if call.accepted_at is None or call.parent_id not in keep or call.child_id not in keep:
+            continue
+        at = aware(call.accepted_at)
+        calls.append((week_start(kst_day(at)), {call.parent_id, call.child_id}))
+        for uid in (call.parent_id, call.child_id):
+            call_times[uid].append(at)
+    events: dict[str, list[Any]] = defaultdict(list)
+    for event in data.events:
+        if event.user_id in signed:
+            events[event.user_id].append(event)
+
+    groups = []
+    for cohort in COHORTS:
+        members = {uid for uid in signed if data.cohorts.get(uid) == cohort}
+        people = len(members)
+        called7d = {uid for uid in members if any(at >= ago7 for at in call_times[uid])}
+        # 그 사람에게 받은 통화가 없던 한국 날짜에 리포트를 연 적이 있는가
+        reopened = set()
+        for uid in members:
+            call_days = {kst_day(at) for at in call_times[uid]}
+            if any(
+                e.name == "report_view" and kst_day(e.occurred_at) not in call_days
+                for e in events[uid]
+            ):
+                reopened.add(uid)
+        answers = [e.code for uid in members for e in events[uid] if e.name == "post_call_answer"]
+        weekly = []
+        for week in weeks:
+            in_week = [pair for start, pair in calls if start == week and pair & members]
+            active = {
+                uid
+                for uid in members
+                for e in events[uid]
+                if e.name == "app_open" and week_start(kst_day(e.occurred_at)) == week
+            }
+            weekly.append({
+                "week": week.isoformat(),
+                "calls": len(in_week),
+                "callsPerPerson": (
+                    round(sum(len(pair & members) for pair in in_week) / people, 2)
+                    if people else None
+                ),
+                "activeUsers": len(active),
+            })
+        groups.append({
+            "cohort": cohort,
+            "people": people,
+            "calledLast7d": ratio(len(called7d), people),
+            "reportOnNoCallDay": ratio(len(reopened), people),
+            "questionUsed": ratio(answers.count("YES"), len(answers)),
+            "weekly": weekly,
+        })
+    return {"weeks": [week.isoformat() for week in weeks], "groups": groups}
+
+
+def build_delivery(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """전화 알림 결과와 「보냈는데 안 울림」, 통화 연결 실패 코드.
+
+    「안 울림」은 알림을 성공으로 보낸 통화 가운데 받는 사람 앱이 울림 기록
+    (incoming_call_shown)을 남기지 않은 비율이다. 알림 결과를 남기기 시작한 뒤의 통화만, 그리고
+    받는 사람 앱이 그 통화 전에 이용 기록을 보낸 적이 있는 통화만 센다(기록을 보내지 않는 옛
+    앱이 안 울림으로 잡히지 않게).
+    """
+    keep = included_users(data, include_internal=include_internal, since=since)
+    shown = {
+        (e.user_id, e.call_id) for e in data.events if e.name == "incoming_call_shown" and e.call_id
+    }
+    results: Counter[str] = Counter()
+    pushed = not_rung = 0
+    for row in data.pushes:
+        if row.parent_id not in keep or row.child_id not in keep:
+            continue
+        result = row.incoming_push.get("result")
+        results[result] += 1
+        started = aware(row.started_at)
+        if result != PushResult.SENT.value or started > now - RING_REPORT_GRACE:
+            continue
+        caller = row.caller_id or row.child_id
+        callee = row.child_id if caller == row.parent_id else row.parent_id
+        rang = (callee, row.id) in shown
+        first = data.first_event.get(callee)
+        if not rang and (first is None or first > started):
+            continue
+        pushed += 1
+        not_rung += not rang
+
+    ago7 = now - timedelta(days=7)
+    failures = [e for e in data.events if e.name == "call_connect_failed" and e.user_id in keep]
+    return {
+        "pushResults": {item.value: results.get(item.value, 0) for item in PushResult},
+        "notRung": ratio(not_rung, pushed),
+        "connectFailed": {
+            "all": dict(Counter(e.code for e in failures).most_common()),
+            "last7d": dict(
+                Counter(e.code for e in failures if aware(e.occurred_at) >= ago7).most_common()
+            ),
+        },
+    }
 
 
 # ---------------------------------------------------------------- 경로
@@ -618,9 +804,12 @@ async def ops_summary(
     now = datetime.now(UTC)
     data = await load_dataset(session, settings)
     logger.info("ops summary viewed by %s", operator)
+    scope = {"now": now, "include_internal": internal, "since": since}
     return {
         "generatedAt": now.isoformat(),
-        **build_summary(data, now=now, include_internal=internal, since=since),
+        **build_summary(data, **scope),
+        "cohorts": build_cohorts(data, **scope),
+        "delivery": build_delivery(data, **scope),
     }
 
 
@@ -653,3 +842,25 @@ async def ops_mark_internal(
     await session.commit()
     logger.info("ops account %s internal=%s by %s", user_id, payload.internal, operator)
     return {"id": user_id, "internal": payload.internal}
+
+
+class CohortFlag(BaseModel):
+    cohort: OpsCohort | None
+
+
+@router.put("/ops/api/accounts/{user_id}/cohort")
+async def ops_set_cohort(
+    user_id: str, payload: CohortFlag, operator: OperatorDep, session: SessionDep
+) -> dict[str, Any]:
+    if await session.get(User, user_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "계정을 찾을 수 없습니다")
+    flag = await session.get(OpsAccountFlag, user_id)
+    if flag is None:
+        flag = OpsAccountFlag(user_id=user_id, internal=False)
+        session.add(flag)
+    cohort = payload.cohort.value if payload.cohort else None
+    flag.cohort = cohort
+    flag.updated_at = datetime.now(UTC)
+    await session.commit()
+    logger.info("ops account %s cohort=%s by %s", user_id, cohort, operator)
+    return {"id": user_id, "cohort": cohort}

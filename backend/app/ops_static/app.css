@@ -143,6 +143,7 @@ th { color: var(--muted); font-weight: 600; font-size: 13px; }
 td.left, th.left { text-align: left; }
 tr.internal td { color: var(--muted); }
 .filter { width: 100%; max-width: 320px; margin-bottom: 10px; padding: 10px 12px; }
+select.cohort { font: inherit; color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 4px 8px; background: #fff; }
 
 @media (max-width: 560px) {
   .value { font-size: 28px; }

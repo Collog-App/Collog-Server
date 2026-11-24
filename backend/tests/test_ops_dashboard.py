@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.ops import Dataset, account_label, build_summary
+from app.ops import Dataset, account_label, build_cohorts, build_delivery, build_summary
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 
@@ -281,3 +281,158 @@ def test_analysis_time_uses_only_analyzed_calls_that_recorded_it() -> None:
     empty = build_summary(Dataset(), now=NOW, include_internal=False, since=None)
     assert empty["calls"]["analysisTime"]["totalSec"] is None
     assert empty["calls"]["analysisTime"]["notifySec"] is None
+
+
+# ------------------------------------------------------------ 테스트 그룹·전화 알림
+
+
+def test_operator_sets_a_cohort_that_the_app_never_sees(ops_client: TestClient) -> None:
+    child_token, child, _, parent = onboard_family(ops_client)
+    headers = {"X-Ops-Code": CODE}
+    path = f"/ops/api/accounts/{child['id']}/cohort"
+
+    assert ops_client.put(path, json={"cohort": "AWARE"}).status_code == 401
+    saved = ops_client.put(path, headers=headers, json={"cohort": "AWARE"})
+    assert saved.status_code == 200
+    assert saved.json() == {"id": child["id"], "cohort": "AWARE"}
+    accounts = {a["id"]: a for a in ops_client.get("/ops/api/accounts", headers=headers).json()[
+        "accounts"
+    ]}
+    assert accounts[child["id"]]["cohort"] == "AWARE"
+    assert accounts[child["id"]]["internal"] is False
+    assert accounts[parent["id"]]["cohort"] is None
+
+    summary = ops_client.get("/ops/api/summary", headers=headers).json()
+    people = {g["cohort"]: g["people"] for g in summary["cohorts"]["groups"]}
+    assert people == {"AWARE": 1, "UNAWARE": 0, None: 1}
+    assert len(summary["cohorts"]["weeks"]) == 8
+
+    me = ops_client.patch(
+        "/v1/account/preferences", headers=auth(child_token), json={"marketingOptIn": False}
+    )
+    assert me.status_code == 200
+    assert "cohort" not in me.json()
+
+    assert ops_client.put(path, headers=headers, json={"cohort": "BOTH"}).status_code == 422
+    cleared = ops_client.put(path, headers=headers, json={"cohort": None})
+    assert cleared.json() == {"id": child["id"], "cohort": None}
+    missing = ops_client.put(
+        "/ops/api/accounts/nobody/cohort", headers=headers, json={"cohort": "UNAWARE"}
+    )
+    assert missing.status_code == 404
+
+
+def test_summary_counts_push_results_of_new_calls(ops_client: TestClient) -> None:
+    child_token, _, _, parent = onboard_family(ops_client)
+    created = ops_client.post(
+        "/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]}
+    )
+    assert created.status_code == 201
+    delivery = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["delivery"]
+    assert delivery["pushResults"] == {"SENT": 0, "TOKEN_INVALID": 0, "FAILED": 0, "NO_DEVICE": 1}
+    assert delivery["notRung"] == {"n": 0, "d": 0, "pct": None}
+
+
+def app_event(user_id: str, name: str, at: datetime, code: str | None = None,
+              call_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(user_id=user_id, name=name, code=code, call_id=call_id, occurred_at=at)
+
+
+def cohort_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid, role in (("a1", "CHILD"), ("a2", "CHILD"), ("u1", "CHILD"), ("p1", "PARENT"),
+                      ("p2", "PARENT"), ("i1", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.internal = {"i1"}
+    data.cohorts = {"a1": "AWARE", "a2": "AWARE", "i1": "AWARE", "u1": "UNAWARE"}
+    data.calls = [
+        call("p1", "a1", NOW - timedelta(days=2)),
+        call("p1", "a1", NOW - timedelta(days=10)),
+        call("p2", "u1", NOW - timedelta(days=20)),
+        call("p1", "a1", None),  # 안 받은 전화는 통화가 아니다
+        call("p2", "i1", NOW - timedelta(days=1)),
+    ]
+    data.events = [
+        app_event("a1", "report_view", NOW - timedelta(days=2, hours=1), "DIRECT"),  # 통화한 날
+        app_event("a2", "report_view", NOW - timedelta(days=1), "DIRECT"),  # 통화 없는 날
+        app_event("u1", "report_view", NOW - timedelta(days=20), "NOTIFICATION"),
+        app_event("i1", "report_view", NOW - timedelta(days=3), "DIRECT"),
+        app_event("a1", "post_call_answer", NOW - timedelta(days=2), "YES"),
+        app_event("a1", "post_call_answer", NOW - timedelta(days=10), "NO"),
+        app_event("u1", "post_call_answer", NOW - timedelta(days=20), "NOT_SEEN"),
+        app_event("a1", "app_open", NOW - timedelta(hours=1)),
+        app_event("a2", "app_open", NOW - timedelta(days=8)),
+    ]
+    return data
+
+
+def test_cohort_tables_split_people_by_group() -> None:
+    cohorts = build_cohorts(cohort_dataset(), now=NOW, include_internal=False, since=None)
+    groups = {g["cohort"]: g for g in cohorts["groups"]}
+    aware, unaware, undecided = groups["AWARE"], groups["UNAWARE"], groups[None]
+    assert aware["people"] == 2  # 팀·시험 계정 i1 은 빠짐
+    assert aware["calledLast7d"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert aware["reportOnNoCallDay"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert aware["questionUsed"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert unaware["people"] == 1
+    assert unaware["reportOnNoCallDay"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert unaware["questionUsed"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert undecided["people"] == 2
+    assert undecided["calledLast7d"] == {"n": 1, "d": 2, "pct": 50.0}
+
+    assert cohorts["weeks"][-1] == "2026-11-16"
+    this_week, last_week = aware["weekly"][-1], aware["weekly"][-2]
+    assert this_week == {"week": "2026-11-16", "calls": 1, "callsPerPerson": 0.5, "activeUsers": 1}
+    assert last_week == {"week": "2026-11-09", "calls": 1, "callsPerPerson": 0.5, "activeUsers": 1}
+    assert sum(w["calls"] for w in undecided["weekly"]) == 3
+
+    with_internal = build_cohorts(cohort_dataset(), now=NOW, include_internal=True, since=None)
+    assert {g["cohort"]: g["people"] for g in with_internal["groups"]}["AWARE"] == 3
+
+
+def push_row(call_id: str, caller: str, started: datetime, result: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        parent_id="p1",
+        child_id="c1",
+        caller_id=caller,
+        started_at=started,
+        incoming_push={"result": result, "at": started.isoformat(), "devices": []},
+    )
+
+
+def test_not_rung_counts_only_calls_the_receiving_app_could_report() -> None:
+    data = dataset()
+    hours3 = NOW - timedelta(hours=3)
+    data.users["i1"] = user("i1", "CHILD", NOW - timedelta(days=40))
+    data.internal = {"i1"}
+    data.pushes = [
+        push_row("rang", "c1", hours3, "SENT"),
+        push_row("silent", "c1", hours3, "SENT"),
+        push_row("too-new", "c1", NOW - timedelta(minutes=10), "SENT"),
+        push_row("expired", "c1", hours3, "TOKEN_INVALID"),
+        push_row("to-child", "p1", hours3, "SENT"),
+        SimpleNamespace(
+            id="old-app", parent_id="p2", child_id="c2", caller_id="c2", started_at=hours3,
+            incoming_push={"result": "SENT", "devices": []},
+        ),
+    ]
+    data.first_event = {"p1": NOW - timedelta(days=1), "c1": hours3 + timedelta(minutes=1)}
+    data.events = [
+        app_event("p1", "incoming_call_shown", hours3, call_id="rang"),
+        app_event("c1", "incoming_call_shown", hours3, call_id="silent"),  # 건 사람 기록은 아님
+        app_event("c1", "incoming_call_shown", hours3, call_id="to-child"),
+        app_event("c1", "call_connect_failed", NOW - timedelta(days=1), "NETWORK"),
+        app_event("p1", "call_connect_failed", NOW - timedelta(days=10), "NETWORK"),
+        app_event("c1", "call_connect_failed", NOW - timedelta(hours=2), "MIC_PERMISSION"),
+        app_event("i1", "call_connect_failed", NOW - timedelta(hours=2), "SERVER"),
+    ]
+    delivery = build_delivery(data, now=NOW, include_internal=False, since=None)
+    assert delivery["pushResults"] == {"SENT": 5, "TOKEN_INVALID": 1, "FAILED": 0, "NO_DEVICE": 0}
+    # rang·silent·to-child 만 센다(too-new 는 1시간 전, old-app 은 받는 앱이 기록을 보낸 적 없음)
+    assert delivery["notRung"] == {"n": 1, "d": 3, "pct": 33.3}
+    assert delivery["connectFailed"] == {
+        "all": {"NETWORK": 2, "MIC_PERMISSION": 1},
+        "last7d": {"NETWORK": 1, "MIC_PERMISSION": 1},
+    }
