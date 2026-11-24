@@ -19,6 +19,7 @@ from app.ops import (
     account_label,
     build_cohorts,
     build_delivery,
+    build_health_link,
     build_quality,
     build_signup,
     build_summary,
@@ -636,3 +637,50 @@ def test_analysis_quality_reads_the_real_tables(ops_client: TestClient) -> None:
     assert quality["pauseUnmeasurable"]["d"] == 1
     assert quality["shortSpeechExcluded"] == {"n": 1, "d": 2, "pct": 50.0}
     assert quality["processingErrors"] == {"all": {}, "last30d": {}}
+
+
+# ------------------------------------------------------------ 건강 연동 결과
+
+
+def test_health_link_counts_people_by_latest_result_and_every_event() -> None:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid in ("a", "b", "i"):
+        data.users[uid] = user(uid, "PARENT", start)
+    data.internal = {"i"}
+    data.health_results = [
+        # a: 안드로이드에서 거부했다가 연결 → 사람은 연결 1, 건수는 둘 다
+        step("a", "PERMISSION_DENIED", "ANDROID", NOW - timedelta(days=3)),
+        step("a", "CONNECTED", "ANDROID", NOW - timedelta(days=1)),
+        step("b", "CONNECTED_NO_RECORDS", "IOS", NOW - timedelta(days=2)),
+        step("b", "CONNECTED_NO_RECORDS", "IOS", NOW - timedelta(days=1)),
+        step("i", "CONNECTED", "IOS", NOW - timedelta(days=1)),  # 팀·시험 계정
+    ]
+    health = build_health_link(data, now=NOW, include_internal=False, since=None)
+    assert health["people"] == 2
+    assert health["events"] == 4
+    assert health["results"] == [
+        {"code": "CONNECTED", "people": {"IOS": 0, "ANDROID": 1},
+         "events": {"IOS": 0, "ANDROID": 1}},
+        {"code": "PERMISSION_DENIED", "people": {"IOS": 0, "ANDROID": 0},
+         "events": {"IOS": 0, "ANDROID": 1}},
+        {"code": "CONNECTED_NO_RECORDS", "people": {"IOS": 1, "ANDROID": 0},
+         "events": {"IOS": 2, "ANDROID": 0}},
+    ]
+    with_internal = build_health_link(data, now=NOW, include_internal=True, since=None)
+    assert with_internal["results"][0]["people"] == {"IOS": 1, "ANDROID": 1}
+
+
+def test_health_link_reads_the_real_events(ops_client: TestClient) -> None:
+    _, _, parent_token, _ = onboard_family(ops_client)
+    sent = ops_client.post("/v1/events", headers=auth(parent_token), json={"events": [
+        {"id": str(uuid4()), "name": "health_link_result", "code": code,
+         "at": (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat(),
+         "platform": "ANDROID", "appVersion": "1.2 (44)"}
+        for code, minutes in (("PERMISSION_DENIED", 5), ("CONNECTED", 1))
+    ]})
+    assert sent.json() == {"accepted": 2}
+    health = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["healthLink"]
+    assert health["people"] == 1
+    assert health["events"] == 2
+    assert health["results"][0]["people"] == {"IOS": 0, "ANDROID": 1}

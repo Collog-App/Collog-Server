@@ -68,6 +68,11 @@ const PROCESSING_ERROR = {
   AUDIO_EXPIRED: "음성 보관 24시간 지남",
   OTHER: "기타",
 };
+const HEALTH_RESULT = {
+  CONNECTED: "연결됨(기록 올라감)",
+  PERMISSION_DENIED: "권한 거부",
+  CONNECTED_NO_RECORDS: "연결됐지만 올릴 기록 없음",
+};
 const PAUSE_REASON = {
   NO_CHILD_TRACK: "자녀 쪽 녹음 없음",
   INSUFFICIENT_WORD_TIMING: "이어진 말이 짧아 잴 구간 없음",
@@ -493,8 +498,36 @@ function renderFeatures(s) {
         `프로필이 있는 부모 ${fmt(x.parentsWithProfile)}명 · 걱정을 직접 쓴 부모 ${fmt(x.concernsWritten)}명`,
         CONDITION,
       ),
+      renderHealthLink(s.healthLink),
     ),
   ];
+}
+
+function renderHealthLink(h) {
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "건강 앱 연결 결과 (앱 기록)"),
+    table(
+      ["결과", "사람 iPhone", "사람 Android", "건수 iPhone", "건수 Android"],
+      h.results.map((row) =>
+        el(
+          "tr",
+          {},
+          el("td", {}, HEALTH_RESULT[row.code] || row.code),
+          el("td", {}, fmt(row.people.IOS)),
+          el("td", {}, fmt(row.people.ANDROID)),
+          el("td", {}, fmt(row.events.IOS)),
+          el("td", {}, fmt(row.events.ANDROID)),
+        ),
+      ),
+    ),
+    el(
+      "p",
+      { class: "muted" },
+      `사람 ${fmt(h.people)}명 · 건수 ${fmt(h.events)}건. 사람 = 그 사람이 가장 최근에 남긴 결과(그때 기기)로 한 번만 셈, 건수 = 연결을 시도할 때마다 남은 기록 수. iPhone 은 읽기 권한 허용 여부를 알 수 없어 「권한 거부」를 보내지 않습니다.`,
+    ),
+  );
 }
 
 function renderSignup(g) {
@@ -818,6 +851,7 @@ function summaryText(s) {
     `- 리포트 발행 ${fmt(x.reportsIssued)}회, 건강 앱 연동 ${pct(x.healthLinked)} (${frac(x.healthLinked)}명)`,
     `- 전화 알림 보냈는데 안 울림 ${pct(s.delivery.notRung)} (${frac(s.delivery.notRung)}통화)`,
     `- 가입 흐름(가입 완료 ${fmt(s.signup.signedUp)}명 기준): ${FUNNEL.map(([key, label]) => `${label} ${fmt(s.signup.stages[key].n)}명`).join(", ")}`,
+    `- 건강 앱 연결 결과(사람, 가장 최근 결과 기준): ${s.healthLink.results.map((r) => `${HEALTH_RESULT[r.code] || r.code} ${fmt(r.people.IOS + r.people.ANDROID)}명`).join(", ")} (건수 ${fmt(s.healthLink.events)}건)`,
     `- 분석 품질: 추출 없이 분석 완료 ${pct(s.quality.analyzedWithoutExtraction)} (${frac(s.quality.analyzedWithoutExtraction)}통화), 휴지 비율 측정 불가 ${pct(s.quality.pauseUnmeasurable)} (${frac(s.quality.pauseUnmeasurable)}통화), 말이 짧아 분석 제외 ${pct(s.quality.shortSpeechExcluded)} (${frac(s.quality.shortSpeechExcluded)}통화), 처리 오류 ${Object.entries(s.quality.processingErrors.all).map(([k, n]) => `${PROCESSING_ERROR[k] || k} ${fmt(n)}`).join(", ") || "없음"}`,
     ...s.cohorts.groups.map(
       (g) =>

@@ -64,14 +64,15 @@ STATIC = Path(__file__).with_name("ops_static")
 TREND_WEEKS = 12
 COHORT_WEEKS = 8
 COHORTS: tuple[str | None, ...] = (OpsCohort.AWARE.value, OpsCohort.UNAWARE.value, None)
-# 운영 지표에 쓰는 로그인 뒤 이용 기록. 가입 단계 기록은 익명 줄까지 따로 읽고(load_dataset),
-# 건강 연동·지표 설명 기록은 아직 화면에 없다.
+# 운영 지표에 쓰는 로그인 뒤 이용 기록. 가입 단계(익명 줄 포함)·건강 연동 결과 기록은 플랫폼까지
+# 따로 읽고(load_dataset), 지표 설명 기록은 아직 화면에 없다.
 OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_shown",
               "call_connect_failed")
 # 가입 단계 화면(onboarding_step 코드)을 앱 흐름 순서로. 이용 기록 약속 문서와 같다.
 ONBOARDING_STEPS = ("WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
                     "INVITE_CODE", "DONE")
 PLATFORMS = ("IOS", "ANDROID")
+HEALTH_LINK_RESULTS = ("CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS")
 # 분석 처리가 calls.processing_error 에 남기는 문구(services/pipeline.py) → 종류. 모르는 문구는
 # OTHER 로만 보이고 원문은 화면·응답에 내보내지 않는다.
 PROCESSING_ERROR_KINDS = {
@@ -220,6 +221,7 @@ class Dataset:
         self.extraction_status: dict[str, str] = {}
         self.short_speech: set[str] = set()
         self.pause_ratio: dict[str, Any] = {}
+        self.health_results: list[Any] = []
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -442,6 +444,13 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             select(
                 AppEvent.user_id, AppEvent.code, AppEvent.platform, AppEvent.occurred_at
             ).where(AppEvent.name == "onboarding_step")
+        )
+    )
+    data.health_results = list(
+        await session.execute(
+            select(
+                AppEvent.user_id, AppEvent.code, AppEvent.platform, AppEvent.occurred_at
+            ).where(AppEvent.name == "health_link_result", AppEvent.user_id.is_not(None))
         )
     )
     data.pushes = [
@@ -977,6 +986,37 @@ def build_quality(
     }
 
 
+def build_health_link(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """건강 앱 연결 시도 결과(health_link_result). 사람 수는 그 사람의 가장 최근 결과로 센다."""
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    events = sorted(
+        (e for e in data.health_results if e.user_id in keep),
+        key=lambda e: aware(e.occurred_at),
+    )
+    latest = {e.user_id: e for e in events}
+    counted = Counter((e.code, e.platform) for e in events)
+    people = Counter((e.code, e.platform) for e in latest.values())
+    return {
+        "people": len(latest),
+        "events": len(events),
+        "results": [
+            {
+                "code": code,
+                "people": {platform: people[(code, platform)] for platform in PLATFORMS},
+                "events": {platform: counted[(code, platform)] for platform in PLATFORMS},
+            }
+            for code in HEALTH_LINK_RESULTS
+        ],
+    }
+
+
 # ---------------------------------------------------------------- 경로
 
 
@@ -1038,6 +1078,7 @@ async def ops_summary(
         "delivery": build_delivery(data, **scope),
         "signup": build_signup(data, **scope),
         "quality": build_quality(data, **scope),
+        "healthLink": build_health_link(data, **scope),
     }
 
 
