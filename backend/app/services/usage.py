@@ -52,24 +52,39 @@ def metering() -> Iterator[Usage]:
         _meter.reset(token)
 
 
+# 한 값의 상한. 통화 한 건에 이보다 큰 사용량은 없으므로 넘으면 값이 없는 것으로 본다(아주 큰
+# 정수가 들어와 합·평균 계산이 넘치지 않게).
+MAX_VALUE = 1e9
+GEMINI_KEYS = ("geminiInputTokens", "geminiOutputTokens", "geminiThoughtTokens")
+
+
 def number(value: Any) -> float | None:
+    """0 이상 MAX_VALUE 이하의 유한한 수만 값으로 본다. 어떤 입력에도 예외를 내지 않는다."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value < 0:
+    try:
+        # 아주 큰 정수는 float 로 바꾸면 넘치므로 범위부터 본다(NaN 은 비교가 모두 거짓).
+        if not 0 <= value <= MAX_VALUE or not math.isfinite(value):
+            return None
+    except (OverflowError, TypeError, ValueError):
         return None
     return value
 
 
 def merge(old: Mapping[str, Any] | None, new: Mapping[str, Any]) -> Usage:
-    """같은 칸은 더한다. 어느 한쪽이라도 None(모름)이면 그 칸은 None 이다."""
-    merged: Usage = dict(old or {})
+    """같은 칸은 더한다. 어느 한쪽이라도 None(모름)이거나 합이 상한을 넘으면 그 칸은 None 이다."""
+    merged: Usage = (
+        {key: number(value) for key, value in old.items()} if isinstance(old, Mapping) else {}
+    )
     for key, value in new.items():
-        if key in merged and (merged[key] is None or value is None):
-            merged[key] = None
-        elif key in merged:
-            merged[key] = round(merged[key] + value, 3)
-        else:
+        value = number(value)
+        if key not in merged:
             merged[key] = value
+        elif merged[key] is None or value is None:
+            merged[key] = None
+        else:
+            total = number(merged[key] + value)
+            merged[key] = None if total is None else round(total, 3)
     return merged
 
 
@@ -78,22 +93,31 @@ def add(key: str, value: Any) -> None:
     if spent is None:
         return
     try:
-        spent.update(merge(spent, {key: number(value)}))
+        spent.update(merge(spent, {key: value}))
     except Exception:
         logger.warning("AI usage could not be recorded (%s)", key, exc_info=True)
 
 
-def add_gemini(usage_metadata: Any) -> None:
-    """Gemini 응답의 usageMetadata. 값이 0 인 칸은 응답 JSON 에서 빠지므로 없으면 0 으로 본다."""
+def gemini_values(usage_metadata: Any) -> dict[str, float | None]:
     if not isinstance(usage_metadata, Mapping):
-        for key in ("geminiInputTokens", "geminiOutputTokens", "geminiThoughtTokens"):
-            add(key, None)
-        return
+        return dict.fromkeys(GEMINI_KEYS)
     candidates = number(usage_metadata.get("candidatesTokenCount", 0))
     thoughts = number(usage_metadata.get("thoughtsTokenCount", 0))
-    add("geminiInputTokens", usage_metadata.get("promptTokenCount"))
-    add(
-        "geminiOutputTokens",
-        None if candidates is None or thoughts is None else candidates + thoughts,
-    )
-    add("geminiThoughtTokens", thoughts)
+    return {
+        "geminiInputTokens": number(usage_metadata.get("promptTokenCount")),
+        "geminiOutputTokens": (
+            None if candidates is None or thoughts is None else candidates + thoughts
+        ),
+        "geminiThoughtTokens": thoughts,
+    }
+
+
+def add_gemini(usage_metadata: Any) -> None:
+    """Gemini 응답의 usageMetadata. 값이 0 인 칸은 응답 JSON 에서 빠지므로 없으면 0 으로 본다."""
+    try:
+        values = gemini_values(usage_metadata)
+    except Exception:
+        logger.warning("Gemini usage could not be read", exc_info=True)
+        values = dict.fromkeys(GEMINI_KEYS)
+    for key, value in values.items():
+        add(key, value)

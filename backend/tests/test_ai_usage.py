@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +17,7 @@ from app.services import usage
 from app.services.deepgram import DeepgramSttGateway
 from app.services.gemini import GeminiExtractionGateway
 from app.services.storage import LocalStorage
-from app.services.tts import ElevenLabsQuestionTtsGateway
+from app.services.tts import ElevenLabsQuestionTtsGateway, character_cost
 from tests.conftest import auth
 from tests.test_api_flow import onboard_family
 from tests.test_call_summary import LONG_TALK, TALK
@@ -258,3 +261,61 @@ def test_direct_question_voice_leaves_the_characters_unknown(
     assert saved_usage(client, call["callId"]) is None
     assert client.post(route, headers=auth(child_token)).status_code == 200
     assert saved_usage(client, call["callId"]) == {"ttsCharacters": None}
+
+
+# ------------------------------------------------------------ 큰 값·이상한 값
+
+
+def test_values_above_the_limit_or_unreadable_count_as_unknown() -> None:
+    assert usage.number(usage.MAX_VALUE) == usage.MAX_VALUE
+    for value in (10**400, usage.MAX_VALUE + 1, float("nan"), float("inf"), -1):
+        assert usage.number(value) is None
+    # 합이 상한을 넘어도 값 없음
+    assert usage.merge({"sttAudioSec": 6e8}, {"sttAudioSec": 6e8}) == {"sttAudioSec": None}
+    # 저장된 값이 깨져 있어도 예외를 내지 않는다
+    assert usage.merge(["broken"], {"sttAudioSec": 1}) == {"sttAudioSec": 1}
+    assert usage.merge({"sttAudioSec": "x"}, {"sttAudioSec": 1}) == {"sttAudioSec": None}
+
+
+def test_metering_never_raises_on_odd_provider_values() -> None:
+    class Exploding(dict):
+        def get(self, *args):
+            raise RuntimeError("broken mapping")
+
+    with usage.metering() as spent:
+        usage.add_gemini({"promptTokenCount": 10**400, "candidatesTokenCount": "x"})
+        usage.add_gemini(Exploding())
+        usage.add("ttsCharacters", 10**400)
+    assert spent == {
+        "geminiInputTokens": None,
+        "geminiOutputTokens": None,
+        "geminiThoughtTokens": None,
+        "ttsCharacters": None,
+    }
+    assert character_cost(httpx.Headers({"character-cost": "9" * 5000})) is None
+    assert character_cost(httpx.Headers({"character-cost": "99999999999"})) == 99999999999
+    with usage.metering() as spent:
+        usage.add("ttsCharacters", character_cost(httpx.Headers({"character-cost": "9" * 30})))
+    assert spent == {"ttsCharacters": None}
+
+
+def test_huge_stored_usage_does_not_break_the_ops_summary(tmp_path: Path) -> None:
+    from tests.test_ops_dashboard import CODE, make_client
+
+    digest = hashlib.sha256(CODE.encode()).hexdigest()
+    with make_client(tmp_path, f"tester:{digest}") as ops_client:
+        child_token, _, _, parent = onboard_family(ops_client)
+        created = ops_client.post(
+            "/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]}
+        )
+        call_id = created.json()["callId"]
+        with sqlite3.connect(tmp_path / "ops.db") as connection:
+            connection.execute(
+                "update calls set ai_usage = ? where id = ?",
+                (json.dumps({"sttAudioSec": 10**400, "geminiInputTokens": 12}), call_id),
+            )
+        response = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE})
+        assert response.status_code == 200, response.text
+        month = response.json()["aiUsage"]["months"][0]
+        assert month["sttAudioSec"] == {"total": 0, "calls": 0, "perCall": None, "unknown": 1}
+        assert month["geminiInputTokens"]["total"] == 12

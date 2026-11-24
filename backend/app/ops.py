@@ -1132,7 +1132,8 @@ def build_ai_usage(
     keep = included_users(data, include_internal=include_internal, since=since)
     months: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for c in data.calls:
-        if c.ai_usage and c.parent_id in keep and c.child_id in keep:
+        if isinstance(c.ai_usage, dict) and c.ai_usage and c.parent_id in keep \
+                and c.child_id in keep:
             months[kst_day(c.started_at).strftime("%Y-%m")].append(c.ai_usage)
 
     def total(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
