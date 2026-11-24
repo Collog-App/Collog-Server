@@ -106,14 +106,17 @@ class RealLiveKitGateway(LiveKitGateway):
         )
 
     async def check_reachable(self) -> None:
-        client = self._client()
+        client = None
         try:
+            # 설정이 틀려 클라이언트를 만들지 못해도 장애 알림의 「LiveKit 접속 불가」로 나오게 한다
+            client = self._client()
             # 없는 방 이름 하나만 물어 서버가 인증된 요청에 답하는지만 본다
             await client.room.list_rooms(api.ListRoomsRequest(names=["collog-health-check"]))
         except Exception as exc:
             raise LiveKitError("LiveKit server did not answer") from exc
         finally:
-            await client.aclose()
+            if client is not None:
+                await client.aclose()
 
     async def participant_identities(self, room_name: str) -> set[str] | None:
         client = self._client()

@@ -122,9 +122,9 @@ async def test_analysis_backlog_counts_recorded_calls_waiting_too_long(database:
     minutes = timedelta(minutes=1)
     await add_calls(
         database,
-        (CallState.PROCESSING.value, True, 25 * minutes),
+        (CallState.PROCESSING.value, True, 35 * minutes),
         (CallState.ENDED.value, True, 30 * minutes),
-        (CallState.ENDED.value, True, 5 * minutes),  # 아직 20분이 안 됨
+        (CallState.ENDED.value, True, 25 * minutes),  # 아직 30분이 안 됨
         (CallState.ENDED.value, False, 60 * minutes),  # 녹음 안 한 통화
         (CallState.ANALYZED.value, True, 60 * minutes),
     )
@@ -172,3 +172,30 @@ async def test_real_livekit_check_reports_a_closed_server() -> None:
     )
     with pytest.raises(LiveKitError):
         await RealLiveKitGateway(settings).check_reachable()
+
+
+async def test_livekit_client_setup_error_is_an_unreachable_problem(
+    database: Database, monkeypatch
+) -> None:
+    gateway = RealLiveKitGateway(Settings(
+        _env_file=None,
+        livekit_api_key="key",
+        livekit_api_secret="secret-with-more-than-thirty-two-characters",
+        storage_backend="s3",
+    ))
+
+    def broken_client():
+        raise ValueError("bad LiveKit settings")
+
+    monkeypatch.setattr(gateway, "_client", broken_client)
+    with pytest.raises(LiveKitError):
+        await gateway.check_reachable()
+    found = await problems(database, gateway)
+    assert [p["code"] for p in found] == ["LIVEKIT_UNREACHABLE"]
+
+
+def test_backlog_threshold_covers_upload_wait_and_processing_limit() -> None:
+    settings = Settings(_env_file=None)
+    waits = timedelta(seconds=settings.upload_url_ttl_seconds + settings.processing_timeout_seconds)
+    assert ops.ANALYSIS_BACKLOG_AFTER == timedelta(minutes=30)
+    assert ops.ANALYSIS_BACKLOG_AFTER > waits

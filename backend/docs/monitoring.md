@@ -11,8 +11,8 @@ GitHub Actions `Production monitor`(`.github/workflows/monitor.yml`)가 15분마
 
 | code | 언제 | 기준 상수 |
 |---|---|---|
-| `LIVEKIT_UNREACHABLE` | LiveKit 서버가 API 요청에 5초 안에 답하지 않거나 오류 | `LIVEKIT_TIMEOUT_SECONDS` |
-| `ANALYSIS_BACKLOG` | 녹음된 통화가 끝나고 20분 넘게 분석 대기(`ENDED`)나 분석 중(`PROCESSING`)에 있음(건수 포함) | `ANALYSIS_BACKLOG_AFTER` |
+| `LIVEKIT_UNREACHABLE` | LiveKit 서버가 API 요청에 5초 안에 답하지 않거나 오류(설정이 틀려 접속 준비를 못 한 경우 포함) | `LIVEKIT_TIMEOUT_SECONDS` |
+| `ANALYSIS_BACKLOG` | 녹음된 통화가 끝나고 30분 넘게 분석 대기(`ENDED`)나 분석 중(`PROCESSING`)에 있음(건수 포함). 원음 업로드 대기 15분과 처리 제한 10분, 재시도를 넘기는 값 | `ANALYSIS_BACKLOG_AFTER` |
 | `ANALYSIS_FAILING` | 분석이 끝난(완료·실패) 통화를 통화 끝난 시각 순으로 볼 때 최근 3건이 모두 실패이고, 그중 가장 최근이 24시간 안 | `FAILURE_STREAK`, `FAILURE_STREAK_WITHIN` |
 
 응답은 `{"ok": bool, "problems": [{"code": "...", "message": "한국어 한 줄"}]}` 입니다.

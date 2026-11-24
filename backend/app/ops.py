@@ -97,7 +97,8 @@ RING_REPORT_GRACE = timedelta(hours=1)
 ALERTS_ONLY_LABELS = frozenset({"monitor"})
 # 장애 알림 기준
 LIVEKIT_TIMEOUT_SECONDS = 5
-ANALYSIS_BACKLOG_AFTER = timedelta(minutes=20)
+# 원음 업로드 대기(15분) + 처리 제한 시간(10분) + 재시도를 넘겨야 정말 밀린 것으로 본다
+ANALYSIS_BACKLOG_AFTER = timedelta(minutes=30)
 FAILURE_STREAK = 3
 FAILURE_STREAK_WITHIN = timedelta(hours=24)
 
