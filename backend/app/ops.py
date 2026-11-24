@@ -14,16 +14,17 @@ import hashlib
 import hmac
 import logging
 from collections import Counter, defaultdict
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from statistics import mean, median
+from types import SimpleNamespace
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -65,10 +66,11 @@ STATIC = Path(__file__).with_name("ops_static")
 TREND_WEEKS = 12
 COHORT_WEEKS = 8
 COHORTS: tuple[str | None, ...] = (OpsCohort.AWARE.value, OpsCohort.UNAWARE.value, None)
-# 운영 지표에 쓰는 로그인 뒤 이용 기록. 가입 단계(익명 줄 포함)·건강 연동 결과 기록은 플랫폼까지
-# 따로 읽고(load_dataset), 지표 설명 기록은 아직 화면에 없다.
-OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_shown",
-              "call_connect_failed")
+# 이용 기록은 요약 화면에서만 읽는다(load_events). 그룹 표가 읽는 줄(앱 열기·리포트 보기·통화 뒤
+# 답)은 주별 표 범위에 한 주 여유를 둔 기간만, 나머지는 SQL 로 묶어서 센다. 지표 설명 기록은 아직
+# 화면에 없다.
+COHORT_EVENTS = ("app_open", "report_view")
+COHORT_EVENT_WINDOW = timedelta(weeks=COHORT_WEEKS + 1)
 # 가입 단계 화면(onboarding_step 코드)을 앱 흐름 순서로. 이용 기록 약속 문서와 같다.
 ONBOARDING_STEPS = ("WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
                     "INVITE_CODE", "DONE")
@@ -214,16 +216,19 @@ class Dataset:
         self.profiles: list[Any] = []
         self.signals: list[Any] = []
         self.cohorts: dict[str, str] = {}
+        # 이용 기록(load_events): 그룹 표·「안 울림」이 쓰는 줄, 집계된 건수
         self.events: list[Any] = []
         self.first_event: dict[str, datetime] = {}
+        self.connect_failed: list[Any] = []
+        self.onboarding: list[Any] = []
+        self.health_counts: list[Any] = []
+        self.health_latest: list[Any] = []
         self.pushes: list[Any] = []
         self.consent_latest: dict[str, str] = {}
         self.inviters: set[str] = set()
-        self.onboarding: list[Any] = []
         self.extraction_status: dict[str, str] = {}
         self.short_speech: set[str] = set()
         self.pause_ratio: dict[str, Any] = {}
-        self.health_results: list[Any] = []
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -421,41 +426,6 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
         )
     )
 
-    # 이용 기록은 「마지막 사용」 계산(last_seen)에 넣지 않는다. 기존 지표가 그대로 남게 한다.
-    data.events = list(
-        await session.execute(
-            select(
-                AppEvent.user_id,
-                AppEvent.name,
-                AppEvent.code,
-                AppEvent.call_id,
-                AppEvent.occurred_at,
-            ).where(AppEvent.user_id.is_not(None), AppEvent.name.in_(OPS_EVENTS))
-        )
-    )
-    data.first_event = {
-        row.user_id: aware(row.first)
-        for row in await session.execute(
-            select(AppEvent.user_id, func.min(AppEvent.occurred_at).label("first"))
-            .where(AppEvent.user_id.is_not(None))
-            .group_by(AppEvent.user_id)
-        )
-    }
-    # 로그인 전 단계는 익명 줄(user_id 없음)이다
-    data.onboarding = list(
-        await session.execute(
-            select(
-                AppEvent.user_id, AppEvent.code, AppEvent.platform, AppEvent.occurred_at
-            ).where(AppEvent.name == "onboarding_step")
-        )
-    )
-    data.health_results = list(
-        await session.execute(
-            select(
-                AppEvent.user_id, AppEvent.code, AppEvent.platform, AppEvent.occurred_at
-            ).where(AppEvent.name == "health_link_result", AppEvent.user_id.is_not(None))
-        )
-    )
     data.pushes = [
         row
         for row in await session.execute(
@@ -471,6 +441,130 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
         if row.incoming_push
     ]
     return data
+
+
+async def load_events(
+    session: AsyncSession, data: Dataset, *, now: datetime, since: date | None
+) -> None:
+    """요약 화면이 쓰는 이용 기록. 표를 통째로 읽지 않고 기간을 묶거나 SQL 로 센다.
+
+    이용 기록은 「마지막 사용」 계산(last_seen)에 넣지 않는다. 기존 지표가 그대로 남게 한다.
+    """
+    window = now - COHORT_EVENT_WINDOW
+    signed_in = AppEvent.user_id.is_not(None)
+    data.events = list(
+        await session.execute(
+            select(
+                AppEvent.user_id,
+                AppEvent.name,
+                AppEvent.code,
+                AppEvent.call_id,
+                AppEvent.occurred_at,
+            ).where(signed_in, AppEvent.name.in_(COHORT_EVENTS), AppEvent.occurred_at >= window)
+        )
+    )
+    # 통화 뒤 답은 (사용자, 통화)마다 가장 최근 답 하나만
+    answered = (
+        select(
+            AppEvent.user_id, AppEvent.call_id, func.max(AppEvent.occurred_at).label("at")
+        )
+        .where(
+            signed_in,
+            AppEvent.name == "post_call_answer",
+            AppEvent.call_id.is_not(None),
+            AppEvent.occurred_at >= window,
+        )
+        .group_by(AppEvent.user_id, AppEvent.call_id)
+        .subquery()
+    )
+    answers: dict[tuple[str, str], Any] = {}
+    for row in await session.execute(
+        select(
+            AppEvent.user_id, AppEvent.name, AppEvent.code, AppEvent.call_id, AppEvent.occurred_at
+        ).join(
+            answered,
+            and_(
+                AppEvent.user_id == answered.c.user_id,
+                AppEvent.call_id == answered.c.call_id,
+                AppEvent.occurred_at == answered.c.at,
+            ),
+        ).where(AppEvent.name == "post_call_answer")
+    ):
+        answers.setdefault((row.user_id, row.call_id), row)
+    data.events += answers.values()
+    # 「안 울림」: 받는 사람 앱이 울림 기록을 남긴 (사용자, 통화). 통화마다 많아야 두 줄이다.
+    data.events += [
+        SimpleNamespace(
+            user_id=row.user_id, name="incoming_call_shown", code=None, call_id=row.call_id,
+            occurred_at=row.first,
+        )
+        for row in await session.execute(
+            select(
+                AppEvent.user_id, AppEvent.call_id, func.min(AppEvent.occurred_at).label("first")
+            )
+            .where(
+                signed_in, AppEvent.name == "incoming_call_shown", AppEvent.call_id.is_not(None)
+            )
+            .group_by(AppEvent.user_id, AppEvent.call_id)
+        )
+    ]
+    data.first_event = {
+        row.user_id: aware(row.first)
+        for row in await session.execute(
+            select(AppEvent.user_id, func.min(AppEvent.occurred_at).label("first"))
+            .where(signed_in)
+            .group_by(AppEvent.user_id)
+        )
+    }
+    data.connect_failed = list(
+        await session.execute(
+            select(
+                AppEvent.user_id,
+                AppEvent.code,
+                func.count().label("total"),
+                func.sum(
+                    case((AppEvent.occurred_at >= now - timedelta(days=7), 1), else_=0)
+                ).label("recent"),
+            )
+            .where(signed_in, AppEvent.name == "call_connect_failed")
+            .group_by(AppEvent.user_id, AppEvent.code)
+        )
+    )
+
+    # 가입 단계: 로그인 뒤 줄은 사람·단계·플랫폼별로, 익명 줄은 단계·플랫폼별로 센다.
+    # 익명 줄은 계정이 없어 「가입일 이후」를 기록 시각(그 날 한국 시간 0시부터)으로 거른다.
+    steps = (
+        select(AppEvent.user_id, AppEvent.code, AppEvent.platform, func.count().label("n"))
+        .where(AppEvent.name == "onboarding_step")
+        .group_by(AppEvent.user_id, AppEvent.code, AppEvent.platform)
+    )
+    if since is not None:
+        start = datetime.combine(since, time.min, tzinfo=KST).astimezone(UTC)
+        steps = steps.where(or_(signed_in, AppEvent.occurred_at >= start))
+    data.onboarding = list(await session.execute(steps))
+
+    data.health_counts = list(
+        await session.execute(
+            select(AppEvent.user_id, AppEvent.code, AppEvent.platform, func.count().label("n"))
+            .where(signed_in, AppEvent.name == "health_link_result")
+            .group_by(AppEvent.user_id, AppEvent.code, AppEvent.platform)
+        )
+    )
+    linked = (
+        select(AppEvent.user_id, func.max(AppEvent.occurred_at).label("at"))
+        .where(signed_in, AppEvent.name == "health_link_result")
+        .group_by(AppEvent.user_id)
+        .subquery()
+    )
+    latest: dict[str, Any] = {}
+    for row in await session.execute(
+        select(AppEvent.user_id, AppEvent.code, AppEvent.platform).join(
+            linked,
+            and_(AppEvent.user_id == linked.c.user_id, AppEvent.occurred_at == linked.c.at),
+        ).where(AppEvent.name == "health_link_result")
+    ):
+        latest.setdefault(row.user_id, row)
+    data.health_latest = list(latest.values())
 
 
 # ---------------------------------------------------------------- 지표
@@ -850,16 +944,20 @@ def build_delivery(
         pushed += 1
         not_rung += not rang
 
-    ago7 = now - timedelta(days=7)
-    failures = [e for e in data.events if e.name == "call_connect_failed" and e.user_id in keep]
+    # 연결 실패는 load_events 가 사람·코드별로 센 건수(전체, 최근 7일)를 더한다.
+    failed_all: Counter[str] = Counter()
+    failed_7d: Counter[str] = Counter()
+    for row in data.connect_failed:
+        if row.user_id in keep:
+            failed_all[row.code] += row.total
+            if row.recent:
+                failed_7d[row.code] += row.recent
     return {
         "pushResults": {item.value: results.get(item.value, 0) for item in PushResult},
         "notRung": ratio(not_rung, pushed),
         "connectFailed": {
-            "all": dict(Counter(e.code for e in failures).most_common()),
-            "last7d": dict(
-                Counter(e.code for e in failures if aware(e.occurred_at) >= ago7).most_common()
-            ),
+            "all": dict(failed_all.most_common()),
+            "last7d": dict(failed_7d.most_common()),
         },
     }
 
@@ -901,15 +999,14 @@ def build_signup(
 
     steps: Counter[tuple[str, str]] = Counter()
     anonymous: Counter[str] = Counter()
-    for event in data.onboarding:
-        if event.user_id is None:
-            # 익명 줄은 계정이 없어 팀·시험 계정을 가릴 수 없다. 「가입일 이후」는 기록 날짜로 본다.
-            if since is not None and kst_day(event.occurred_at) < since:
-                continue
-            anonymous[event.code] += 1
-        elif event.user_id not in keep:
+    for row in data.onboarding:
+        if row.user_id is None:
+            # 익명 줄은 계정이 없어 팀·시험 계정을 가릴 수 없다(「가입일 이후」는 load_events 가
+            # 기록 날짜로 거름).
+            anonymous[row.code] += row.n
+        elif row.user_id not in keep:
             continue
-        steps[(event.code, event.platform)] += 1
+        steps[(row.code, row.platform)] += row.n
     return {
         "signedUp": len(signed),
         "loginOnly": len(keep - signed),
@@ -999,16 +1096,15 @@ def build_health_link(
     """건강 앱 연결 시도 결과(health_link_result). 사람 수는 그 사람의 가장 최근 결과로 센다."""
     del now
     keep = included_users(data, include_internal=include_internal, since=since)
-    events = sorted(
-        (e for e in data.health_results if e.user_id in keep),
-        key=lambda e: aware(e.occurred_at),
-    )
-    latest = {e.user_id: e for e in events}
-    counted = Counter((e.code, e.platform) for e in events)
-    people = Counter((e.code, e.platform) for e in latest.values())
+    latest = [row for row in data.health_latest if row.user_id in keep]
+    counted: Counter[tuple[str, str]] = Counter()
+    for row in data.health_counts:
+        if row.user_id in keep:
+            counted[(row.code, row.platform)] += row.n
+    people = Counter((row.code, row.platform) for row in latest)
     return {
         "people": len(latest),
-        "events": len(events),
+        "events": sum(counted.values()),
         "results": [
             {
                 "code": code,
@@ -1114,6 +1210,7 @@ async def ops_summary(
     settings: Settings = request.app.state.container.settings
     now = datetime.now(UTC)
     data = await load_dataset(session, settings)
+    await load_events(session, data, now=now, since=since)
     logger.info("ops summary viewed by %s", operator)
     scope = {"now": now, "include_internal": internal, "since": since}
     return {

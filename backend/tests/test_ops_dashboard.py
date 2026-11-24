@@ -11,9 +11,11 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sa_event
 
 from app.config import Settings
 from app.main import create_app
+from app.models import AppEvent
 from app.ops import (
     KST,
     Dataset,
@@ -25,9 +27,12 @@ from app.ops import (
     build_quality,
     build_signup,
     build_summary,
+    load_dataset,
+    load_events,
 )
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
+from tests.test_app_events import declined_call
 from tests.test_call_summary import LONG_TALK
 from tests.test_guardrail import analyze_family_call
 
@@ -406,6 +411,10 @@ def test_cohort_tables_split_people_by_group() -> None:
     assert {g["cohort"]: g["people"] for g in with_internal["groups"]}["AWARE"] == 3
 
 
+def failed(user_id: str, code: str, *, total: int, recent: int) -> SimpleNamespace:
+    return SimpleNamespace(user_id=user_id, code=code, total=total, recent=recent)
+
+
 def push_row(call_id: str, caller: str, started: datetime, result: str) -> SimpleNamespace:
     return SimpleNamespace(
         id=call_id,
@@ -438,10 +447,13 @@ def test_not_rung_counts_only_calls_the_receiving_app_could_report() -> None:
         app_event("p1", "incoming_call_shown", hours3, call_id="rang"),
         app_event("c1", "incoming_call_shown", hours3, call_id="silent"),  # 건 사람 기록은 아님
         app_event("c1", "incoming_call_shown", hours3, call_id="to-child"),
-        app_event("c1", "call_connect_failed", NOW - timedelta(days=1), "NETWORK"),
-        app_event("p1", "call_connect_failed", NOW - timedelta(days=10), "NETWORK"),
-        app_event("c1", "call_connect_failed", NOW - timedelta(hours=2), "MIC_PERMISSION"),
-        app_event("i1", "call_connect_failed", NOW - timedelta(hours=2), "SERVER"),
+    ]
+    # 연결 실패는 load_events 가 사람·코드별로 센 건수(전체, 최근 7일)로 온다
+    data.connect_failed = [
+        failed("c1", "NETWORK", total=1, recent=1),  # 1일 전
+        failed("p1", "NETWORK", total=1, recent=0),  # 10일 전
+        failed("c1", "MIC_PERMISSION", total=1, recent=1),  # 2시간 전
+        failed("i1", "SERVER", total=1, recent=1),
     ]
     delivery = build_delivery(data, now=NOW, include_internal=False, since=None)
     assert delivery["pushResults"] == {"SENT": 5, "TOKEN_INVALID": 1, "FAILED": 0, "NO_DEVICE": 0}
@@ -456,8 +468,14 @@ def test_not_rung_counts_only_calls_the_receiving_app_could_report() -> None:
 # ------------------------------------------------------------ 가입 퍼널
 
 
-def step(user_id: str | None, code: str, platform: str, at: datetime) -> SimpleNamespace:
-    return SimpleNamespace(user_id=user_id, code=code, platform=platform, occurred_at=at)
+def counted(user_id: str | None, code: str, platform: str, n: int = 1) -> SimpleNamespace:
+    """load_events 가 사람(익명은 None)·코드·플랫폼별로 센 한 줄."""
+    return SimpleNamespace(user_id=user_id, code=code, platform=platform, n=n)
+
+
+def anonymous_step(code: str, at: datetime) -> dict:
+    return {"id": str(uuid4()), "name": "onboarding_step", "code": code,
+            "at": at.isoformat(), "platform": "ANDROID", "appVersion": "1.2 (44)"}
 
 
 def signup_dataset() -> Dataset:
@@ -484,11 +502,10 @@ def signup_dataset() -> Dataset:
         SimpleNamespace(parent_id="p2", issued_at=NOW, state="EMPTY"),
     ]
     data.onboarding = [
-        step(None, "WELCOME", "IOS", NOW - timedelta(days=1)),
-        step(None, "WELCOME", "IOS", NOW - timedelta(days=10)),
-        step(None, "LOGIN", "ANDROID", NOW - timedelta(days=1)),
-        step("late", "TERMS", "IOS", NOW - timedelta(days=1)),
-        step("i1", "CONDITIONS", "ANDROID", NOW - timedelta(days=30)),
+        counted(None, "WELCOME", "IOS", 2),
+        counted(None, "LOGIN", "ANDROID"),
+        counted("late", "TERMS", "IOS"),
+        counted("i1", "CONDITIONS", "ANDROID"),
     ]
     return data
 
@@ -532,9 +549,24 @@ def test_signup_funnel_follows_internal_and_since_filters() -> None:
     assert recent["signedUp"] == 0
     assert recent["stages"]["consentGranted"] == {"n": 0, "d": 0, "pct": None}
     steps = {row["step"]: row for row in recent["onboardingSteps"]}
-    # 익명 줄은 기록 날짜로 거른다(10일 전 시작 화면 기록은 빠짐)
-    assert steps["WELCOME"]["IOS"] == 1
-    assert steps["TERMS"]["IOS"] == 1
+    assert steps["TERMS"]["IOS"] == 1  # 11-20 이후 계정 late 의 로그인 뒤 기록
+
+
+def test_anonymous_steps_follow_the_since_filter_by_record_date(ops_client: TestClient) -> None:
+    now = datetime.now(UTC)
+    batch = [anonymous_step("WELCOME", now - timedelta(days=10)),
+             anonymous_step("WELCOME", now - timedelta(hours=1))]
+    assert ops_client.post("/v1/events/anonymous", json={"events": batch}).json() == {
+        "accepted": 2
+    }
+    headers = {"X-Ops-Code": CODE}
+    since = (now.astimezone(KST) - timedelta(days=2)).date().isoformat()
+    for query, expected in (("", 2), (f"?since={since}", 1)):
+        steps = ops_client.get(f"/ops/api/summary{query}", headers=headers).json()["signup"][
+            "onboardingSteps"
+        ]
+        assert steps[0] == {"step": "WELCOME", "IOS": 0, "ANDROID": expected,
+                            "anonymous": expected}
 
 
 def test_signup_funnel_reads_the_real_tables(ops_client: TestClient) -> None:
@@ -650,13 +682,17 @@ def test_health_link_counts_people_by_latest_result_and_every_event() -> None:
     for uid in ("a", "b", "i"):
         data.users[uid] = user(uid, "PARENT", start)
     data.internal = {"i"}
-    data.health_results = [
-        # a: 안드로이드에서 거부했다가 연결 → 사람은 연결 1, 건수는 둘 다
-        step("a", "PERMISSION_DENIED", "ANDROID", NOW - timedelta(days=3)),
-        step("a", "CONNECTED", "ANDROID", NOW - timedelta(days=1)),
-        step("b", "CONNECTED_NO_RECORDS", "IOS", NOW - timedelta(days=2)),
-        step("b", "CONNECTED_NO_RECORDS", "IOS", NOW - timedelta(days=1)),
-        step("i", "CONNECTED", "IOS", NOW - timedelta(days=1)),  # 팀·시험 계정
+    # a: 안드로이드에서 거부했다가 연결 → 사람은 연결 1, 건수는 둘 다. i 는 팀·시험 계정
+    data.health_counts = [
+        counted("a", "PERMISSION_DENIED", "ANDROID"),
+        counted("a", "CONNECTED", "ANDROID"),
+        counted("b", "CONNECTED_NO_RECORDS", "IOS", 2),
+        counted("i", "CONNECTED", "IOS"),
+    ]
+    data.health_latest = [
+        counted("a", "CONNECTED", "ANDROID"),
+        counted("b", "CONNECTED_NO_RECORDS", "IOS"),
+        counted("i", "CONNECTED", "IOS"),
     ]
     health = build_health_link(data, now=NOW, include_internal=False, since=None)
     assert health["people"] == 2
@@ -751,3 +787,78 @@ def test_ai_usage_of_an_analyzed_mock_call_reaches_the_summary(ops_client: TestC
         (len(LONG_TALK) + len("CHILD: 쓰러지신 적은 없으시죠?")) / 4, abs=0.1
     )
     assert month["ttsCharacters"]["calls"] == 0
+
+
+# ------------------------------------------------------------ 이용 기록 읽기
+
+
+def statements(client: TestClient, path: str) -> list[str]:
+    seen: list[str] = []
+    engine = client.app.state.container.database.engine.sync_engine
+
+    def record(conn, cursor, statement, parameters, context, executemany) -> None:
+        seen.append(" ".join(statement.split()))
+
+    sa_event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert client.get(path, headers={"X-Ops-Code": CODE}).status_code == 200
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", record)
+    return seen
+
+
+def test_accounts_never_read_usage_events_and_summary_reads_them_bounded(
+    ops_client: TestClient,
+) -> None:
+    onboard_family(ops_client)
+    assert not [s for s in statements(ops_client, "/ops/api/accounts") if "app_events" in s]
+    reads = [s for s in statements(ops_client, "/ops/api/summary") if "FROM app_events" in s]
+    assert reads
+    # 표를 통째로 읽는 문이 없다: 모두 SQL 로 묶어 세거나 기간을 둔다
+    assert all("GROUP BY" in s or "app_events.occurred_at >=" in s for s in reads), reads
+
+
+def test_cohort_events_are_read_only_for_the_weekly_window(ops_client: TestClient) -> None:
+    _, child, _, _ = onboard_family(ops_client)
+    now = datetime.now(UTC)
+    container = ops_client.app.state.container
+
+    async def load():
+        async with container.database.sessions() as session:
+            session.add_all([
+                AppEvent(id=name, user_id=child["id"], name="app_open", platform="IOS",
+                         app_version="1.2 (44)", occurred_at=now - age, received_at=now - age)
+                for name, age in (("inside", timedelta(weeks=8)), ("outside", timedelta(weeks=10)))
+            ])
+            await session.commit()
+            data = await load_dataset(session, container.settings)
+            await load_events(session, data, now=now, since=None)
+            return data
+
+    data = ops_client.portal.call(load)
+    assert [(e.user_id, e.name) for e in data.events] == [(child["id"], "app_open")]
+    assert data.first_event[child["id"]] <= now - timedelta(weeks=10)  # 첫 기록은 기간과 무관
+
+
+def test_question_answers_count_once_per_person_and_call(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    first = declined_call(ops_client, child_token, parent_token, parent["id"])
+    second = declined_call(ops_client, child_token, parent_token, parent["id"])
+    now = datetime.now(UTC)
+    answers = [
+        app_event_body("post_call_answer", "YES", first, now - timedelta(minutes=10)),
+        app_event_body("post_call_answer", "NO", first, now - timedelta(minutes=5)),  # 가장 최근
+        app_event_body("post_call_answer", "YES", second, now - timedelta(minutes=1)),
+    ]
+    sent = ops_client.post("/v1/events", headers=auth(child_token), json={"events": answers})
+    assert sent.json() == {"accepted": 3}
+    groups = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["cohorts"][
+        "groups"
+    ]
+    undecided = next(g for g in groups if g["cohort"] is None)
+    assert undecided["questionUsed"] == {"n": 1, "d": 2, "pct": 50.0}
+
+
+def app_event_body(name: str, code: str | None, call_id: str | None, at: datetime) -> dict:
+    return {"id": str(uuid4()), "name": name, "code": code, "callId": call_id,
+            "at": at.isoformat(), "platform": "IOS", "appVersion": "1.2 (44)"}
