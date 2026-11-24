@@ -6,13 +6,21 @@ from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.main import create_app
-from app.ops import Dataset, account_label, build_cohorts, build_delivery, build_summary
+from app.ops import (
+    Dataset,
+    account_label,
+    build_cohorts,
+    build_delivery,
+    build_signup,
+    build_summary,
+)
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
 
@@ -435,4 +443,106 @@ def test_not_rung_counts_only_calls_the_receiving_app_could_report() -> None:
     assert delivery["connectFailed"] == {
         "all": {"NETWORK": 2, "MIC_PERMISSION": 1},
         "last7d": {"NETWORK": 1, "MIC_PERMISSION": 1},
+    }
+
+
+# ------------------------------------------------------------ 가입 퍼널
+
+
+def step(user_id: str | None, code: str, platform: str, at: datetime) -> SimpleNamespace:
+    return SimpleNamespace(user_id=user_id, code=code, platform=platform, occurred_at=at)
+
+
+def signup_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=40)
+    for uid, role in (("c1", "CHILD"), ("p1", "PARENT"), ("c2", "CHILD"), ("p2", "PARENT"),
+                      ("i1", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.users["late"] = user("late", "CHILD", NOW - timedelta(days=1), nickname=None)
+    data.internal = {"i1"}
+    data.consent_latest = {"c1": "GRANTED", "p1": "GRANTED", "c2": "DENIED", "i1": "GRANTED",
+                           "late": "GRANTED"}
+    data.profiles = [SimpleNamespace(parent_id=uid, conditions=[], concerns=None)
+                     for uid in ("p1", "p2", "c2")]
+    data.inviters = {"c1", "c2", "i1"}
+    data.family_users = [(start, {"c1", "p1"}), (start, {"c2"}), (start, {"p2", "i1"})]
+    data.calls = [
+        call("p1", "c1", NOW - timedelta(days=3)),
+        call("p2", "i1", NOW - timedelta(days=3)),  # 팀·시험 계정과 한 통화
+        call("p2", "c2", None),  # 안 받은 전화
+    ]
+    data.reports = [
+        SimpleNamespace(parent_id="p1", issued_at=NOW, state="READY"),
+        SimpleNamespace(parent_id="p2", issued_at=NOW, state="EMPTY"),
+    ]
+    data.onboarding = [
+        step(None, "WELCOME", "IOS", NOW - timedelta(days=1)),
+        step(None, "WELCOME", "IOS", NOW - timedelta(days=10)),
+        step(None, "LOGIN", "ANDROID", NOW - timedelta(days=1)),
+        step("late", "TERMS", "IOS", NOW - timedelta(days=1)),
+        step("i1", "CONDITIONS", "ANDROID", NOW - timedelta(days=30)),
+    ]
+    return data
+
+
+def test_signup_funnel_counts_each_stage_among_signed_up_people() -> None:
+    signup = build_signup(signup_dataset(), now=NOW, include_internal=False, since=None)
+    assert signup["signedUp"] == 4
+    assert signup["loginOnly"] == 1
+    assert signup["stages"] == {
+        "consentGranted": {"n": 2, "d": 4, "pct": 50.0},
+        "consentDenied": {"n": 1, "d": 4, "pct": 25.0},
+        "conditions": {"n": 3, "d": 4, "pct": 75.0},
+        "inviteCreated": {"n": 2, "d": 4, "pct": 50.0},
+        # p2 의 가족은 팀·시험 계정 i1 을 빼면 혼자다
+        "connected": {"n": 2, "d": 4, "pct": 50.0},
+        "firstCall": {"n": 2, "d": 4, "pct": 50.0},
+        # p1 리포트 → p1 과 통화한 c1 도 셈. 빈 리포트(p2)는 세지 않는다
+        "firstReport": {"n": 2, "d": 4, "pct": 50.0},
+    }
+    steps = {row["step"]: row for row in signup["onboardingSteps"]}
+    assert list(steps) == ["WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
+                           "INVITE_CODE", "DONE"]
+    assert steps["WELCOME"] == {"step": "WELCOME", "IOS": 2, "ANDROID": 0, "anonymous": 2}
+    assert steps["LOGIN"] == {"step": "LOGIN", "IOS": 0, "ANDROID": 1, "anonymous": 1}
+    # 가입 단계에서 멈춘 계정의 로그인 뒤 기록은 센다. 팀·시험 계정 기록은 뺀다
+    assert steps["TERMS"] == {"step": "TERMS", "IOS": 1, "ANDROID": 0, "anonymous": 0}
+    assert steps["CONDITIONS"]["ANDROID"] == 0
+
+
+def test_signup_funnel_follows_internal_and_since_filters() -> None:
+    with_internal = build_signup(signup_dataset(), now=NOW, include_internal=True, since=None)
+    assert with_internal["signedUp"] == 5
+    assert with_internal["stages"]["inviteCreated"]["n"] == 3
+    assert with_internal["stages"]["connected"]["n"] == 4
+    assert with_internal["stages"]["firstCall"]["n"] == 4
+    assert {r["step"]: r["ANDROID"] for r in with_internal["onboardingSteps"]}["CONDITIONS"] == 1
+
+    recent = build_signup(
+        signup_dataset(), now=NOW, include_internal=False, since=date(2026, 11, 20)
+    )
+    assert recent["signedUp"] == 0
+    assert recent["stages"]["consentGranted"] == {"n": 0, "d": 0, "pct": None}
+    steps = {row["step"]: row for row in recent["onboardingSteps"]}
+    # 익명 줄은 기록 날짜로 거른다(10일 전 시작 화면 기록은 빠짐)
+    assert steps["WELCOME"]["IOS"] == 1
+    assert steps["TERMS"]["IOS"] == 1
+
+
+def test_signup_funnel_reads_the_real_tables(ops_client: TestClient) -> None:
+    onboard_family(ops_client)
+    anonymous = ops_client.post("/v1/events/anonymous", json={"events": [{
+        "id": str(uuid4()), "name": "onboarding_step", "at": datetime.now(UTC).isoformat(),
+        "platform": "ANDROID", "appVersion": "1.2 (44)", "code": "WELCOME",
+    }]})
+    assert anonymous.json() == {"accepted": 1}
+    signup = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["signup"]
+    assert signup["signedUp"] == 2
+    assert signup["stages"]["consentGranted"]["n"] == 2
+    assert signup["stages"]["inviteCreated"]["n"] == 1  # 초대한 자녀
+    assert signup["stages"]["connected"]["n"] == 2
+    assert signup["stages"]["firstCall"]["n"] == 0
+    assert signup["onboardingSteps"][0] == {
+        "step": "WELCOME", "IOS": 0, "ANDROID": 1, "anonymous": 1
     }

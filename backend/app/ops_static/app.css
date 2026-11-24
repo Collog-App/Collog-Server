@@ -126,6 +126,7 @@ button.wide { width: 100%; padding: 14px; font-size: 16px; }
 .block { background: var(--surface); border-radius: var(--radius); padding: 18px; margin-top: 12px; }
 .blocks { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; }
 .blocks .block { margin-top: 0; }
+.defs { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12px; }
 
 /* 막대 */
 .bars { display: grid; gap: 8px; }

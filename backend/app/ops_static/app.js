@@ -59,6 +59,25 @@ const CONNECT_FAILED = {
   OTHER: "기타",
 };
 const PLATFORM = { IOS: "iPhone", ANDROID: "Android" };
+const FUNNEL = [
+  ["consentGranted", "외부 AI 분석 동의", "마지막 선택이 동의(문서 판이 바뀌어 다시 동의가 필요한 사람도 마지막 선택으로 셈)"],
+  ["consentDenied", "외부 AI 분석 거절", "마지막 선택이 거절"],
+  ["conditions", "질환 등록", "자기 건강 프로필이 저장됨(가족이 대신 저장했거나 질환 없이 저장한 경우 포함)"],
+  ["inviteCreated", "초대 만듦", "자기가 만든 가족에 초대가 하나라도 있음(가족에 들어온 사람이 보낸 초대도 가족을 만든 사람 몫)"],
+  ["connected", "가족과 연결됨(초대 수락)", "가입한 사람이 둘 이상인 가족에 속함(초대를 수락했거나, 내 초대를 누가 수락함)"],
+  ["firstCall", "첫 통화", "받아 연결된 통화가 한 번이라도 있음(건 쪽·받은 쪽 모두)"],
+  ["firstReport", "첫 리포트", "나 또는 내가 통화한 부모님 칸 대상으로 비어 있지 않은 리포트가 발행됨"],
+];
+const ONBOARDING = {
+  WELCOME: "시작 화면",
+  LOGIN: "로그인",
+  TERMS: "약관",
+  AI_CONSENT: "AI 분석 동의",
+  PROFILE: "프로필",
+  CONDITIONS: "질환 선택",
+  INVITE_CODE: "초대 코드",
+  DONE: "가입 끝",
+};
 const GENDER = { MALE: "남성", FEMALE: "여성" };
 const CONDITION = {
   FORGETFULNESS: "건망증",
@@ -406,17 +425,68 @@ function renderFeatures(s) {
   ];
 }
 
-function renderPeople(s) {
-  const p = s.people;
+function renderSignup(g) {
   return el(
     "div",
     { class: "blocks" },
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "가입 흐름 (사람 수)"),
+      table(
+        ["단계", "사람", "가입 대비"],
+        [
+          el("tr", {}, el("td", {}, "가입 완료"), el("td", {}, fmt(g.signedUp)), el("td", {}, g.signedUp ? "100%" : "–")),
+          ...FUNNEL.map(([key, label]) =>
+            el("tr", {}, el("td", {}, label), el("td", {}, fmt(g.stages[key].n)), el("td", {}, pct(g.stages[key]))),
+          ),
+        ],
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        `단계마다 그 단계를 한 가입자를 따로 셉니다(초대를 받아 들어온 사람은 「초대 만듦」을 거치지 않음). 안드로이드 가입 단계에서 멈춘 ${fmt(g.loginOnly)}명은 「가입 완료」에 없습니다.`,
+      ),
+      el("ul", { class: "defs" }, FUNNEL.map(([, label, def]) => el("li", {}, `${label}: ${def}`))),
+    ),
+    el(
+      "div",
+      { class: "block" },
+      el("h2", {}, "가입 단계 화면 기록 (건수)"),
+      table(
+        ["단계", "iPhone", "Android", "합계", "그중 로그인 전"],
+        g.onboardingSteps.map((row) =>
+          el(
+            "tr",
+            {},
+            el("td", {}, ONBOARDING[row.step] || row.step),
+            el("td", {}, fmt(row.IOS)),
+            el("td", {}, fmt(row.ANDROID)),
+            el("td", {}, fmt(row.IOS + row.ANDROID)),
+            el("td", {}, fmt(row.anonymous)),
+          ),
+        ),
+      ),
+      el(
+        "p",
+        { class: "muted" },
+        "앱이 단계 화면에 처음 들어올 때 설치마다 단계당 한 번 남기는 기록 수입니다. 로그인 전 기록은 익명이라 사람 수가 아니라 건수이고, 팀·시험 계정 빼기가 적용되지 않으며 「가입일 이후」는 기록 날짜로 거릅니다. 앱마다 있는 단계만 기록됩니다.",
+      ),
+    ),
+  );
+}
+
+function renderPeople(s) {
+  const p = s.people;
+  return [renderSignup(s.signup), el(
+    "div",
+    { class: "blocks", style: "margin-top:12px" },
     bars("마지막으로 쓴 기기", p.platform, "가입자 기준", PLATFORM),
     bars("로그인 방식", p.login, "가입자 기준"),
     bars("부모 연령대", p.parentAge, "가입 때 적은 생년월일"),
     bars("자녀 연령대", p.childAge, "가입 때 적은 생년월일"),
     bars("성별", p.gender, "가입자 기준", GENDER),
-  );
+  )];
 }
 
 function renderWeekly(s) {
@@ -675,6 +745,7 @@ function summaryText(s) {
     `- 통화 시간 중앙값 ${minutes(c.durationSec.median)}`,
     `- 리포트 발행 ${fmt(x.reportsIssued)}회, 건강 앱 연동 ${pct(x.healthLinked)} (${frac(x.healthLinked)}명)`,
     `- 전화 알림 보냈는데 안 울림 ${pct(s.delivery.notRung)} (${frac(s.delivery.notRung)}통화)`,
+    `- 가입 흐름(가입 완료 ${fmt(s.signup.signedUp)}명 기준): ${FUNNEL.map(([key, label]) => `${label} ${fmt(s.signup.stages[key].n)}명`).join(", ")}`,
     ...s.cohorts.groups.map(
       (g) =>
         `- ${cohortName(g.cohort)} 그룹 ${fmt(g.people)}명: 최근 7일 통화 ${pct(g.calledLast7d)}, 통화 없는 날 리포트 연 사람 ${pct(g.reportOnNoCallDay)}, 추천 질문 「써 봤다」 ${pct(g.questionUsed)} (${frac(g.questionUsed)})`,

@@ -32,6 +32,8 @@ from app.models import (
     CallRecord,
     CallState,
     ChangeSignal,
+    ConsentDecision,
+    ConsentRecord,
     Device,
     Family,
     FamilyMember,
@@ -58,9 +60,14 @@ STATIC = Path(__file__).with_name("ops_static")
 TREND_WEEKS = 12
 COHORT_WEEKS = 8
 COHORTS: tuple[str | None, ...] = (OpsCohort.AWARE.value, OpsCohort.UNAWARE.value, None)
-# 운영 지표에 쓰는 이용 기록. 가입 단계·건강 연동·지표 설명 기록은 아직 화면에 없다.
+# 운영 지표에 쓰는 로그인 뒤 이용 기록. 가입 단계 기록은 익명 줄까지 따로 읽고(load_dataset),
+# 건강 연동·지표 설명 기록은 아직 화면에 없다.
 OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_shown",
               "call_connect_failed")
+# 가입 단계 화면(onboarding_step 코드)을 앱 흐름 순서로. 이용 기록 약속 문서와 같다.
+ONBOARDING_STEPS = ("WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
+                    "INVITE_CODE", "DONE")
+PLATFORMS = ("IOS", "ANDROID")
 # 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
 # 시작되고 이만큼 지난 통화만 센다.
 RING_REPORT_GRACE = timedelta(hours=1)
@@ -191,6 +198,9 @@ class Dataset:
         self.events: list[Any] = []
         self.first_event: dict[str, datetime] = {}
         self.pushes: list[Any] = []
+        self.consent_latest: dict[str, str] = {}
+        self.inviters: set[str] = set()
+        self.onboarding: list[Any] = []
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -285,7 +295,27 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             data.touch(row.parent_id, row.accepted_at)
             data.touch(row.child_id, row.accepted_at)
 
-    data.reports = list(await session.execute(select(Report.parent_id, Report.issued_at)))
+    data.reports = list(
+        await session.execute(select(Report.parent_id, Report.issued_at, Report.state))
+    )
+
+    # 외부 AI 동의: 사람마다 마지막 선택(문서 판과 상관없이)
+    consent_at: dict[str, datetime] = {}
+    for row in await session.execute(
+        select(ConsentRecord.user_id, ConsentRecord.decision, ConsentRecord.agreed_at)
+    ):
+        at = aware(row.agreed_at)
+        if row.user_id not in consent_at or at > consent_at[row.user_id]:
+            consent_at[row.user_id] = at
+            data.consent_latest[row.user_id] = row.decision
+    # 초대한 사람은 남기지 않으므로 초대 줄(구성원)이 있는 가족을 만든 사람으로 본다
+    data.inviters = set(
+        await session.scalars(
+            select(Family.created_by)
+            .join(FamilyMember, FamilyMember.family_id == Family.id)
+            .distinct()
+        )
+    )
 
     latest_consent: dict[str, tuple[datetime, int, str]] = {}
     for row in await session.execute(
@@ -360,6 +390,14 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             .group_by(AppEvent.user_id)
         )
     }
+    # 로그인 전 단계는 익명 줄(user_id 없음)이다
+    data.onboarding = list(
+        await session.execute(
+            select(
+                AppEvent.user_id, AppEvent.code, AppEvent.platform, AppEvent.occurred_at
+            ).where(AppEvent.name == "onboarding_step")
+        )
+    )
     data.pushes = [
         row
         for row in await session.execute(
@@ -768,6 +806,81 @@ def build_delivery(
     }
 
 
+def build_signup(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """가입 퍼널(단계마다 거기까지 온 사람 수)과 가입 단계 화면 기록 건수.
+
+    퍼널은 가입 완료 사용자(build_summary 와 같은 기준) 가운데 각 단계를 한 사람을 따로 센다.
+    초대를 받아 들어온 사람은 「초대 만듦」을 거치지 않으므로 앞 단계를 꼭 지나야 셈하지 않는다.
+    """
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    signed = {uid for uid in keep if data.users[uid].nickname or not data.users[uid].google}
+
+    connected: set[str] = set()
+    for _, members in data.family_users:
+        people = members & keep
+        if len(people) >= 2:
+            connected |= people
+    calls = [
+        c for c in data.calls
+        if c.accepted_at is not None and c.parent_id in keep and c.child_id in keep
+    ]
+    called = {uid for c in calls for uid in (c.parent_id, c.child_id)}
+    # 리포트는 분석 대상(부모 칸)마다 발행된다. 통화가 없어 빈 리포트(EMPTY)는 세지 않는다.
+    subjects = {r.parent_id for r in data.reports if r.state != "EMPTY"}
+    reported = subjects | {
+        uid for c in calls if c.parent_id in subjects for uid in (c.parent_id, c.child_id)
+    }
+
+    def reached(people: set[str]) -> dict[str, Any]:
+        return ratio(len(people & signed), len(signed))
+
+    steps: Counter[tuple[str, str]] = Counter()
+    anonymous: Counter[str] = Counter()
+    for event in data.onboarding:
+        if event.user_id is None:
+            # 익명 줄은 계정이 없어 팀·시험 계정을 가릴 수 없다. 「가입일 이후」는 기록 날짜로 본다.
+            if since is not None and kst_day(event.occurred_at) < since:
+                continue
+            anonymous[event.code] += 1
+        elif event.user_id not in keep:
+            continue
+        steps[(event.code, event.platform)] += 1
+    return {
+        "signedUp": len(signed),
+        "loginOnly": len(keep - signed),
+        "stages": {
+            "consentGranted": reached({
+                uid for uid, decision in data.consent_latest.items()
+                if decision == ConsentDecision.GRANTED.value
+            }),
+            "consentDenied": reached({
+                uid for uid, decision in data.consent_latest.items()
+                if decision == ConsentDecision.DENIED.value
+            }),
+            "conditions": reached({p.parent_id for p in data.profiles}),
+            "inviteCreated": reached(data.inviters),
+            "connected": reached(connected),
+            "firstCall": reached(called),
+            "firstReport": reached(reported),
+        },
+        "onboardingSteps": [
+            {
+                "step": step,
+                **{platform: steps[(step, platform)] for platform in PLATFORMS},
+                "anonymous": anonymous[step],
+            }
+            for step in ONBOARDING_STEPS
+        ],
+    }
+
+
 # ---------------------------------------------------------------- 경로
 
 
@@ -827,6 +940,7 @@ async def ops_summary(
         **build_summary(data, **scope),
         "cohorts": build_cohorts(data, **scope),
         "delivery": build_delivery(data, **scope),
+        "signup": build_signup(data, **scope),
     }
 
 
