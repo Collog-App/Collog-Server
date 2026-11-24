@@ -55,6 +55,7 @@ from app.models import (
     UserRole,
 )
 from app.security import SessionDep
+from app.services import usage
 from app.services.livekit import LiveKitError, LiveKitGateway
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ PROCESSING_ERROR_KINDS = {
 }
 # 휴지 비율 정의가 바뀌어(0018) 옛 값을 지운 표시. 측정하지 못한 것이 아니므로 비율에서 뺀다.
 PAUSE_DEFINITION_CHANGED = "DEFINITION_CHANGED"
+AI_USAGE_MONTHS = 12
 # 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
 # 시작되고 이만큼 지난 통화만 센다.
 RING_REPORT_GRACE = timedelta(hours=1)
@@ -309,6 +311,7 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
             CallRecord.report_notified_at,
             CallRecord.ended_at,
             CallRecord.analysis_timing,
+            CallRecord.ai_usage,
         )
     )
     for row in call_rows:
@@ -1017,6 +1020,48 @@ def build_health_link(
     }
 
 
+def build_ai_usage(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """통화 시작 달(한국 시간)별 외부 AI 사용량 합계. 원화로 바꾸지 않고 공급자 단위 그대로.
+
+    칸마다 값이 있는 통화만 더하고 그 통화 수로 나눠 통화당 평균을 낸다. 공급자를 불렀지만
+    응답에 값이 없던 통화는 unknown 으로 따로 센다.
+    """
+    del now
+    keep = included_users(data, include_internal=include_internal, since=since)
+    months: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for c in data.calls:
+        if c.ai_usage and c.parent_id in keep and c.child_id in keep:
+            months[kst_day(c.started_at).strftime("%Y-%m")].append(c.ai_usage)
+
+    def total(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+        present = [r[key] for r in records if key in r]
+        known = [v for v in present if usage.number(v) is not None]
+        amount = sum(known)
+        return {
+            "total": round(amount, 1),
+            "calls": len(known),
+            "perCall": round(amount / len(known), 1) if known else None,
+            "unknown": len(present) - len(known),
+        }
+
+    return {
+        "months": [
+            {
+                "month": month,
+                "calls": len(months[month]),
+                **{key: total(months[month], key) for key in usage.USAGE_KEYS},
+            }
+            for month in sorted(months, reverse=True)[:AI_USAGE_MONTHS]
+        ]
+    }
+
+
 # ---------------------------------------------------------------- 경로
 
 
@@ -1079,6 +1124,7 @@ async def ops_summary(
         "signup": build_signup(data, **scope),
         "quality": build_quality(data, **scope),
         "healthLink": build_health_link(data, **scope),
+        "aiUsage": build_ai_usage(data, **scope),
     }
 
 

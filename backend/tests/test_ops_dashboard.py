@@ -15,8 +15,10 @@ from fastapi.testclient import TestClient
 from app.config import Settings
 from app.main import create_app
 from app.ops import (
+    KST,
     Dataset,
     account_label,
+    build_ai_usage,
     build_cohorts,
     build_delivery,
     build_health_link,
@@ -684,3 +686,68 @@ def test_health_link_reads_the_real_events(ops_client: TestClient) -> None:
     assert health["people"] == 1
     assert health["events"] == 2
     assert health["results"][0]["people"] == {"IOS": 0, "ANDROID": 1}
+
+
+# ------------------------------------------------------------ AI 사용량
+
+
+def usage_call(call_id: str, started: datetime, spent: dict | None, child: str = "c"):
+    item = quality_call(call_id, "ANALYZED", child=child, started=started)
+    item.ai_usage = spent
+    return item
+
+
+def test_ai_usage_sums_each_month_in_provider_units() -> None:
+    data = Dataset()
+    for uid, role in (("p", "PARENT"), ("c", "CHILD"), ("i", "CHILD")):
+        data.users[uid] = user(uid, role, NOW - timedelta(days=90))
+    data.internal = {"i"}
+    data.calls = [
+        usage_call("u1", datetime(2026, 11, 20, tzinfo=UTC), {
+            "sttAudioSec": 100.6, "geminiInputTokens": 1000, "geminiOutputTokens": 300,
+            "geminiThoughtTokens": 200, "ttsCharacters": 0,
+        }),
+        # 한국 시간 11월 1일 00:30 → 11월
+        usage_call("u2", datetime(2026, 10, 31, 15, 30, tzinfo=UTC), {
+            "sttAudioSec": 50.0, "geminiInputTokens": 500, "geminiOutputTokens": 100,
+            "geminiThoughtTokens": 0, "ttsCharacters": None,
+        }),
+        usage_call("u3", datetime(2026, 10, 15, tzinfo=UTC), {"sttAudioSec": 30.0}),
+        usage_call("u4", datetime(2026, 11, 10, tzinfo=UTC), None),  # 기록 전 통화
+        usage_call("u5", datetime(2026, 11, 10, tzinfo=UTC), {"sttAudioSec": 999.0}, child="i"),
+    ]
+    months = build_ai_usage(data, now=NOW, include_internal=False, since=None)["months"]
+    assert [m["month"] for m in months] == ["2026-11", "2026-10"]
+    november, october = months
+    assert november["calls"] == 2
+    assert november["sttAudioSec"] == {"total": 150.6, "calls": 2, "perCall": 75.3, "unknown": 0}
+    assert november["geminiInputTokens"] == {
+        "total": 1500, "calls": 2, "perCall": 750.0, "unknown": 0
+    }
+    assert november["geminiOutputTokens"]["total"] == 400
+    assert november["geminiThoughtTokens"]["perCall"] == 100.0
+    # 앱이 직접 만든 질문 음성(값 없음)은 합에 넣지 않고 따로 센다
+    assert november["ttsCharacters"] == {"total": 0, "calls": 1, "perCall": 0.0, "unknown": 1}
+    assert october["calls"] == 1
+    assert october["geminiInputTokens"] == {
+        "total": 0, "calls": 0, "perCall": None, "unknown": 0
+    }
+
+    with_internal = build_ai_usage(data, now=NOW, include_internal=True, since=None)
+    assert with_internal["months"][0]["sttAudioSec"]["total"] == 1149.6
+
+
+def test_ai_usage_of_an_analyzed_mock_call_reaches_the_summary(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    analyze_family_call(ops_client, child_token, parent_token, parent, LONG_TALK)
+    months = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()[
+        "aiUsage"
+    ]["months"]
+    assert [m["month"] for m in months] == [datetime.now(KST).strftime("%Y-%m")]
+    month = months[0]
+    assert month["calls"] == 1
+    assert month["geminiInputTokens"] == {"total": 200, "calls": 1, "perCall": 200.0, "unknown": 0}
+    assert month["sttAudioSec"]["total"] == pytest.approx(
+        (len(LONG_TALK) + len("CHILD: 쓰러지신 적은 없으시죠?")) / 4, abs=0.1
+    )
+    assert month["ttsCharacters"]["calls"] == 0

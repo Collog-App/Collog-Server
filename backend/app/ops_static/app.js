@@ -356,7 +356,49 @@ function renderCalls(s) {
     ),
     renderDelivery(s.delivery),
     renderQuality(s.quality),
+    renderAiUsage(s.aiUsage),
   ];
+}
+
+const AI_USAGE = [
+  ["sttAudioSec", "음성 인식(초)"],
+  ["geminiInputTokens", "Gemini 입력 토큰"],
+  ["geminiOutputTokens", "Gemini 출력 토큰"],
+  ["geminiThoughtTokens", "그중 생각 토큰"],
+  ["ttsCharacters", "질문 음성 글자 수"],
+];
+
+function renderAiUsage(u) {
+  const cell = (t) =>
+    el(
+      "td",
+      {},
+      fmt(t.total),
+      el("br"),
+      el(
+        "span",
+        { class: "cell-sub" },
+        `통화당 ${fmt(t.perCall)} · ${fmt(t.calls)}건${t.unknown ? ` · 값 없음 ${fmt(t.unknown)}건` : ""}`,
+      ),
+    );
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "통화당 AI 사용량 (달별 합계)"),
+    u.months.length
+      ? table(
+          ["달", "통화", ...AI_USAGE.map(([, label]) => label)],
+          u.months.map((m) =>
+            el("tr", {}, el("td", {}, m.month), el("td", {}, fmt(m.calls)), AI_USAGE.map(([key]) => cell(m[key]))),
+          ),
+        )
+      : el("p", { class: "muted" }, "아직 없음"),
+    el(
+      "p",
+      { class: "muted" },
+      "통화 시작 달(한국 시간)별로 공급자가 응답으로 알려 준 값을 단위 그대로 더했습니다(원화 환산 없음). 통화 = 사용량 기록이 있는 통화, 통화당 = 그 칸 값이 있는 통화 수로 나눈 평균. 음성 인식 = Deepgram 이 처리한 음성 길이(부모·자녀 트랙 합). Gemini = 추출·요약·2차 검토 요청의 합이고 출력 토큰에 생각 토큰이 들어 있음. 다시 시도한 분석도 더함. 질문 음성 = 서버가 ElevenLabs 로 새로 만든 음성의 글자 수(만들어 둔 음성을 다시 쓰면 0, 질문 목록 화면에서 먼저 만든 음성은 어느 통화에도 들어가지 않음). 앱이 ElevenLabs 에 바로 요청하는 방식은 서버가 글자 수를 몰라 「값 없음」으로 셉니다. 이 기록을 넣기 전 통화는 빠집니다.",
+    ),
+  );
 }
 
 function renderQuality(q) {
@@ -853,6 +895,12 @@ function summaryText(s) {
     `- 가입 흐름(가입 완료 ${fmt(s.signup.signedUp)}명 기준): ${FUNNEL.map(([key, label]) => `${label} ${fmt(s.signup.stages[key].n)}명`).join(", ")}`,
     `- 건강 앱 연결 결과(사람, 가장 최근 결과 기준): ${s.healthLink.results.map((r) => `${HEALTH_RESULT[r.code] || r.code} ${fmt(r.people.IOS + r.people.ANDROID)}명`).join(", ")} (건수 ${fmt(s.healthLink.events)}건)`,
     `- 분석 품질: 추출 없이 분석 완료 ${pct(s.quality.analyzedWithoutExtraction)} (${frac(s.quality.analyzedWithoutExtraction)}통화), 휴지 비율 측정 불가 ${pct(s.quality.pauseUnmeasurable)} (${frac(s.quality.pauseUnmeasurable)}통화), 말이 짧아 분석 제외 ${pct(s.quality.shortSpeechExcluded)} (${frac(s.quality.shortSpeechExcluded)}통화), 처리 오류 ${Object.entries(s.quality.processingErrors.all).map(([k, n]) => `${PROCESSING_ERROR[k] || k} ${fmt(n)}`).join(", ") || "없음"}`,
+    ...(s.aiUsage.months.length
+      ? s.aiUsage.months.map(
+          (m) =>
+            `- AI 사용량 ${m.month} (사용량 기록 통화 ${fmt(m.calls)}건): 음성 인식 ${fmt(m.sttAudioSec.total)}초 (통화당 ${fmt(m.sttAudioSec.perCall)}초), Gemini 입력 ${fmt(m.geminiInputTokens.total)}토큰 (통화당 ${fmt(m.geminiInputTokens.perCall)}), 출력 ${fmt(m.geminiOutputTokens.total)}토큰 (통화당 ${fmt(m.geminiOutputTokens.perCall)}, 그중 생각 ${fmt(m.geminiThoughtTokens.total)}), 질문 음성 ${fmt(m.ttsCharacters.total)}자 (통화당 ${fmt(m.ttsCharacters.perCall)}, 값 없음 ${fmt(m.ttsCharacters.unknown)}건)`,
+        )
+      : ["- AI 사용량: 아직 기록 없음"]),
     ...s.cohorts.groups.map(
       (g) =>
         `- ${cohortName(g.cohort)} 그룹 ${fmt(g.people)}명: 최근 7일 통화 ${pct(g.calledLast7d)}, 통화 없는 날 리포트 연 사람 ${pct(g.reportOnNoCallDay)}, 추천 질문 「써 봤다」 ${pct(g.questionUsed)} (${frac(g.questionUsed)})`,
