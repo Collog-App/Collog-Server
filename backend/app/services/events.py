@@ -42,9 +42,12 @@ ANONYMOUS_EVENTS = frozenset({"onboarding_step"})
 
 MAX_AGE = timedelta(days=30)
 MAX_AHEAD = timedelta(minutes=5)
-# 인증 없는 주소로 남는 줄의 상한. 넘치면 그 사이 익명 기록은 조용히 버린다.
+# 인증 없는 주소로 남는 줄의 상한(모든 기기 합). 넘치면 그 사이 익명 기록은 조용히 버린다.
 ANONYMOUS_WINDOW = timedelta(minutes=10)
-ANONYMOUS_WINDOW_LIMIT = 1_000
+ANONYMOUS_WINDOW_LIMIT = 200
+# 로그인한 사람 한 명이 남길 수 있는 줄의 상한. 넘친 줄은 조용히 버린다.
+USER_WINDOW = timedelta(hours=24)
+USER_WINDOW_LIMIT = 500
 
 RETENTION = timedelta(days=365)
 RETENTION_INTERVAL = timedelta(hours=1)
@@ -131,6 +134,13 @@ async def store_events(
             for row in accepted:
                 if row["call_id"] not in own_calls:
                     row["call_id"] = None
+        if accepted:
+            recent = await session.scalar(
+                select(func.count()).select_from(AppEvent).where(
+                    AppEvent.user_id == user_id, AppEvent.received_at >= now - USER_WINDOW
+                )
+            )
+            accepted = accepted[: max(0, USER_WINDOW_LIMIT - (recent or 0))]
     elif accepted:
         recent = await session.scalar(
             select(func.count()).select_from(AppEvent).where(

@@ -24,7 +24,9 @@ def upgrade() -> None:
         sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("received_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index("ix_app_events_user_id", "app_events", ["user_id"])
+    op.create_index(
+        "ix_app_events_user_id_received_at", "app_events", ["user_id", "received_at"]
+    )
     op.create_index("ix_app_events_occurred_at", "app_events", ["occurred_at"])
     op.create_index("ix_app_events_received_at", "app_events", ["received_at"])
     op.add_column("calls", sa.Column("incoming_push", sa.JSON(), nullable=True))

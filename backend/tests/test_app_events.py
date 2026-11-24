@@ -242,3 +242,37 @@ def test_deleting_an_account_removes_its_events(client: TestClient, tmp_path: Pa
     assert rows[theirs_view["id"]][0] == parent["id"]
     assert rows[theirs_view["id"]][3] is None
     assert rows[theirs_shown["id"]][4] is None
+
+
+def test_signed_in_events_stop_at_the_daily_limit_per_person(
+    client: TestClient, tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(event_rules, "USER_WINDOW_LIMIT", 3)
+    child_token, child, parent_token, _ = onboard_family(client)
+
+    def send(token: str, count: int) -> dict:
+        batch = [event("app_open") for _ in range(count)]
+        response = client.post("/v1/events", headers=auth(token), json={"events": batch})
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    assert send(child_token, 2) == {"accepted": 2}
+    assert send(child_token, 2) == {"accepted": 1}  # 넘친 줄은 조용히 버린다
+    assert send(child_token, 1) == {"accepted": 0}
+    assert send(parent_token, 2) == {"accepted": 2}  # 사람마다 따로 센다
+
+    # 받은 지 24시간이 지난 줄은 세지 않는다
+    with sqlite3.connect(tmp_path / "test.db") as connection:
+        connection.execute(
+            "update app_events set received_at = ? where user_id = ?",
+            # SQLAlchemy 가 SQLite 에 쓰는 꼴(공백 구분)과 같게 둔다
+            (f"{datetime.now(UTC) - timedelta(hours=25):%Y-%m-%d %H:%M:%S.%f}", child["id"]),
+        )
+    assert send(child_token, 2) == {"accepted": 2}
+
+
+def test_event_limits_are_the_agreed_numbers() -> None:
+    assert event_rules.USER_WINDOW == timedelta(hours=24)
+    assert event_rules.USER_WINDOW_LIMIT == 500
+    assert event_rules.ANONYMOUS_WINDOW == timedelta(minutes=10)
+    assert event_rules.ANONYMOUS_WINDOW_LIMIT == 200

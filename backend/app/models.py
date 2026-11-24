@@ -12,6 +12,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -564,10 +565,14 @@ class AppEvent(Base):
     """
 
     __tablename__ = "app_events"
+    __table_args__ = (
+        # 사용자별 하루 상한을 셀 때(user_id, received_at) 쓰고, user_id 만으로 찾을 때도 쓴다.
+        Index("ix_app_events_user_id_received_at", "user_id", "received_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     # 로그인 전 단계 기록(익명)은 비어 있다.
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     name: Mapped[str] = mapped_column(String(40))
     code: Mapped[str | None] = mapped_column(String(40), nullable=True)
     subject_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
