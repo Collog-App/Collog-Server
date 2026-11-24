@@ -34,7 +34,9 @@ EVENT_CODES: dict[str, frozenset[str] | re.Pattern[str] | None] = {
         "WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS", "INVITE_CODE", "DONE",
     }),
     "health_link_result": frozenset({"CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS"}),
-    "metric_help_open": re.compile(r"[A-Z_]{1,40}"),
+    # 지표 이름(대문자·밑줄). 숫자는 F0_VARIATION 처럼 글자 사이에 한 개씩만 둔다
+    # (전화번호 같은 숫자열은 받지 않는다).
+    "metric_help_open": re.compile(r"(?=.{1,40}$)[A-Z_]+(?:[0-9][A-Z_]+)*"),
 }
 # 「버전 (빌드)」 꼴만 받는다(예: 1.2 (44)). 다른 글자(NUL 등)가 섞인 줄은 버린다.
 APP_VERSION = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,3} \([0-9]{1,9}\)")

@@ -360,9 +360,11 @@ def test_call_answers_need_a_call_of_the_person_who_answered(
     assert set(stored(tmp_path)) == {own["id"]}
 
 
-def test_metric_help_code_is_capital_letters_and_underscores(client: TestClient) -> None:
+def test_metric_help_code_takes_no_digit_runs(client: TestClient) -> None:
     token, _ = create_user(client, "01055556666", "CHILD", "시험")
-    batch = [event("metric_help_open", code=code)
-             for code in ("PAUSE_RATIO", "F0_VARIATION", "01012345678", "SPEECH RATE", "A" * 41)]
+    kept = ("PAUSE_RATIO", "F0_VARIATION", "A" * 40)
+    dropped = ("01012345678", "P01012345678", "PAUSE_RATIO2", "F00_VARIATION", "SPEECH RATE",
+               "pause_ratio", "A" * 41)
+    batch = [event("metric_help_open", code=code) for code in kept + dropped]
     response = client.post("/v1/events", headers=auth(token), json={"events": batch})
-    assert response.json() == {"accepted": 1}
+    assert response.json() == {"accepted": len(kept)}
