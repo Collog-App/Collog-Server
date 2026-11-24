@@ -7,7 +7,16 @@ from typing import Annotated
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Path, Query, Request, status
 from sqlalchemy import or_, select, update
 
-from app.models import AssetKind, AudioAsset, CallRecord, CallState, Device, User, UserRole
+from app.models import (
+    AssetKind,
+    AudioAsset,
+    CallRecord,
+    CallState,
+    Device,
+    PushResult,
+    User,
+    UserRole,
+)
 from app.routes.devices import deliver_incoming_call_push
 from app.routes.questions import questions_for_parent
 from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
@@ -167,10 +176,10 @@ async def create_reserved_call(
         .order_by(Device.created_at.desc())
     ))
     await session.commit()
-    delivered = False
+    pushes: list[dict[str, str]] = []
     for device in devices:
         container = request.app.state.container
-        device_delivered = await deliver_incoming_call_push(
+        result = await deliver_incoming_call_push(
             container.android_voip_push if device.platform == "ANDROID" else container.voip_push,
             device,
             IncomingCallPush(
@@ -184,7 +193,24 @@ async def create_reserved_call(
             ),
             request.app.state.container,
         )
-        delivered = delivered or device_delivered
+        pushes.append({"platform": device.platform, "result": result.value})
+    results = {push["result"] for push in pushes}
+    delivered = PushResult.SENT.value in results
+    overall = (
+        PushResult.SENT if delivered
+        else PushResult.NO_DEVICE if not pushes
+        else PushResult.TOKEN_INVALID if results == {PushResult.TOKEN_INVALID.value}
+        else PushResult.FAILED
+    )
+    # 상대가 그새 받았을 수 있으니 통화 줄 전체가 아니라 이 칸만 고친다.
+    await session.execute(
+        update(CallRecord).where(CallRecord.id == call.id).values(incoming_push={
+            "result": overall.value,
+            "at": datetime.now(UTC).isoformat(),
+            "devices": pushes,
+        }).execution_options(synchronize_session=False)
+    )
+    await session.commit()
     if not delivered and (devices or not settings_from(request).mock_external_services):
         await request.app.state.container.calls.finish(call.id)
         raise HTTPException(

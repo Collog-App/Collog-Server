@@ -123,3 +123,64 @@ def test_failed_push_returns_error_before_room_credentials(client: TestClient) -
             assert call.room_closed_at is not None
 
     client.portal.call(check)
+
+
+def call_push_record(client: TestClient, call_id: str | None) -> dict | None:
+    async def read() -> dict | None:
+        async with client.app.state.container.database.sessions() as session:
+            if call_id is None:
+                return (await session.scalar(select(CallRecord))).incoming_push
+            return (await session.get(CallRecord, call_id)).incoming_push
+
+    return client.portal.call(read)
+
+
+@pytest.mark.parametrize(
+    "outcomes,expected",
+    [
+        ({"1": "sent", "2": "gone"}, "SENT"),
+        ({"1": "gone", "2": "gone"}, "TOKEN_INVALID"),
+        ({"1": "gone", "2": "down"}, "FAILED"),
+    ],
+)
+def test_call_records_push_result_per_device(
+    client: TestClient, outcomes: dict[str, str], expected: str
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    for index, platform in (("1", "IOS"), ("2", "ANDROID")):
+        response = client.post("/v1/devices", headers=auth(parent_token), json={
+            "platform": platform, "token": f"device-{index}", "voipToken": index * 64,
+        })
+        assert response.status_code == 201
+
+    class Gateway(VoipPushGateway):
+        async def send_incoming_call(self, token: str, push: IncomingCallPush) -> str | None:
+            outcome = outcomes[token[0]]
+            if outcome == "gone":
+                raise UnregisteredVoipToken("Unregistered")
+            if outcome == "down":
+                raise PushNotificationError("Unavailable")
+            return None
+
+    container = client.app.state.container
+    container.voip_push = container.android_voip_push = Gateway()
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == (201 if expected == "SENT" else 502), response.text
+
+    record = call_push_record(client, response.json().get("callId"))
+    assert record["result"] == expected
+    assert datetime.fromisoformat(record["at"]).tzinfo is not None
+    results = {"sent": "SENT", "gone": "TOKEN_INVALID", "down": "FAILED"}
+    assert sorted(record["devices"], key=lambda d: d["platform"]) == [
+        {"platform": "ANDROID", "result": results[outcomes["2"]]},
+        {"platform": "IOS", "result": results[outcomes["1"]]},
+    ]
+
+
+def test_call_without_receiving_device_records_no_device(client: TestClient) -> None:
+    child_token, _, _, parent = onboard_family(client)
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == 201
+    record = call_push_record(client, response.json()["callId"])
+    assert record["result"] == "NO_DEVICE"
+    assert record["devices"] == []
