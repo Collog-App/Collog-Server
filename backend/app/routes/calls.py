@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import random
+from contextlib import suppress
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated
 
@@ -33,6 +35,7 @@ from app.services.livekit import LiveKitError
 from app.services.notifications import IncomingCallPush
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/calls", status_code=201, tags=["Call"])
@@ -206,21 +209,7 @@ async def create_reserved_call(
         else PushResult.TOKEN_INVALID if results == {PushResult.TOKEN_INVALID.value}
         else PushResult.FAILED
     )
-    # 상대가 그새 받았을 수 있으니 통화 줄 전체가 아니라 이 칸만 고친다.
-    await session.execute(
-        update(CallRecord).where(CallRecord.id == call.id).values(incoming_push={
-            "result": overall.value,
-            "at": datetime.now(UTC).isoformat(),
-            "devices": pushes,
-        }).execution_options(synchronize_session=False)
-    )
-    await session.commit()
-    if not delivered and (devices or not settings_from(request).mock_external_services):
-        await request.app.state.container.calls.finish(call.id)
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            "상대방에게 통화 알림을 보내지 못했어요. 상대방 앱에서 다시 로그인한 뒤 시도해주세요",
-        )
+    # 아래 기록이 실패해 rollback 하면 세션의 객체 값이 만료되므로 응답을 먼저 만들어 둔다.
     response = CallCreated(
         call_id=call.id,
         caller_id=call.effective_caller_id,
@@ -235,6 +224,30 @@ async def create_reserved_call(
         questions=questions,
         audio_constraints=AudioConstraints(),
     )
+    # 알림 결과 기록은 운영 지표용 덤이다. 실패해도 통화는 그대로 진행한다.
+    try:
+        # 상대가 그새 받았을 수 있으니 통화 줄 전체가 아니라 이 칸만 고친다.
+        await session.execute(
+            update(CallRecord).where(CallRecord.id == response.call_id).values(incoming_push={
+                "result": overall.value,
+                "at": datetime.now(UTC).isoformat(),
+                "devices": pushes,
+            }).execution_options(synchronize_session=False)
+        )
+        await session.commit()
+    except Exception as exc:
+        logger.warning(
+            "incoming call push result was not recorded (%s)", type(exc).__name__,
+            extra={"call_id": response.call_id},
+        )
+        with suppress(Exception):
+            await session.rollback()
+    if not delivered and (devices or not settings_from(request).mock_external_services):
+        await request.app.state.container.calls.finish(response.call_id)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            "상대방에게 통화 알림을 보내지 못했어요. 상대방 앱에서 다시 로그인한 뒤 시도해주세요",
+        )
     return response.model_dump(by_alias=True)
 
 

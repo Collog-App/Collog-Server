@@ -5,7 +5,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.config import Settings
 from app.models import CallRecord, Device
@@ -184,3 +184,41 @@ def test_call_without_receiving_device_records_no_device(client: TestClient) -> 
     record = call_push_record(client, response.json()["callId"])
     assert record["result"] == "NO_DEVICE"
     assert record["devices"] == []
+
+
+class BrokenPushUpdate:
+    """incoming_push 를 쓰는 UPDATE 대신 DB 오류를 내는 문을 돌려준다."""
+
+    def __init__(self, *args) -> None:
+        del args
+
+    def where(self, *args) -> "BrokenPushUpdate":
+        return self
+
+    def values(self, **kwargs):
+        del kwargs
+        return text("UPDATE no_such_table SET incoming_push = NULL")
+
+
+@pytest.mark.parametrize("delivered", [True, False])
+def test_failing_push_result_record_does_not_block_the_call(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+    delivered: bool,
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    if delivered:
+        client.post("/v1/devices", headers=auth(parent_token), json={
+            "platform": "IOS", "token": "device", "voipToken": "a" * 64,
+        })
+    monkeypatch.setattr("app.routes.calls.update", BrokenPushUpdate)
+    response = client.post("/v1/calls", headers=auth(child_token), json={"calleeId": parent["id"]})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["accessToken"] and body["roomName"]
+    assert call_push_record(client, body["callId"]) is None
+    assert "incoming call push result was not recorded (OperationalError)" in caplog.text
+
+    # 세션을 되돌렸으니 같은 앱의 다음 요청도 그대로 돈다
+    calls = client.get(f"/v1/parents/{parent['id']}/calls", headers=auth(child_token))
+    assert calls.status_code == 200
+    assert [item["callId"] for item in calls.json()["calls"]] == [body["callId"]]
