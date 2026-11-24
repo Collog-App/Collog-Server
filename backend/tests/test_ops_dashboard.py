@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -18,11 +19,14 @@ from app.ops import (
     account_label,
     build_cohorts,
     build_delivery,
+    build_quality,
     build_signup,
     build_summary,
 )
 from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family
+from tests.test_call_summary import LONG_TALK
+from tests.test_guardrail import analyze_family_call
 
 CODE = "test-ops-code"
 NOW = datetime(2026, 11, 22, 3, 0, tzinfo=UTC)  # 한국 시간 12:00
@@ -546,3 +550,89 @@ def test_signup_funnel_reads_the_real_tables(ops_client: TestClient) -> None:
     assert signup["onboardingSteps"][0] == {
         "step": "WELCOME", "IOS": 0, "ANDROID": 1, "anonymous": 1
     }
+
+
+# ------------------------------------------------------------ 분석 품질
+
+
+def quality_call(call_id: str, state: str, *, parent: str = "p", child: str = "c",
+                 error: str | None = None, accepted: bool = True, recording: bool = True,
+                 started: datetime | None = None) -> SimpleNamespace:
+    item = call(parent, child, (started or NOW - timedelta(days=1)) if accepted else None, state)
+    item.id = call_id
+    item.processing_error = error
+    item.recording_enabled = recording
+    item.started_at = started or NOW - timedelta(days=1)
+    return item
+
+
+def pause(call_id: str, status: str, reason: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(call_id=call_id, status=status, unmeasurable_reason=reason)
+
+
+def quality_dataset() -> Dataset:
+    data = Dataset()
+    start = NOW - timedelta(days=60)
+    for uid, role in (("p", "PARENT"), ("c", "CHILD"), ("i", "CHILD")):
+        data.users[uid] = user(uid, role, start)
+    data.internal = {"i"}
+    data.calls = [
+        quality_call("a1", "ANALYZED"),
+        quality_call("a2", "ANALYZED"),
+        quality_call("a3", "ANALYZED"),
+        quality_call("a4", "ANALYZED"),
+        quality_call("x1", "ANALYSIS_EXCLUDED"),
+        quality_call("x2", "ANALYSIS_EXCLUDED"),  # 동의 철회 등 다른 이유로 빠짐
+        quality_call("f1", "ANALYSIS_FAILED", error="Analysis failed",
+                     started=NOW - timedelta(days=40)),
+        quality_call("f2", "ANALYSIS_FAILED", error="부모 Egress 녹음이 완료되지 않았습니다"),
+        quality_call("f3", "ANALYSIS_FAILED", error="홍길동 님 통화 처리 실패"),
+        quality_call("e1", "ENDED", error="Analysis retry pending"),
+        quality_call("n1", "ANALYSIS_EXCLUDED", accepted=False),
+        quality_call("r0", "ANALYSIS_EXCLUDED", recording=False),
+        quality_call("i1", "ANALYZED", child="i"),  # 팀·시험 계정
+    ]
+    data.extraction_status = {"a1": "OK", "a2": "FAILED", "a4": "OK", "x1": "EXCLUDED",
+                              "i1": "FAILED"}
+    data.pause_ratio = {
+        "a1": pause("a1", "OK"),
+        "a2": pause("a2", "UNMEASURABLE", "NO_CHILD_TRACK"),
+        "a3": pause("a3", "UNMEASURABLE", "DEFINITION_CHANGED"),
+        "i1": pause("i1", "UNMEASURABLE", "NO_CHILD_TRACK"),
+    }
+    data.short_speech = {"x1", "r0", "i1"}
+    return data
+
+
+def test_analysis_quality_counts_and_hides_error_text() -> None:
+    quality = build_quality(quality_dataset(), now=NOW, include_internal=False, since=None)
+    assert quality["processingErrors"] == {
+        "all": {"ANALYSIS_ERROR": 1, "PARENT_RECORDING_MISSING": 1, "OTHER": 1,
+                "RETRY_PENDING": 1},
+        "last30d": {"PARENT_RECORDING_MISSING": 1, "OTHER": 1, "RETRY_PENDING": 1},
+    }
+    assert "홍길동" not in json.dumps(quality, ensure_ascii=False)
+    # a2 는 추출 실패, a3 는 추출 결과 줄 없음
+    assert quality["analyzedWithoutExtraction"] == {"n": 2, "d": 4, "pct": 50.0}
+    # 정의가 바뀌어 지운 a3 와 기록이 없는 a4 는 빼고 a1·a2 가운데
+    assert quality["pauseUnmeasurable"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert quality["pauseUnmeasurableReasons"] == {"NO_CHILD_TRACK": 1}
+    # 녹음된 통화(받음·녹음 켬) 10건 가운데 말이 짧아 빠진 x1
+    assert quality["shortSpeechExcluded"] == {"n": 1, "d": 10, "pct": 10.0}
+
+    with_internal = build_quality(quality_dataset(), now=NOW, include_internal=True, since=None)
+    assert with_internal["analyzedWithoutExtraction"] == {"n": 3, "d": 5, "pct": 60.0}
+
+
+def test_analysis_quality_reads_the_real_tables(ops_client: TestClient) -> None:
+    child_token, _, parent_token, parent = onboard_family(ops_client)
+    analyze_family_call(ops_client, child_token, parent_token, parent, LONG_TALK)
+    analyze_family_call(
+        ops_client, child_token, parent_token, parent, "PARENT: 응 잘 지내",
+        state="ANALYSIS_EXCLUDED",
+    )
+    quality = ops_client.get("/ops/api/summary", headers={"X-Ops-Code": CODE}).json()["quality"]
+    assert quality["analyzedWithoutExtraction"] == {"n": 0, "d": 1, "pct": 0.0}
+    assert quality["pauseUnmeasurable"]["d"] == 1
+    assert quality["shortSpeechExcluded"] == {"n": 1, "d": 2, "pct": 50.0}
+    assert quality["processingErrors"] == {"all": {}, "last30d": {}}

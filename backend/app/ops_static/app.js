@@ -59,6 +59,21 @@ const CONNECT_FAILED = {
   OTHER: "기타",
 };
 const PLATFORM = { IOS: "iPhone", ANDROID: "Android" };
+const PROCESSING_ERROR = {
+  RETRY_PENDING: "다시 시도 기다리는 중(아직 실패 아님)",
+  ANALYSIS_ERROR: "분석 중 오류",
+  RETRY_LIMIT: "다시 시도 한도·음성 보관 한도 넘음",
+  PARENT_RECORDING_MISSING: "부모님 쪽 통화 녹음 없음",
+  RAW_UPLOAD_EXPIRED: "기기 원음 올리기 시간 지남",
+  AUDIO_EXPIRED: "음성 보관 24시간 지남",
+  OTHER: "기타",
+};
+const PAUSE_REASON = {
+  NO_CHILD_TRACK: "자녀 쪽 녹음 없음",
+  INSUFFICIENT_WORD_TIMING: "이어진 말이 짧아 잴 구간 없음",
+  INSUFFICIENT_PARENT_SPEECH: "부모님 말씀이 짧음",
+  UNKNOWN: "이유 없음",
+};
 const FUNNEL = [
   ["consentGranted", "외부 AI 분석 동의", "마지막 선택이 동의(문서 판이 바뀌어 다시 동의가 필요한 사람도 마지막 선택으로 셈)"],
   ["consentDenied", "외부 AI 분석 거절", "마지막 선택이 거절"],
@@ -335,7 +350,64 @@ function renderCalls(s) {
       ),
     ),
     renderDelivery(s.delivery),
+    renderQuality(s.quality),
   ];
+}
+
+function renderQuality(q) {
+  const known = Object.keys(PROCESSING_ERROR);
+  const seen = [...Object.keys(q.processingErrors.all), ...Object.keys(q.processingErrors.last30d)];
+  const kinds = [...known.filter((k) => seen.includes(k)), ...new Set(seen.filter((k) => !known.includes(k)))];
+  const reasons = Object.entries(q.pauseUnmeasurableReasons)
+    .map(([code, n]) => `${PAUSE_REASON[code] || code} ${fmt(n)}`)
+    .join(" · ");
+  return el(
+    "div",
+    { class: "block" },
+    el("h2", {}, "분석 품질"),
+    el(
+      "div",
+      { class: "grid" },
+      card(
+        "추출 없이 「분석 완료」",
+        pct(q.analyzedWithoutExtraction),
+        `${frac(q.analyzedWithoutExtraction)}통화`,
+        "분석 완료 통화 중 건강 사실 추출 결과가 없거나 실패로 남은 통화(리포트에 건강 사실 없이 나감)",
+      ),
+      card(
+        "휴지 비율 측정 불가",
+        pct(q.pauseUnmeasurable),
+        `${frac(q.pauseUnmeasurable)}통화${reasons ? ` · ${reasons}` : ""}`,
+        "분석 완료 통화 중 말 사이 쉼(휴지 비율)을 잴 수 없던 통화. 정의가 바뀌어 지운 옛 값은 뺌",
+      ),
+      card(
+        "말이 짧아 분석 제외",
+        pct(q.shortSpeechExcluded),
+        `${frac(q.shortSpeechExcluded)}통화`,
+        "녹음된 통화(받음·녹음 켬) 중 부모님 말씀이 기준보다 짧아 건강 분석에서 빠진 통화",
+      ),
+    ),
+    el("p", { class: "muted", style: "margin-top:12px" }, "처리 오류 종류"),
+    kinds.length
+      ? table(
+          ["종류", "전체", "최근 30일"],
+          kinds.map((kind) =>
+            el(
+              "tr",
+              {},
+              el("td", {}, PROCESSING_ERROR[kind] || kind),
+              el("td", {}, fmt(q.processingErrors.all[kind] || 0)),
+              el("td", {}, fmt(q.processingErrors.last30d[kind] || 0)),
+            ),
+          ),
+        )
+      : el("p", { class: "muted" }, "아직 없음"),
+    el(
+      "p",
+      { class: "muted" },
+      "통화에 지금 남아 있는 처리 오류 표시를 종류로 묶은 통화 수입니다(다시 시도해 성공하면 지워짐, 최근 30일은 통화 시작 기준). 오류 문구 원문은 보이지 않습니다.",
+    ),
+  );
 }
 
 function renderDelivery(d) {
@@ -746,6 +818,7 @@ function summaryText(s) {
     `- 리포트 발행 ${fmt(x.reportsIssued)}회, 건강 앱 연동 ${pct(x.healthLinked)} (${frac(x.healthLinked)}명)`,
     `- 전화 알림 보냈는데 안 울림 ${pct(s.delivery.notRung)} (${frac(s.delivery.notRung)}통화)`,
     `- 가입 흐름(가입 완료 ${fmt(s.signup.signedUp)}명 기준): ${FUNNEL.map(([key, label]) => `${label} ${fmt(s.signup.stages[key].n)}명`).join(", ")}`,
+    `- 분석 품질: 추출 없이 분석 완료 ${pct(s.quality.analyzedWithoutExtraction)} (${frac(s.quality.analyzedWithoutExtraction)}통화), 휴지 비율 측정 불가 ${pct(s.quality.pauseUnmeasurable)} (${frac(s.quality.pauseUnmeasurable)}통화), 말이 짧아 분석 제외 ${pct(s.quality.shortSpeechExcluded)} (${frac(s.quality.shortSpeechExcluded)}통화), 처리 오류 ${Object.entries(s.quality.processingErrors.all).map(([k, n]) => `${PROCESSING_ERROR[k] || k} ${fmt(n)}`).join(", ") || "없음"}`,
     ...s.cohorts.groups.map(
       (g) =>
         `- ${cohortName(g.cohort)} 그룹 ${fmt(g.people)}명: 최근 7일 통화 ${pct(g.calledLast7d)}, 통화 없는 날 리포트 연 사람 ${pct(g.reportOnNoCallDay)}, 추천 질문 「써 봤다」 ${pct(g.questionUsed)} (${frac(g.questionUsed)})`,

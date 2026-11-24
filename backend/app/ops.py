@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.models import (
+    AcousticFeature,
     AppEvent,
     CallRecord,
     CallState,
@@ -38,8 +39,10 @@ from app.models import (
     Family,
     FamilyMember,
     HealthDailySummary,
+    HealthExtraction,
     HealthLinkConsent,
     HealthLinkDecision,
+    Metric,
     OpsAccountFlag,
     OpsCohort,
     ParentProfile,
@@ -47,6 +50,7 @@ from app.models import (
     RefreshSession,
     Report,
     TodoItem,
+    Transcript,
     User,
     UserRole,
 )
@@ -68,6 +72,18 @@ OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_show
 ONBOARDING_STEPS = ("WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS",
                     "INVITE_CODE", "DONE")
 PLATFORMS = ("IOS", "ANDROID")
+# 분석 처리가 calls.processing_error 에 남기는 문구(services/pipeline.py) → 종류. 모르는 문구는
+# OTHER 로만 보이고 원문은 화면·응답에 내보내지 않는다.
+PROCESSING_ERROR_KINDS = {
+    "Analysis retry pending": "RETRY_PENDING",
+    "Analysis failed": "ANALYSIS_ERROR",
+    "Analysis retry limit or audio retention limit reached": "RETRY_LIMIT",
+    "부모 Egress 녹음이 완료되지 않았습니다": "PARENT_RECORDING_MISSING",
+    "Raw audio upload expired": "RAW_UPLOAD_EXPIRED",
+    "Audio retention limit reached": "AUDIO_EXPIRED",
+}
+# 휴지 비율 정의가 바뀌어(0018) 옛 값을 지운 표시. 측정하지 못한 것이 아니므로 비율에서 뺀다.
+PAUSE_DEFINITION_CHANGED = "DEFINITION_CHANGED"
 # 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
 # 시작되고 이만큼 지난 통화만 센다.
 RING_REPORT_GRACE = timedelta(hours=1)
@@ -201,6 +217,9 @@ class Dataset:
         self.consent_latest: dict[str, str] = {}
         self.inviters: set[str] = set()
         self.onboarding: list[Any] = []
+        self.extraction_status: dict[str, str] = {}
+        self.short_speech: set[str] = set()
+        self.pause_ratio: dict[str, Any] = {}
 
     def touch(self, user_id: str | None, when: datetime | None) -> None:
         if user_id is None or when is None:
@@ -274,6 +293,8 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
 
     call_rows = await session.execute(
         select(
+            CallRecord.id,
+            CallRecord.processing_error,
             CallRecord.parent_id,
             CallRecord.child_id,
             CallRecord.caller_id,
@@ -298,6 +319,31 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
     data.reports = list(
         await session.execute(select(Report.parent_id, Report.issued_at, Report.state))
     )
+
+    # 분석 품질: 결과의 상태·이유 코드만 읽는다(추출 내용·전사·수치는 읽지 않음)
+    data.extraction_status = {
+        row.call_id: row.parse_status
+        for row in await session.execute(
+            select(HealthExtraction.call_id, HealthExtraction.parse_status)
+        )
+    }
+    data.short_speech = set(
+        await session.scalars(
+            select(Transcript.call_id).where(
+                Transcript.exclusion_reason == "INSUFFICIENT_PARENT_SPEECH"
+            )
+        )
+    )
+    data.pause_ratio = {
+        row.call_id: row
+        for row in await session.execute(
+            select(
+                AcousticFeature.call_id,
+                AcousticFeature.status,
+                AcousticFeature.unmeasurable_reason,
+            ).where(AcousticFeature.metric == Metric.PAUSE_RATIO.value)
+        )
+    }
 
     # 외부 AI 동의: 사람마다 마지막 선택(문서 판과 상관없이)
     consent_at: dict[str, datetime] = {}
@@ -881,6 +927,56 @@ def build_signup(
     }
 
 
+def build_quality(
+    data: Dataset,
+    *,
+    now: datetime,
+    include_internal: bool,
+    since: date | None,
+) -> dict[str, Any]:
+    """분석 품질: 처리 오류 종류, 추출 없이 완료된 통화, 휴지 비율 측정 불가, 말이 짧은 통화."""
+    keep = included_users(data, include_internal=include_internal, since=since)
+    calls = [c for c in data.calls if c.parent_id in keep and c.child_id in keep]
+    ago30 = now - timedelta(days=30)
+
+    def error_kinds(rows: list[Any]) -> dict[str, int]:
+        return dict(
+            Counter(
+                PROCESSING_ERROR_KINDS.get(c.processing_error, "OTHER")
+                for c in rows
+                if c.processing_error
+            ).most_common()
+        )
+
+    analyzed = [c for c in calls if c.state == CallState.ANALYZED.value]
+    # 분석 완료인데 추출 결과 줄이 없거나 추출이 OK 가 아닌(FAILED 등) 통화
+    no_extraction = [c for c in analyzed if data.extraction_status.get(c.id) != "OK"]
+    pauses = [
+        data.pause_ratio[c.id]
+        for c in analyzed
+        if c.id in data.pause_ratio
+        and data.pause_ratio[c.id].unmeasurable_reason != PAUSE_DEFINITION_CHANGED
+    ]
+    unmeasurable = [p for p in pauses if p.status == "UNMEASURABLE"]
+    recorded = [c for c in calls if c.accepted_at is not None and c.recording_enabled]
+    short = [
+        c for c in recorded
+        if c.state == CallState.ANALYSIS_EXCLUDED.value and c.id in data.short_speech
+    ]
+    return {
+        "processingErrors": {
+            "all": error_kinds(calls),
+            "last30d": error_kinds([c for c in calls if aware(c.started_at) >= ago30]),
+        },
+        "analyzedWithoutExtraction": ratio(len(no_extraction), len(analyzed)),
+        "pauseUnmeasurable": ratio(len(unmeasurable), len(pauses)),
+        "pauseUnmeasurableReasons": dict(
+            Counter(p.unmeasurable_reason or "UNKNOWN" for p in unmeasurable).most_common()
+        ),
+        "shortSpeechExcluded": ratio(len(short), len(recorded)),
+    }
+
+
 # ---------------------------------------------------------------- 경로
 
 
@@ -941,6 +1037,7 @@ async def ops_summary(
         "cohorts": build_cohorts(data, **scope),
         "delivery": build_delivery(data, **scope),
         "signup": build_signup(data, **scope),
+        "quality": build_quality(data, **scope),
     }
 
 
