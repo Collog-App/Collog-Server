@@ -28,6 +28,12 @@ def upgrade() -> None:
         "ix_app_events_user_id_received_at", "app_events", ["user_id", "received_at"]
     )
     op.create_index("ix_app_events_occurred_at", "app_events", ["occurred_at"])
+    for column in ("subject_id", "call_id"):
+        condition = sa.text(f"{column} IS NOT NULL")
+        op.create_index(
+            f"ix_app_events_{column}", "app_events", [column],
+            postgresql_where=condition, sqlite_where=condition,
+        )
     op.create_index("ix_app_events_received_at", "app_events", ["received_at"])
     op.add_column("calls", sa.Column("incoming_push", sa.JSON(), nullable=True))
     op.add_column("ops_account_flags", sa.Column("cohort", sa.String(16), nullable=True))

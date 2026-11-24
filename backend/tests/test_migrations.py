@@ -213,3 +213,32 @@ def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     result = migrate(database, "downgrade", "base")
     assert result.returncode != 0
     assert "Restore a verified backup" in result.stderr
+
+
+def test_app_event_indexes_serve_the_limit_count_and_account_deletion(tmp_path: Path) -> None:
+    database = tmp_path / "indexes.db"
+    assert migrate(database, "upgrade", "head").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    with engine.connect() as connection:
+        definitions = dict(connection.execute(sa.text(
+            "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='app_events'"
+        )).all())
+        assert "ix_app_events_user_id" not in definitions  # 복합 색인이 대신한다
+        assert "(user_id, received_at)" in definitions["ix_app_events_user_id_received_at"]
+        for column in ("subject_id", "call_id"):
+            assert definitions[f"ix_app_events_{column}"].endswith(f"WHERE {column} IS NOT NULL")
+
+        def plan(statement: str) -> str:
+            rows = connection.execute(sa.text(f"EXPLAIN QUERY PLAN {statement}")).all()
+            return " ".join(str(row[-1]) for row in rows)
+
+        assert "ix_app_events_user_id_received_at" in plan(
+            "SELECT count(*) FROM app_events WHERE user_id = 'u' AND received_at >= '2026-11-24'"
+        )
+        assert "ix_app_events_subject_id" in plan(
+            "UPDATE app_events SET subject_id = NULL WHERE subject_id = 'u'"
+        )
+        assert "ix_app_events_call_id" in plan(
+            "UPDATE app_events SET call_id = NULL WHERE call_id IN ('a', 'b')"
+        )
+    engine.dispose()

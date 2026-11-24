@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     false,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -568,6 +569,20 @@ class AppEvent(Base):
     __table_args__ = (
         # 사용자별 하루 상한을 셀 때(user_id, received_at) 쓰고, user_id 만으로 찾을 때도 쓴다.
         Index("ix_app_events_user_id_received_at", "user_id", "received_at"),
+        # 계정·통화를 지울 때 다른 사람 줄의 대상·통화 ID 를 비우는 UPDATE 가 표를 훑지 않게.
+        # 대부분의 줄은 두 칸이 비어 있으므로 값이 있는 줄만 색인한다.
+        Index(
+            "ix_app_events_subject_id",
+            "subject_id",
+            postgresql_where=text("subject_id IS NOT NULL"),
+            sqlite_where=text("subject_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_app_events_call_id",
+            "call_id",
+            postgresql_where=text("call_id IS NOT NULL"),
+            sqlite_where=text("call_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
