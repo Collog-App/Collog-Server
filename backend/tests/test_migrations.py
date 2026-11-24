@@ -147,6 +147,31 @@ def test_pause_ratio_saved_before_v6_leaves_the_baseline(tmp_path: Path) -> None
     }
 
 
+def test_app_events_migration_keeps_ops_flags_and_refuses_downgrade(tmp_path: Path) -> None:
+    database = tmp_path / "events.db"
+    assert migrate(database, "upgrade", "0020_call_summary_and_timing").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text("INSERT INTO ops_account_flags VALUES ('tester', 1, :now)"),
+            dict(now=datetime.now(UTC)),
+        )
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        flag = connection.execute(
+            sa.text("SELECT internal, cohort FROM ops_account_flags WHERE user_id='tester'")
+        ).one()
+        assert tuple(flag) == (1, None)
+        inspector = sa.inspect(connection)
+        assert "incoming_push" in {column["name"] for column in inspector.get_columns("calls")}
+        assert "app_events" in inspector.get_table_names()
+    engine.dispose()
+    refused = migrate(database, "downgrade", "0020_call_summary_and_timing")
+    assert refused.returncode != 0
+    assert "Restore a verified backup" in refused.stderr
+
+
 def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "rollback.db"
     assert migrate(database, "upgrade", "head").returncode == 0

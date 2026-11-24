@@ -79,6 +79,22 @@ class AssetStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class PushResult(StrEnum):
+    """통화 알림을 받는 사람 기기로 보낸 결과."""
+
+    SENT = "SENT"
+    TOKEN_INVALID = "TOKEN_INVALID"
+    FAILED = "FAILED"
+    NO_DEVICE = "NO_DEVICE"
+
+
+class OpsCohort(StrEnum):
+    """운영자가 정하는 테스트 그룹. 표시가 없으면 미정이다."""
+
+    AWARE = "AWARE"
+    UNAWARE = "UNAWARE"
+
+
 class Metric(StrEnum):
     COUGH_EVENTS = "COUGH_EVENTS"
     SPEECH_RATE = "SPEECH_RATE"
@@ -346,6 +362,9 @@ class CallRecord(Base):
     # 분석이 어디서 오래 걸리는지 보려고 남기는 단계별 초: waitSec(통화 끝 → 분석 시작),
     # sttSec, analysisSec(추출·요약·음향), totalSec(통화 끝 → 분석 끝).
     analysis_timing: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
+    # 받는 사람에게 보낸 전화 알림 결과: result(PushResult, 기기 하나라도 SENT 면 SENT),
+    # at(보낸 시각), devices([{platform, result}] 기기마다). 이 기록이 생기기 전 통화는 비어 있다.
+    incoming_push: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     @property
@@ -529,4 +548,30 @@ class OpsAccountFlag(Base):
 
     user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # 테스트 그룹(OpsCohort). 비어 있으면 미정. 운영 화면에서만 쓰고 앱에는 보이지 않는다.
+    cohort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AppEvent(Base):
+    """앱이 보낸 이용 기록. 정해진 이름·코드값과 ID·시각·플랫폼·앱 버전만 담는다.
+
+    질환·리포트 문장·통화 내용·전화번호 같은 값은 어떤 칸에도 넣지 않는다. 계정 삭제 흐름을
+    건드리지 않도록 외래 키를 걸지 않고, 계정·통화를 지울 때 이 표의 줄도 같이 정리한다.
+    """
+
+    __tablename__ = "app_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    # 로그인 전 단계 기록(익명)은 비어 있다.
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(40))
+    code: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    subject_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    call_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    platform: Mapped[str] = mapped_column(String(16))
+    app_version: Mapped[str] = mapped_column(String(40))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
