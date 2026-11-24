@@ -172,6 +172,41 @@ def test_app_events_migration_keeps_ops_flags_and_refuses_downgrade(tmp_path: Pa
     assert "Restore a verified backup" in refused.stderr
 
 
+def test_ai_usage_migration_keeps_existing_calls(tmp_path: Path) -> None:
+    database = tmp_path / "usage.db"
+    assert migrate(database, "upgrade", "0021_app_events").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        for user_id in ("p", "c"):
+            connection.execute(
+                sa.text(
+                    "INSERT INTO users (id, role, name, marketing_opt_in, created_at)"
+                    " VALUES (:id, 'PARENT', 'Test', 0, :now)"
+                ),
+                dict(id=user_id, now=now),
+            )
+        connection.execute(
+            sa.text(
+                "INSERT INTO calls (id, parent_id, child_id, state, room_name, recording_enabled,"
+                " started_at, asked_question_ids, processing_attempts, created_at)"
+                " VALUES ('old-call', 'p', 'c', 'ANALYZED', 'room', 1, :now, '[]', 1, :now)"
+            ),
+            dict(now=now),
+        )
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        row = connection.execute(
+            sa.text("SELECT state, ai_usage FROM calls WHERE id='old-call'")
+        ).one()
+        assert tuple(row) == ("ANALYZED", None)
+    engine.dispose()
+    refused = migrate(database, "downgrade", "0021_app_events")
+    assert refused.returncode != 0
+    assert "Restore a verified backup" in refused.stderr
+
+
 def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "rollback.db"
     assert migrate(database, "upgrade", "head").returncode == 0

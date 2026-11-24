@@ -365,6 +365,9 @@ class CallRecord(Base):
     # 받는 사람에게 보낸 전화 알림 결과: result(PushResult, 기기 하나라도 SENT 면 SENT),
     # at(보낸 시각), devices([{platform, result}] 기기마다). 이 기록이 생기기 전 통화는 비어 있다.
     incoming_push: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 이 통화에 쓴 외부 AI 사용량(공급자 응답이 알려 준 값의 합, services/usage.py 의 칸 이름).
+    # 칸이 없으면 그 공급자를 부르지 않았고, null 이면 불렀지만 응답에 값이 없었다.
+    ai_usage: Mapped[dict[str, float | None] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     @property
