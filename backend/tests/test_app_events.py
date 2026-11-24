@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import insert, select
 
 from app.database import Base, Database
-from app.models import AppEvent
+from app.models import AppEvent, User
 from app.services import events as event_rules
 from app.services.events import EventRetention
 from tests.conftest import auth, create_user
@@ -368,3 +368,25 @@ def test_metric_help_code_takes_no_digit_runs(client: TestClient) -> None:
     batch = [event("metric_help_open", code=code) for code in kept + dropped]
     response = client.post("/v1/events", headers=auth(token), json={"events": batch})
     assert response.json() == {"accepted": len(kept)}
+
+
+async def test_retention_also_removes_rows_of_deleted_accounts(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'orphans.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    now = datetime.now(UTC)
+    rows = [
+        {"id": name, "user_id": user_id, "name": "app_open", "platform": "IOS",
+         "app_version": "1.0 (1)", "occurred_at": now, "received_at": now}
+        for name, user_id in (("kept", "alive"), ("orphan", "deleted"), ("anonymous", None))
+    ]
+    try:
+        async with database.sessions() as session:
+            session.add(User(id="alive", role="CHILD", name="시험", created_at=now))
+            await session.execute(insert(AppEvent), rows)
+            await session.commit()
+        assert await EventRetention(database).maintain() == 1
+        async with database.sessions() as session:
+            assert set(await session.scalars(select(AppEvent.id))) == {"kept", "anonymous"}
+    finally:
+        await database.close()

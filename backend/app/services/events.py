@@ -17,7 +17,7 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import Database
-from app.models import AppEvent, CallRecord, Family, FamilyMember
+from app.models import AppEvent, CallRecord, Family, FamilyMember, User
 from app.schemas import AppEventIn
 from app.services.domain import connected_family_ids
 
@@ -182,7 +182,11 @@ async def store_events(
 
 
 class EventRetention:
-    """보관 기간(1년)이 지난 이용 기록을 지운다. 정기 작업이 자주 불러도 한 시간에 한 번만 돈다."""
+    """보관 기간(1년)이 지난 이용 기록과, 이미 지워진 계정의 기록을 지운다.
+
+    계정 삭제는 그 사람의 줄을 함께 지우지만, 배포가 이 표를 모르는 이전 판으로 되돌아간 동안
+    지운 계정의 줄은 남는다. 정기 작업이 자주 불러도 한 시간에 한 번만 돈다.
+    """
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -193,11 +197,19 @@ class EventRetention:
         if self._last_run is not None and now - self._last_run < RETENTION_INTERVAL:
             return 0
         async with self.database.sessions() as session:
-            result = await session.execute(
+            expired = await session.execute(
                 delete(AppEvent).where(AppEvent.occurred_at < now - RETENTION)
+            )
+            orphaned = await session.execute(
+                delete(AppEvent).where(
+                    AppEvent.user_id.is_not(None),
+                    ~select(User.id).where(User.id == AppEvent.user_id).exists(),
+                )
             )
             await session.commit()
         self._last_run = now
-        if result.rowcount:
-            logger.info("보관 기간이 지난 이용 기록 %d건을 지웠습니다", result.rowcount)
-        return result.rowcount
+        if expired.rowcount:
+            logger.info("보관 기간이 지난 이용 기록 %d건을 지웠습니다", expired.rowcount)
+        if orphaned.rowcount:
+            logger.info("지워진 계정의 이용 기록 %d건을 지웠습니다", orphaned.rowcount)
+        return expired.rowcount + orphaned.rowcount
