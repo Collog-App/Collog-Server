@@ -9,6 +9,7 @@ import httpx
 
 from app.config import Settings
 from app.schemas import QuestionTtsToken, QuestionView
+from app.services import usage
 from app.services.http import request_with_retry
 from app.services.storage import StorageGateway
 
@@ -17,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 class QuestionTtsError(RuntimeError):
     pass
+
+
+def character_cost(headers: httpx.Headers) -> int | None:
+    """ElevenLabs 가 응답 헤더로 알려 준 이번 요청의 글자 수. 없으면 None."""
+    value = headers.get("character-cost") or headers.get("x-character-count")
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
 
 
 class QuestionTtsGateway:
@@ -45,6 +55,8 @@ class ElevenLabsQuestionTtsGateway(QuestionTtsGateway):
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def attach_audio(self, questions: list[QuestionView]) -> list[QuestionView]:
+        # 이미 만들어 둔 음성만 쓰면 ElevenLabs 를 부르지 않으므로 0자다.
+        usage.add("ttsCharacters", 0)
         results = await asyncio.gather(
             *(self._attach_one(question) for question in questions),
             return_exceptions=True,
@@ -108,6 +120,7 @@ class ElevenLabsQuestionTtsGateway(QuestionTtsGateway):
                 )
         except httpx.HTTPError as exc:
             raise QuestionTtsError(f"ElevenLabs TTS 요청 실패: {exc}") from exc
+        usage.add("ttsCharacters", character_cost(response.headers))
         if not response.content:
             raise QuestionTtsError("ElevenLabs가 빈 오디오를 반환했습니다")
         return response.content

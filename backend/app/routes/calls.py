@@ -22,6 +22,7 @@ from app.routes.questions import questions_for_parent
 from app.routes.shared import aware, call_to_dict, ensure_call_access, settings_from
 from app.schemas import AudioConstraints, CallAccepted, CallAcceptRequest, CallCreate, CallCreated
 from app.security import CurrentUser, SessionDep
+from app.services import usage
 from app.services.domain import (
     ensure_same_family,
     ensure_subject_access,
@@ -132,7 +133,9 @@ async def create_reserved_call(
             raise HTTPException(
                 status.HTTP_409_CONFLICT, "상대방의 통화 수신 기기가 등록되지 않았습니다"
             )
-    source, questions = await questions_for_parent(request, session, parent.id, child.id)
+    # 서버가 질문 음성을 새로 만들면(ElevenLabs) 그 글자 수가 이 통화의 사용량이 된다.
+    with usage.metering() as spent:
+        source, questions = await questions_for_parent(request, session, parent.id, child.id)
     del source
     recording_enabled = await participants_consented(
         session, parent.id, child.id, settings_from(request).consent_document_version
@@ -156,6 +159,7 @@ async def create_reserved_call(
         recording_enabled=recording_enabled,
         recording_disabled_reason=disabled_reason,
         asked_question_ids=[item.question_id for item in questions],
+        ai_usage=spent or None,
     )
     session.add(call)
     await session.flush()
