@@ -1,0 +1,95 @@
+name: Production monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# 외부 액션도 저장소 토큰도 쓰지 않는다.
+permissions: {}
+
+concurrency:
+  group: production-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check health and operator alerts
+        env:
+          API_BASE: https://api.collog.live
+          OPS_MONITOR_CODE: ${{ secrets.OPS_MONITOR_CODE }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          # 비밀 값(접속 코드·웹훅 주소)은 어떤 출력에도 넣지 않는다.
+          base = os.environ["API_BASE"]
+          agent = {"User-Agent": "collog-monitor (GitHub Actions)"}
+          problems = []
+
+
+          def fetch(path, headers=None):
+              request = urllib.request.Request(base + path, headers={**agent, **(headers or {})})
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  return response.status, response.read()
+
+
+          try:
+              status, _ = fetch("/v1/health")
+              if status != 200:
+                  problems.append(f"/v1/health 응답 {status}")
+          except urllib.error.HTTPError as error:
+              problems.append(f"/v1/health 응답 {error.code}")
+          except Exception as error:
+              problems.append(f"/v1/health 접속 실패 ({type(error).__name__})")
+
+          code = os.environ.get("OPS_MONITOR_CODE", "")
+          if code:
+              try:
+                  status, body = fetch("/ops/api/alerts", {"X-Ops-Code": code})
+                  result = json.loads(body)
+                  if result.get("ok") is not True:
+                      found = [
+                          str(item.get("message") or item.get("code"))
+                          for item in result.get("problems", [])
+                      ]
+                      problems.extend(found or ["장애 알림 확인 결과가 ok 가 아님"])
+              except urllib.error.HTTPError as error:
+                  problems.append(f"/ops/api/alerts 응답 {error.code}")
+              except Exception as error:
+                  problems.append(f"/ops/api/alerts 확인 실패 ({type(error).__name__})")
+          else:
+              print("OPS_MONITOR_CODE 비밀이 없어 장애 알림 확인은 건너뜁니다")
+
+          if not problems:
+              print("이상 없음")
+              sys.exit(0)
+
+          text = "콜록 운영 경보\n" + "\n".join(f"- {item}" for item in problems)
+          print(text)
+          hook = os.environ.get("ALERT_WEBHOOK_URL", "")
+          if hook:
+              # 디스코드는 content, 슬랙은 text 를 읽는다
+              payload = json.dumps({"content": text, "text": text}).encode()
+              request = urllib.request.Request(
+                  hook, data=payload, headers={**agent, "Content-Type": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      print(f"알림을 보냈습니다 (응답 {response.status})")
+              except urllib.error.HTTPError as error:
+                  print(f"알림 보내기 실패 (응답 {error.code})")
+              except Exception as error:
+                  print(f"알림 보내기 실패 ({type(error).__name__})")
+          else:
+              print("ALERT_WEBHOOK_URL 비밀이 없어 알림 보내기는 건너뜁니다")
+          sys.exit(1)
+          PY

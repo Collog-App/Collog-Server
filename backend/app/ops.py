@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -48,6 +49,7 @@ from app.models import (
     UserRole,
 )
 from app.security import SessionDep
+from app.services.livekit import LiveKitError, LiveKitGateway
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,14 @@ OPS_EVENTS = ("app_open", "report_view", "post_call_answer", "incoming_call_show
 # 받는 앱은 울림 기록을 다음에 앱이 앞으로 올 때 올릴 수 있다. 「보냈는데 안 울림」은 통화가
 # 시작되고 이만큼 지난 통화만 센다.
 RING_REPORT_GRACE = timedelta(hours=1)
+
+# 이 이름표의 접속 코드는 장애 알림(/ops/api/alerts)만 열 수 있다(바깥 감시 작업용).
+ALERTS_ONLY_LABELS = frozenset({"monitor"})
+# 장애 알림 기준
+LIVEKIT_TIMEOUT_SECONDS = 5
+ANALYSIS_BACKLOG_AFTER = timedelta(minutes=20)
+FAILURE_STREAK = 3
+FAILURE_STREAK_WITHIN = timedelta(hours=24)
 
 router = APIRouter(include_in_schema=False)
 
@@ -86,7 +96,7 @@ def enabled_settings(request: Request) -> Settings:
     return settings
 
 
-def require_operator(
+def require_alert_reader(
     request: Request,
     x_ops_code: Annotated[str | None, Header()] = None,
 ) -> str:
@@ -96,7 +106,14 @@ def require_operator(
     return label
 
 
+def require_operator(label: Annotated[str, Depends(require_alert_reader)]) -> str:
+    if label in ALERTS_ONLY_LABELS:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "이 접속 코드로는 볼 수 없습니다")
+    return label
+
+
 OperatorDep = Annotated[str, Depends(require_operator)]
+AlertReaderDep = Annotated[str, Depends(require_alert_reader)]
 
 
 # ---------------------------------------------------------------- 계산 도우미
@@ -864,3 +881,79 @@ async def ops_set_cohort(
     await session.commit()
     logger.info("ops account %s cohort=%s by %s", user_id, cohort, operator)
     return {"id": user_id, "cohort": cohort}
+
+
+# ---------------------------------------------------------------- 장애 알림
+
+
+async def find_problems(
+    session: AsyncSession, livekit: LiveKitGateway, now: datetime
+) -> list[dict[str, str]]:
+    problems = []
+    try:
+        async with asyncio.timeout(LIVEKIT_TIMEOUT_SECONDS):
+            await livekit.check_reachable()
+    except (LiveKitError, TimeoutError):
+        logger.warning("ops alert: LiveKit check failed", exc_info=True)
+        problems.append({
+            "code": "LIVEKIT_UNREACHABLE",
+            "message": (
+                f"LiveKit 서버가 {LIVEKIT_TIMEOUT_SECONDS}초 안에 답하지 않습니다(통화 연결 불가)"
+            ),
+        })
+
+    # 녹음된 통화가 끝났는데 분석 대기(ENDED)나 분석 중(PROCESSING)에 오래 머물러 있다
+    waiting = await session.scalar(
+        select(func.count(CallRecord.id)).where(
+            CallRecord.recording_enabled.is_(True),
+            CallRecord.state.in_([CallState.ENDED.value, CallState.PROCESSING.value]),
+            CallRecord.ended_at <= now - ANALYSIS_BACKLOG_AFTER,
+        )
+    )
+    if waiting:
+        minutes = int(ANALYSIS_BACKLOG_AFTER.total_seconds() // 60)
+        problems.append({
+            "code": "ANALYSIS_BACKLOG",
+            "message": (
+                f"통화가 끝나고 {minutes}분 넘게 분석을 기다리는 통화가 {waiting}건 있습니다"
+            ),
+        })
+
+    # 분석이 끝난(완료·실패) 통화를 통화 끝난 시각 순으로 본다. 분석 제외(짧은 통화 등)는 건너뛴다.
+    latest = list(
+        await session.execute(
+            select(CallRecord.state, CallRecord.ended_at)
+            .where(
+                CallRecord.state.in_([CallState.ANALYZED.value, CallState.ANALYSIS_FAILED.value]),
+                CallRecord.ended_at.is_not(None),
+            )
+            .order_by(CallRecord.ended_at.desc())
+            .limit(FAILURE_STREAK)
+        )
+    )
+    if (
+        len(latest) == FAILURE_STREAK
+        and all(row.state == CallState.ANALYSIS_FAILED.value for row in latest)
+        and aware(latest[0].ended_at) >= now - FAILURE_STREAK_WITHIN
+    ):
+        problems.append({
+            "code": "ANALYSIS_FAILING",
+            "message": (
+                f"가장 최근에 분석이 끝난 통화 {FAILURE_STREAK}건이 모두 분석에 실패했습니다"
+            ),
+        })
+    return problems
+
+
+@router.get("/ops/api/alerts")
+async def ops_alerts(
+    request: Request, reader: AlertReaderDep, session: SessionDep
+) -> dict[str, Any]:
+    problems = await find_problems(
+        session, request.app.state.container.livekit, datetime.now(UTC)
+    )
+    if problems:
+        logger.warning(
+            "ops alerts checked by %s: %s", reader, ", ".join(p["code"] for p in problems)
+        )
+    return {"ok": not problems, "problems": problems}

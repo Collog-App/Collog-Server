@@ -726,9 +726,10 @@ document.addEventListener("DOMContentLoaded", () => {
       headers: { "X-Ops-Code": code },
       cache: "no-store",
     });
-    if (response.status === 401) {
+    if (response.status === 401 || response.status === 403) {
       $("login-error").hidden = false;
-      $("login-error").textContent = "접속 코드가 맞지 않습니다";
+      $("login-error").textContent =
+        response.status === 403 ? "이 접속 코드로는 지표 화면을 볼 수 없습니다" : "접속 코드가 맞지 않습니다";
       return;
     }
     storage("set", code);

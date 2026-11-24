@@ -22,6 +22,10 @@ class EgressStarted:
 
 
 class LiveKitGateway:
+    async def check_reachable(self) -> None:
+        """LiveKit 서버가 API 요청에 답하는지 본다. 답하지 못하면 LiveKitError."""
+        raise NotImplementedError
+
     async def participant_identities(self, room_name: str) -> set[str] | None:
         raise NotImplementedError
 
@@ -50,6 +54,9 @@ class LiveKitGateway:
 
 
 class MockLiveKitGateway(LiveKitGateway):
+    async def check_reachable(self) -> None:
+        return None
+
     async def participant_identities(self, room_name: str) -> set[str] | None:
         return None
 
@@ -97,6 +104,16 @@ class RealLiveKitGateway(LiveKitGateway):
             self.settings.livekit_api_key,
             self.settings.livekit_api_secret,
         )
+
+    async def check_reachable(self) -> None:
+        client = self._client()
+        try:
+            # 없는 방 이름 하나만 물어 서버가 인증된 요청에 답하는지만 본다
+            await client.room.list_rooms(api.ListRoomsRequest(names=["collog-health-check"]))
+        except Exception as exc:
+            raise LiveKitError("LiveKit server did not answer") from exc
+        finally:
+            await client.aclose()
 
     async def participant_identities(self, room_name: str) -> set[str] | None:
         client = self._client()
