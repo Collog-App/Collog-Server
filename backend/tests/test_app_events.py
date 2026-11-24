@@ -8,6 +8,7 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 from sqlalchemy import insert, select
 
+from app.database import Base, Database
 from app.models import AppEvent
 from app.services import events as event_rules
 from app.services.events import EventRetention
@@ -191,33 +192,29 @@ def test_events_show_in_openapi(client: TestClient) -> None:
     assert items["$ref"].rsplit("/", 1)[-1] in document["components"]["schemas"]
 
 
-def test_old_events_are_removed_after_a_year(client: TestClient) -> None:
-    container = client.app.state.container
+async def test_old_events_are_removed_after_a_year(tmp_path: Path) -> None:
+    # 앱을 띄우면 정기 작업이 같은 정리를 돌리므로, 정기 작업이 없는 DB 에서 본다
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'retention.db'}")
+    async with database.engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
     now = datetime.now(UTC)
-    # 앱의 정기 작업이 시험 도중 먼저 지우지 않게 막아 둔다
-    container.event_retention._last_run = now
     rows = [
         {"id": name, "user_id": None, "name": "app_open", "platform": "IOS",
          "app_version": "1.0 (1)", "occurred_at": now - age, "received_at": now - age}
         for name, age in (("old", timedelta(days=366)), ("recent", timedelta(days=364)))
     ]
-
-    async def run() -> tuple[int, int, set[str]]:
-        async with container.database.sessions() as session:
+    try:
+        async with database.sessions() as session:
             await session.execute(insert(AppEvent), rows)
             await session.commit()
-        retention = EventRetention(container.database)
-        removed = await retention.maintain()
+        retention = EventRetention(database)
+        assert await retention.maintain() == 1
         # 한 시간 안에 다시 불러도 돌지 않는다
-        skipped = await retention.maintain()
-        async with container.database.sessions() as session:
-            left = set(await session.scalars(select(AppEvent.id)))
-        return removed, skipped, left
-
-    removed, skipped, left = client.portal.call(run)
-    assert removed == 1
-    assert skipped == 0
-    assert left == {"recent"}
+        assert await retention.maintain() == 0
+        async with database.sessions() as session:
+            assert set(await session.scalars(select(AppEvent.id))) == {"recent"}
+    finally:
+        await database.close()
 
 
 def test_deleting_an_account_removes_its_events(client: TestClient, tmp_path: Path) -> None:
