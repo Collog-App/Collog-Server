@@ -34,7 +34,7 @@ EVENT_CODES: dict[str, frozenset[str] | re.Pattern[str] | None] = {
         "WELCOME", "LOGIN", "TERMS", "AI_CONSENT", "PROFILE", "CONDITIONS", "INVITE_CODE", "DONE",
     }),
     "health_link_result": frozenset({"CONNECTED", "PERMISSION_DENIED", "CONNECTED_NO_RECORDS"}),
-    "metric_help_open": re.compile(r"[A-Z0-9_]{1,40}"),
+    "metric_help_open": re.compile(r"[A-Z_]{1,40}"),
 }
 # 「버전 (빌드)」 꼴만 받는다(예: 1.2 (44)). 다른 글자(NUL 등)가 섞인 줄은 버린다.
 APP_VERSION = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,3} \([0-9]{1,9}\)")
@@ -42,6 +42,8 @@ APP_VERSION = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,3} \([0-9]{1,9}\)")
 RECORD_ID = re.compile(r"[0-9A-Za-z-]{1,36}")
 SUBJECT_EVENTS = frozenset({"report_view", "post_call_answer"})
 CALL_EVENTS = frozenset({"post_call_answer", "incoming_call_shown", "call_connect_failed"})
+# 요청한 사람이 한쪽인 통화 ID 가 있어야 받는 이벤트(없거나 남의 통화면 그 줄을 버린다)
+CALL_REQUIRED_EVENTS = frozenset({"post_call_answer"})
 ANONYMOUS_EVENTS = frozenset({"onboarding_step"})
 
 MAX_AGE = timedelta(days=30)
@@ -91,6 +93,8 @@ def accepted_row(
     signed_in = user_id is not None
     subject_id = record_id(event.subject_id)
     call_id = record_id(event.call_id)
+    if event.name in CALL_REQUIRED_EVENTS and call_id is None:
+        return None
     return {
         "id": str(event.id),
         "user_id": user_id,
@@ -146,6 +150,10 @@ async def store_events(
             for row in accepted:
                 if row["call_id"] not in own_calls:
                     row["call_id"] = None
+        accepted = [
+            row for row in accepted
+            if row["call_id"] or row["name"] not in CALL_REQUIRED_EVENTS
+        ]
         if accepted:
             recent = await session.scalar(
                 select(func.count()).select_from(AppEvent).where(

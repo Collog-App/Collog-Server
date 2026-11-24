@@ -338,3 +338,31 @@ def test_platform_takes_only_the_two_app_values(client: TestClient) -> None:
             json={"events": [{**event("app_open"), "platform": platform}]},
         )
         assert response.json() == {"accepted": 1}
+
+
+def test_call_answers_need_a_call_of_the_person_who_answered(
+    client: TestClient, tmp_path: Path
+) -> None:
+    child_token, _, parent_token, parent = onboard_family(client)
+    call_id = declined_call(client, child_token, parent_token, parent["id"])
+    stranger_token, _ = create_user(client, "01077778888", "CHILD", "남")
+    own = event("post_call_answer", code="YES", subject=parent["id"], call=call_id)
+    no_call = event("post_call_answer", code="NO", subject=parent["id"])
+    unknown_call = event("post_call_answer", code="NO", call="no-such-call")
+    response = client.post(
+        "/v1/events", headers=auth(child_token), json={"events": [own, no_call, unknown_call]}
+    )
+    assert response.json() == {"accepted": 1}
+    foreign = event("post_call_answer", code="YES", call=call_id)
+    assert client.post(
+        "/v1/events", headers=auth(stranger_token), json={"events": [foreign]}
+    ).json() == {"accepted": 0}
+    assert set(stored(tmp_path)) == {own["id"]}
+
+
+def test_metric_help_code_is_capital_letters_and_underscores(client: TestClient) -> None:
+    token, _ = create_user(client, "01055556666", "CHILD", "시험")
+    batch = [event("metric_help_open", code=code)
+             for code in ("PAUSE_RATIO", "F0_VARIATION", "01012345678", "SPEECH RATE", "A" * 41)]
+    response = client.post("/v1/events", headers=auth(token), json={"events": batch})
+    assert response.json() == {"accepted": 1}
