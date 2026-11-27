@@ -113,10 +113,10 @@ async def revenuecat_webhook(
     실패로 보므로 그보다 짧게 끊는다.
     """
     container = request.app.state.container
-    expected = container.settings.revenuecat_webhook_auth
-    if not expected.strip():
+    expected = container.settings.revenuecat_webhook_auth.strip()
+    if not expected:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "결제 웹훅이 설정되지 않았습니다")
-    if not hmac.compare_digest(authorization.encode(), expected.encode()):
+    if not hmac.compare_digest(authorization.strip().encode(), expected.encode()):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "웹훅 인증에 실패했습니다")
     try:
         body = await request.json()

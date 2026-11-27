@@ -7,7 +7,6 @@ from fastapi import APIRouter, HTTPException, Path, Query, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import Settings
 from app.models import Baseline, ChangeSignal, User
 from app.security import CurrentUser, SessionDep
 from app.services import billing
@@ -17,13 +16,17 @@ from app.services.signals import baseline_to_dict, signal_to_dict
 router = APIRouter()
 
 
-async def ensure_premium(session: AsyncSession, settings: Settings, user: User) -> None:
+async def ensure_premium(session: AsyncSession, request: Request, user: User) -> None:
     """결제가 켜져 있고 보는 사람의 가족이 프리미엄이 아니면 402(403 은 공유 꺼짐)."""
+    container = request.app.state.container
     now = datetime.now(UTC)
-    if not billing.billing_enabled(settings, now):
+    if not billing.billing_enabled(container.settings, now):
         return
     people = await billing.people_of(session, user.id)
-    if not (await billing.family_plan(session, settings, people, now)).premium:
+    plan = await billing.current_plan(
+        session, container.settings, container.revenuecat, people, now
+    )
+    if not plan.premium:
         raise HTTPException(402, billing.PREMIUM_REQUIRED_MESSAGE)
 
 
@@ -54,7 +57,7 @@ async def get_signals(
     filter: Literal["ALL", "PROMOTED", "ACUTE"] = "ALL",
 ) -> dict:
     await ensure_subject_access(session, user, parent_id, "report")
-    await ensure_premium(session, request.app.state.container.settings, user)
+    await ensure_premium(session, request, user)
     statement = select(ChangeSignal).where(ChangeSignal.parent_id == parent_id)
     if filter == "PROMOTED":
         statement = statement.where(ChangeSignal.promoted.is_(True))
@@ -74,5 +77,5 @@ async def get_report(
     date_: Annotated[date | None, Query(alias="date")] = None,
 ) -> dict:
     await ensure_subject_access(session, user, parent_id, "report")
-    await ensure_premium(session, request.app.state.container.settings, user)
+    await ensure_premium(session, request, user)
     return await request.app.state.container.reports.get_or_issue(session, parent_id, period, date_)

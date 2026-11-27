@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
+import time
 from datetime import UTC, datetime, timedelta
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -64,6 +65,8 @@ from app.services.revenuecat import RevenueCatError
 from app.services.storage import StorageError
 
 router = APIRouter(prefix="/account", tags=["Account"])
+# 같은 사람이 이 간격 안에 다시 새로 읽기를 부르면 RevenueCat 을 부르지 않고 저장값으로 답한다.
+REFRESH_INTERVAL_SECONDS = 30
 
 
 class RoleUpdate(ApiModel):
@@ -222,18 +225,28 @@ async def update_sharing(payload: SharingUpdate, user: CurrentUser, session: Ses
 @router.get("/entitlement")
 async def get_entitlement(request: Request, user: CurrentUser, session: SessionDep) -> dict:
     """가족 요금제와 이번 달 분석 분량. 앱은 화면 잠금을 이 값으로만 정한다."""
-    settings = request.app.state.container.settings
-    return await billing.entitlement_view(session, settings, user, datetime.now(UTC))
+    container = request.app.state.container
+    return await billing.entitlement_view(
+        session, container.settings, user, datetime.now(UTC), container.revenuecat
+    )
 
 
 @router.post("/entitlement/refresh")
 async def refresh_entitlement(request: Request, user: CurrentUser, session: SessionDep) -> dict:
     """구매·복원 직후 RevenueCat 에서 내 구독을 다시 읽는다.
 
-    비밀 키가 없으면 저장된 값으로만 답한다.
+    비밀 키가 없거나 결제가 꺼져 있거나 30초 안에 다시 부르면 저장된 값으로만 답한다.
     """
     container = request.app.state.container
-    if container.revenuecat.configured:
+    client = container.revenuecat
+    last = client.refreshed_at.get(user.id)
+    recent = last is not None and time.monotonic() - last < REFRESH_INTERVAL_SECONDS
+    if (
+        client.configured
+        and billing.billing_enabled(container.settings, datetime.now(UTC))
+        and not recent
+    ):
+        client.refreshed_at[user.id] = time.monotonic()
         try:
             await billing.refresh_entitlement(
                 session, container.settings, container.revenuecat, user.id, datetime.now(UTC)
@@ -244,7 +257,9 @@ async def refresh_entitlement(request: Request, user: CurrentUser, session: Sess
                 502, "구독 정보를 확인하지 못했어요. 잠시 뒤 다시 시도해 주세요"
             ) from exc
         await session.commit()
-    return await billing.entitlement_view(session, container.settings, user, datetime.now(UTC))
+    return await billing.entitlement_view(
+        session, container.settings, user, datetime.now(UTC), client
+    )
 
 
 @router.delete("", status_code=204)

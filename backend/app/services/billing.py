@@ -12,16 +12,24 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
-from app.models import AnalysisUsage, CallRecord, RevenueCatEvent, User, UserEntitlement
+from app.models import (
+    AnalysisUsage,
+    CallRecord,
+    RevenueCatEvent,
+    Transcript,
+    User,
+    UserEntitlement,
+)
 from app.services.domain import family_for_user, family_people
 from app.services.revenuecat import (
     EntitlementState,
     RevenueCatClient,
+    RevenueCatError,
     entitlement_from_event,
     entitlement_from_subscriber,
     related_user_ids,
@@ -33,6 +41,9 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 QUOTA_EXCEEDED_REASON = "ANALYSIS_QUOTA_EXCEEDED"
 PREMIUM_REQUIRED_MESSAGE = "주간 리포트는 프리미엄에서 볼 수 있어요."
+# 만료가 막 지났는데 갱신될 구독은 웹훅을 놓쳤을 수 있어 판정 전에 다시 읽는다.
+LAPSED_LOOKBACK = timedelta(days=7)
+LAPSED_RECHECK = timedelta(minutes=10)
 
 
 def aware(value: datetime) -> datetime:
@@ -66,11 +77,13 @@ class FamilyPlan:
     premium: bool
     source: str | None
     trial_ends_at: datetime | None
-    paid_until: datetime | None
-    # 유효한 구독이 있는 가족 사람 → 그 구독 만료 시각
-    payers: dict[str, datetime] = field(default_factory=dict)
-    # paid_until 을 준 구독이 자동 갱신 중인가. 유료가 아니거나 모르면 None.
-    will_renew: bool | None = None
+    # 유효한 구독이 있는 가족 사람 → (그 구독 만료 시각, 자동 갱신 중인가)
+    payers: dict[str, tuple[datetime, bool | None]] = field(default_factory=dict)
+
+    @property
+    def latest_payer(self) -> str | None:
+        """가족에서 가장 늦게 끝나는 구독의 사람."""
+        return max(self.payers, key=lambda user_id: self.payers[user_id][0], default=None)
 
 
 async def family_plan(
@@ -84,15 +97,12 @@ async def family_plan(
             UserEntitlement.active_until.is_not(None),
         )
     )
-    valid = [
-        (user_id, aware(until), renew) for user_id, until, renew in rows.all()
+    payers = {
+        user_id: (aware(until), renew) for user_id, until, renew in rows.all()
         if aware(until) > now
-    ]
-    payers = {user_id: until for user_id, until, _ in valid}
-    latest = max(valid, key=lambda item: item[1], default=None)
-    paid_until, will_renew = (latest[1], latest[2]) if latest else (None, None)
+    }
     if not billing_enabled(settings, now):
-        return FamilyPlan(False, True, None, None, paid_until, payers, will_renew)
+        return FamilyPlan(False, True, None, None, payers)
     assert settings.billing_launch_at is not None
     # 가장 먼저 가입한 사람의 체험만 본다. 새 사람이 들어와도 가족 체험은 늘지 않는다.
     first_joined = await session.scalar(
@@ -110,27 +120,77 @@ async def family_plan(
         source = "TRIAL"
     else:
         source = None
-    return FamilyPlan(
-        True, source is not None, source, trial_ends_at, paid_until, payers, will_renew
-    )
+    return FamilyPlan(True, source is not None, source, trial_ends_at, payers)
+
+
+async def refresh_lapsed(
+    session: AsyncSession, settings: Settings, client: RevenueCatClient | None,
+    people: set[str], now: datetime,
+) -> bool:
+    """만료가 7일 안에 지났고 해지하지 않은 구독을 RevenueCat 에서 다시 읽는다.
+
+    갱신 웹훅을 놓쳐 유료 사용자가 잠기지 않게 한다. 한 사람당 10분(updated_at)에 한 번만 부르고,
+    실패해도 요청을 실패시키지 않고 저장값으로 판정한다. 다시 읽은 사람이 있으면 True.
+    """
+    if client is None or not client.configured or not billing_enabled(settings, now):
+        return False
+    lapsed = list(await session.scalars(
+        select(UserEntitlement.user_id).where(
+            UserEntitlement.user_id.in_(people),
+            UserEntitlement.active_until <= now,
+            UserEntitlement.active_until > now - LAPSED_LOOKBACK,
+            or_(UserEntitlement.will_renew.is_(None), UserEntitlement.will_renew.is_(True)),
+            UserEntitlement.updated_at < now - LAPSED_RECHECK,
+        )
+    ))
+    for user_id in lapsed:
+        try:
+            await refresh_entitlement(session, settings, client, user_id, now)
+        except RevenueCatError:
+            logger.warning("만료가 지난 구독을 다시 읽지 못해 저장값으로 판정합니다")
+            # 다음 시도도 10분 뒤에 하도록 시각만 남긴다.
+            row = await session.get(UserEntitlement, user_id)
+            if row is not None:
+                row.updated_at = now
+    if lapsed:
+        await session.commit()
+    return bool(lapsed)
+
+
+async def current_plan(
+    session: AsyncSession, settings: Settings, client: RevenueCatClient | None,
+    people: set[str], now: datetime,
+) -> FamilyPlan:
+    """프리미엄이 아니면 만료가 막 지난 구독을 다시 읽어 한 번 더 판정한다."""
+    plan = await family_plan(session, settings, people, now)
+    if not plan.premium and await refresh_lapsed(session, settings, client, people, now):
+        plan = await family_plan(session, settings, people, now)
+    return plan
 
 
 def analysis_limit(settings: Settings, plan: FamilyPlan) -> int:
     return settings.premium_analysis_seconds if plan.premium else settings.free_analysis_seconds
 
 
-async def used_seconds(session: AsyncSession, people: set[str], month: str) -> int:
-    total = await session.scalar(
-        select(func.coalesce(func.sum(AnalysisUsage.seconds), 0)).where(
-            AnalysisUsage.month == month,
-            or_(AnalysisUsage.parent_id.in_(people), AnalysisUsage.child_id.in_(people)),
-        )
+async def used_seconds(
+    session: AsyncSession, settings: Settings, people: set[str], month: str, now: datetime
+) -> int:
+    """그 달 가족 사용량. 결제가 켜져 있으면 켜진 뒤에 남은 줄만 센다."""
+    statement = select(func.coalesce(func.sum(AnalysisUsage.seconds), 0)).where(
+        AnalysisUsage.month == month,
+        or_(AnalysisUsage.parent_id.in_(people), AnalysisUsage.child_id.in_(people)),
     )
-    return int(total or 0)
+    if billing_enabled(settings, now):
+        assert settings.billing_launch_at is not None
+        statement = statement.where(
+            AnalysisUsage.created_at >= settings.billing_launch_at.astimezone(UTC)
+        )
+    return int(await session.scalar(statement) or 0)
 
 
 async def quota_exceeded(
-    session: AsyncSession, settings: Settings, call: CallRecord, now: datetime
+    session: AsyncSession, settings: Settings, call: CallRecord, now: datetime,
+    client: RevenueCatClient | None = None,
 ) -> bool:
     """결제가 켜져 있고 그 통화 가족의 이번 달 사용량이 한도 이상이면 True.
 
@@ -141,8 +201,13 @@ async def quota_exceeded(
     if await session.get(AnalysisUsage, call.id) is not None:
         return False
     people = await people_of(session, call.parent_id) | await people_of(session, call.child_id)
+    used = await used_seconds(session, settings, people, kst_month(now), now)
     plan = await family_plan(session, settings, people, now)
-    return await used_seconds(session, people, kst_month(now)) >= analysis_limit(settings, plan)
+    if used < analysis_limit(settings, plan):
+        return False
+    if await refresh_lapsed(session, settings, client, people, now):
+        plan = await family_plan(session, settings, people, now)
+    return used >= analysis_limit(settings, plan)
 
 
 async def record_usage(
@@ -166,29 +231,47 @@ async def record_usage(
     await session.commit()
 
 
+async def release_usage(session: AsyncSession, call_id: str) -> None:
+    """STT 를 끝내 마치지 못하고 ANALYSIS_FAILED 로 끝난 통화의 원장 줄을 지운다(커밋은 부른 쪽).
+
+    전사가 저장됐으면 STT 는 끝난 것이라 그대로 둔다. 재시도를 기다리는 통화에는 부르지 않는다.
+    """
+    await session.execute(
+        delete(AnalysisUsage).where(
+            AnalysisUsage.call_id == call_id,
+            ~select(Transcript.id).where(Transcript.call_id == call_id).exists(),
+        )
+    )
+
+
 async def entitlement_view(
-    session: AsyncSession, settings: Settings, user: User, now: datetime
+    session: AsyncSession, settings: Settings, user: User, now: datetime,
+    client: RevenueCatClient | None = None,
 ) -> dict[str, Any]:
     people = await people_of(session, user.id)
+    await refresh_lapsed(session, settings, client, people, now)
     plan = await family_plan(session, settings, people, now)
     month = kst_month(now)
     paid_by_me = user.id in plan.payers
+    # 내가 결제했으면 내 구독, 아니면 가족에서 가장 늦게 끝나는 구독을 보인다.
+    shown = user.id if paid_by_me else plan.latest_payer
+    paid_until, will_renew = plan.payers[shown] if shown else (None, None)
     payer_name = None
-    if plan.payers and not paid_by_me:
-        payer = await session.get(User, max(plan.payers, key=plan.payers.__getitem__))
+    if shown and not paid_by_me:
+        payer = await session.get(User, shown)
         payer_name = payer.display_name if payer is not None else None
     return {
         "billingEnabled": plan.billing_enabled,
         "plan": "PREMIUM" if plan.premium else "FREE",
         "source": plan.source,
         "trialEndsAt": plan.trial_ends_at,
-        "paidUntil": plan.paid_until,
+        "paidUntil": paid_until,
         "paidByMe": paid_by_me,
-        "willRenew": plan.will_renew,
+        "willRenew": will_renew,
         "payerName": payer_name,
         "analysis": {
             "month": month,
-            "usedSec": await used_seconds(session, people, month),
+            "usedSec": await used_seconds(session, settings, people, month, now),
             "limitSec": analysis_limit(settings, plan),
             "resetsAt": month_resets_at(now),
         },
@@ -198,16 +281,22 @@ async def entitlement_view(
 async def save_entitlement(
     session: AsyncSession, user_id: str, state: EntitlementState, now: datetime
 ) -> None:
-    row = await session.get(UserEntitlement, user_id)
-    if row is None:
-        row = UserEntitlement(user_id=user_id)
-        session.add(row)
-    row.active_until = state.active_until
-    row.store = state.store
-    row.product_id = state.product_id
-    row.environment = state.environment
-    row.will_renew = state.will_renew
-    row.updated_at = now
+    """한 사람의 구독을 덮어쓴다. refresh 와 웹훅이 동시에 와도 겹치지 않게 upsert 한다."""
+    values = {
+        "active_until": state.active_until,
+        "store": state.store,
+        "product_id": state.product_id,
+        "environment": state.environment,
+        "will_renew": state.will_renew,
+        "updated_at": now,
+    }
+    dialect = (await session.connection()).dialect.name
+    insert = postgresql.insert if dialect == "postgresql" else sqlite.insert
+    await session.execute(
+        insert(UserEntitlement)
+        .values(user_id=user_id, **values)
+        .on_conflict_do_update(index_elements=["user_id"], set_=values)
+    )
 
 
 async def refresh_entitlement(
@@ -221,6 +310,27 @@ async def refresh_entitlement(
         settings.revenuecat_entitlement_id,
         allow_sandbox=settings.revenuecat_allow_sandbox,
     )
+    await save_entitlement(session, user_id, state, now)
+
+
+async def save_event_entitlement(
+    session: AsyncSession, user_id: str, state: EntitlementState, event_type: object,
+    now: datetime,
+) -> None:
+    """비밀 키 없이 이벤트 본문만으로 저장한다.
+
+    재시도·순서 뒤바뀜으로 옛 이벤트가 늦게 와도 접근이 줄지 않게, EXPIRATION 이 아니면 만료
+    시각을 앞으로만 옮긴다.
+    """
+    if event_type != "EXPIRATION" and state.active_until is not None:
+        stored = await session.scalar(
+            select(UserEntitlement.active_until).where(UserEntitlement.user_id == user_id)
+        )
+        if stored is not None and aware(stored) > state.active_until:
+            state = EntitlementState(
+                active_until=aware(stored), store=state.store, product_id=state.product_id,
+                environment=state.environment, will_renew=state.will_renew,
+            )
     await save_entitlement(session, user_id, state, now)
 
 
@@ -252,7 +362,7 @@ async def apply_revenuecat_event(
             state = entitlement_from_event(event, settings.revenuecat_entitlement_id)
             if state is not None:
                 for user_id in users:
-                    await save_entitlement(session, user_id, state, now)
+                    await save_event_entitlement(session, user_id, state, event.get("type"), now)
             elif users:
                 logger.info(
                     "RevenueCat %s 이벤트는 비밀 키 없이 반영할 내용이 없습니다", event.get("type")

@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
+import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select, update
 
@@ -23,6 +24,7 @@ from app.models import (
 from app.services import billing
 from app.services.revenuecat import (
     LIFETIME,
+    EntitlementState,
     RevenueCatClient,
     entitlement_from_subscriber,
     related_user_ids,
@@ -72,7 +74,7 @@ def end_trial(client: TestClient, *user_ids: str) -> None:
 
 def add_usage(
     client: TestClient, seconds: int, parent_id: str | None, child_id: str | None,
-    month: str | None = None, call_id: str | None = None,
+    month: str | None = None, call_id: str | None = None, created_at: datetime | None = None,
 ) -> str:
     call_id = call_id or f"old-call-{seconds}-{parent_id}"
 
@@ -80,6 +82,7 @@ def add_usage(
         session.add(AnalysisUsage(
             call_id=call_id, parent_id=parent_id, child_id=child_id,
             month=month or billing.kst_month(datetime.now(UTC)), seconds=seconds,
+            created_at=created_at or datetime.now(UTC),
         ))
 
     run_db(client, work)
@@ -641,7 +644,7 @@ def test_webhook_transfer_refreshes_only_our_users_through_rest(client: TestClie
     assert entitlement(client, child_token)["payerName"] == "김순자"
 
 
-def test_will_renew_follows_the_latest_family_subscription(client: TestClient) -> None:
+def test_will_renew_and_paid_until_follow_the_shown_subscription(client: TestClient) -> None:
     child_token, child, parent_token, parent = onboard_family(client)
     end_trial(client, child["id"], parent["id"])
     settings_of(client).revenuecat_webhook_auth = WEBHOOK_AUTH
@@ -660,9 +663,13 @@ def test_will_renew_follows_the_latest_family_subscription(client: TestClient) -
     cancelled["subscriptions"]["collog_premium"]["unsubscribe_detected_at"] = "2026-11-20T00:00:00Z"
     client.app.state.container.revenuecat.subscribers[parent["id"]] = cancelled
     refreshed = client.post("/v1/account/entitlement/refresh", headers=auth(parent_token)).json()
-    # 가족에서 가장 늦게 끝나는 구독(부모, 40일)의 값을 쓴다.
     assert (refreshed["paidByMe"], refreshed["willRenew"]) == (True, False)
-    assert entitlement(client, child_token)["willRenew"] is False
+    # 내가 결제했으면 가족의 가장 늦은 구독(부모 40일)이 아니라 내 구독(30일·갱신)을 보인다.
+    mine = entitlement(client, child_token)
+    assert (mine["paidByMe"], mine["willRenew"], mine["payerName"]) == (True, True, None)
+    assert datetime.fromisoformat(mine["paidUntil"]) < datetime.fromisoformat(
+        refreshed["paidUntil"]
+    )
 
 
 def test_related_user_ids_reads_every_identity_field() -> None:
@@ -706,7 +713,8 @@ def test_refresh_reads_revenuecat_and_saves(client: TestClient) -> None:
 
 
 def test_refresh_reports_upstream_failure(client: TestClient) -> None:
-    child_token, _, _, _ = onboard_family(client)
+    child_token, child, _, _ = onboard_family(client)
+    end_trial(client, child["id"])
     settings_of(client).revenuecat_secret_key = "sk_test_key"
     container = client.app.state.container
     container.revenuecat = RevenueCatClient(
@@ -795,3 +803,214 @@ def test_account_deletion_cleans_billing_rows_but_keeps_family_usage(client: Tes
         return set(await session.scalars(select(RevenueCatEvent.id)))
 
     assert run_db(client, events) == {"evt-keep"}
+
+
+# --- 검토 반영 ----------------------------------------------------------------------------
+
+
+def lapse(client: TestClient, user_id: str, *, will_renew: bool | None = True,
+          checked: timedelta = timedelta(hours=1)) -> None:
+    """하루 전에 만료된 구독. 마지막으로 읽은 지 checked 만큼 지났다."""
+    now = datetime.now(UTC)
+
+    async def work(session):
+        session.add(UserEntitlement(
+            user_id=user_id, active_until=now - timedelta(days=1), will_renew=will_renew,
+            store="PLAY_STORE", updated_at=now - checked,
+        ))
+
+    run_db(client, work)
+
+
+def test_lapsed_renewing_subscription_is_read_again_before_locking(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    lapse(client, child["id"])
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    revenuecat.subscribers[child["id"]] = premium_subscriber()  # 갱신 웹훅을 놓쳤다
+
+    # 리포트 잠금 판정 전에 그 사람만 다시 읽어 잠그지 않는다.
+    assert report(client, parent_token, parent["id"]).status_code == 200
+    assert revenuecat.requested == [child["id"]]
+    assert entitlement(client, parent_token)["source"] == "PAID"
+    assert revenuecat.requested == [child["id"]]  # 이제 유효하니 다시 부르지 않는다
+
+
+def test_lapsed_check_runs_once_per_ten_minutes_and_skips_cancelled(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    lapse(client, child["id"])
+    lapse(client, parent["id"], will_renew=False)
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+
+    for _ in range(2):
+        assert entitlement(client, child_token)["plan"] == "FREE"
+    # 해지해 둔 부모 구독은 읽지 않고, 아이 구독은 10분 안에 한 번만 읽는다.
+    assert revenuecat.requested == [child["id"]]
+
+
+def test_lapsed_check_failure_falls_back_to_stored_values(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    lapse(client, child["id"])
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    container = client.app.state.container
+    container.revenuecat = RevenueCatClient(
+        container.settings,
+        transport=httpx.MockTransport(lambda request: httpx.Response(401, json={})),
+    )
+    assert entitlement(client, child_token)["plan"] == "FREE"
+    assert report(client, parent_token, parent["id"]).status_code == 402
+    # 실패해도 10분 뒤에 다시 보도록 시각은 남긴다.
+    row = stored_entitlement(client, child["id"])
+    assert datetime.now(UTC) - billing.aware(row.updated_at) < timedelta(minutes=1)
+
+
+def test_lapsed_check_is_off_without_secret_key_or_billing(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    lapse(client, child["id"])
+    revenuecat = client.app.state.container.revenuecat
+    revenuecat.subscribers[child["id"]] = premium_subscriber()
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    entitlement(client, child_token)  # 결제 꺼짐
+    end_trial(client, child["id"], parent["id"])
+    settings_of(client).revenuecat_secret_key = ""
+    assert entitlement(client, child_token)["plan"] == "FREE"  # 비밀 키 없음
+    assert revenuecat.requested == []
+
+
+def test_quota_check_reads_a_lapsed_subscription_before_excluding(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    add_usage(client, 2400, parent["id"], child["id"])
+    lapse(client, child["id"])
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    revenuecat.subscribers[child["id"]] = premium_subscriber()
+
+    call_id = run_call(client, child_token, parent_token, parent)
+    assert call_view(client, child_token, call_id)["state"] == "ANALYZED"
+    assert revenuecat.requested == [child["id"]]
+
+
+def test_saving_an_entitlement_is_an_upsert(client: TestClient) -> None:
+    """refresh 와 첫 구매 웹훅이 겹쳐도 PK 위반이 없게 INSERT … ON CONFLICT DO UPDATE 로 쓴다."""
+    _, child, _, _ = onboard_family(client)
+    grant_paid(client, child["id"], datetime.now(UTC) + timedelta(days=1))
+    engine = client.app.state.container.database.engine.sync_engine
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(statement)
+
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        until = datetime.now(UTC).replace(microsecond=0) + timedelta(days=9)
+
+        async def save(session):
+            state = EntitlementState(active_until=until, store="APP_STORE", will_renew=False)
+            await billing.save_entitlement(session, child["id"], state, datetime.now(UTC))
+
+        run_db(client, save)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+    assert any("ON CONFLICT (user_id) DO UPDATE" in item for item in statements)
+    row = stored_entitlement(client, child["id"])
+    assert (billing.aware(row.active_until), row.store, row.will_renew) == (
+        until, "APP_STORE", False,
+    )
+
+
+def test_refresh_skips_revenuecat_when_billing_is_off_or_called_again_soon(
+    client: TestClient,
+) -> None:
+    child_token, child, _, _ = onboard_family(client)
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    revenuecat.subscribers[child["id"]] = premium_subscriber()
+
+    off = client.post("/v1/account/entitlement/refresh", headers=auth(child_token))
+    assert (off.status_code, revenuecat.requested) == (200, [])
+
+    end_trial(client, child["id"])
+    for _ in range(2):
+        response = client.post("/v1/account/entitlement/refresh", headers=auth(child_token))
+        assert response.json()["source"] == "PAID"
+    assert revenuecat.requested == [child["id"]]
+
+
+def test_webhook_authorization_ignores_surrounding_whitespace(client: TestClient) -> None:
+    child_token, child, _, _ = onboard_family(client)
+    settings_of(client).revenuecat_webhook_auth = f"  {WEBHOOK_AUTH}\n"
+    response = post_event(client, purchase_event(child["id"], "evt-ws"))
+    assert response.status_code == 200, response.text
+
+
+def test_event_mode_only_moves_expiry_forward_and_honours_grace(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    settings_of(client).revenuecat_webhook_auth = WEBHOOK_AUTH
+
+    post_event(client, purchase_event(child["id"], "evt-f1", expires_in=timedelta(days=30)))
+    first = datetime.fromisoformat(entitlement(client, child_token)["paidUntil"])
+    # 늦게 도착한 옛 갱신 이벤트(만료 10일)는 만료를 당기지 않는다.
+    post_event(client, purchase_event(
+        child["id"], "evt-f2", "RENEWAL", expires_in=timedelta(days=10)
+    ))
+    assert datetime.fromisoformat(entitlement(client, child_token)["paidUntil"]) == first
+    # 만료(EXPIRATION)만 접근을 끊는다.
+    post_event(client, purchase_event(
+        child["id"], "evt-f3", "EXPIRATION", expires_in=-timedelta(minutes=1)
+    ))
+    assert entitlement(client, child_token)["plan"] == "FREE"
+
+    # 결제 문제(BILLING_ISSUE)는 유예 끝까지 유지한다.
+    grace = datetime.now(UTC).replace(microsecond=0) + timedelta(days=3)
+    post_event(client, purchase_event(
+        parent["id"], "evt-f4", "BILLING_ISSUE", expires_in=-timedelta(hours=1),
+        grace_period_expiration_at_ms=int(grace.timestamp() * 1000),
+    ))
+    body = entitlement(client, parent_token)
+    assert (body["source"], datetime.fromisoformat(body["paidUntil"])) == ("PAID", grace)
+
+
+def test_usage_before_launch_is_not_counted(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])  # 20일 전에 켜짐
+    before = datetime.now(UTC) - timedelta(days=25)
+    add_usage(client, 2400, parent["id"], child["id"], call_id="before-launch", created_at=before)
+    add_usage(client, 100, parent["id"], child["id"], call_id="after-launch")
+
+    assert entitlement(client, child_token)["analysis"]["usedSec"] == 100
+    call_id = run_call(client, child_token, parent_token, parent)
+    assert call_view(client, child_token, call_id)["state"] == "ANALYZED"
+
+    settings_of(client).billing_launch_at = None  # 꺼지면 실제 사용량 전부
+    assert entitlement(client, child_token)["analysis"]["usedSec"] >= 2500
+
+
+def test_failed_stt_releases_the_usage_but_later_failures_keep_it(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    container = client.app.state.container
+    original_stt = container.stt.transcribe
+
+    async def broken_stt(*args, **kwargs):
+        raise ValueError("not retried")
+
+    container.stt.transcribe = broken_stt
+    failed = run_call(client, child_token, parent_token, parent, talk_seconds=60)
+    assert call_view(client, child_token, failed)["state"] == "ANALYSIS_FAILED"
+    assert usage_rows(client, failed) == []
+
+    # STT 가 끝나 전사가 남은 뒤에 실패하면 분량은 쓴 것으로 둔다.
+    container.stt.transcribe = original_stt
+
+    async def broken_acoustics(*args, **kwargs):
+        raise ValueError("not retried")
+
+    container.acoustics.analyze = broken_acoustics
+    late = run_call(client, child_token, parent_token, parent, talk_seconds=60)
+    assert call_view(client, child_token, late)["state"] == "ANALYSIS_FAILED"
+    assert len(usage_rows(client, late)) == 1

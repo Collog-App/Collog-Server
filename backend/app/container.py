@@ -57,3 +57,4 @@ class AppContainer:
         )
         # 분석이 끝나면 주기 작업을 기다리지 않고 바로 리포트 알림을 보낸다.
         self.pipeline.after_analyzed = self.report_notifications.notify
+        self.pipeline.revenuecat = self.revenuecat

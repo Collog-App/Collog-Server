@@ -32,6 +32,7 @@ from app.services.domain import participants_consented
 from app.services.gemini import ExtractionGateway
 from app.services.guardrail import safety_notice
 from app.services.repeat_detector import detect_repeat_events
+from app.services.revenuecat import RevenueCatClient
 from app.services.signals import SignalService
 from app.services.storage import StorageGateway
 
@@ -98,6 +99,8 @@ class ProcessingPipeline:
         self.signals = signals
         # 분석이 끝난 통화를 바로 알릴 때 부른다(없으면 주기 작업이 다음 차례에 알린다).
         self.after_analyzed: Callable[[str], Awaitable[None]] | None = None
+        # 분량 검사 직전 만료가 막 지난 구독을 다시 읽을 때 쓴다(container 가 넣는다).
+        self.revenuecat: RevenueCatClient | None = None
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def process(self, call_id: str) -> None:
@@ -134,6 +137,8 @@ class ProcessingPipeline:
                             if retry else None
                         )
                         call.processing_claimed_at = None
+                        if not retry:
+                            await billing.release_usage(session, call_id)
                         await session.commit()
                         if not retry:
                             await self.purge_call_audio(call_id)
@@ -197,7 +202,9 @@ class ProcessingPipeline:
             # 무료 분량을 다 쓴 가족의 통화는 STT·Gemini 를 부르지 않고 동의 실패와 같게 정리한다.
             # processing_allowed 에 넣지 않는 것은 분석 도중 여러 번 다시 불리기 때문이다(시작한
             # 통화가 그 사이 다른 통화 때문에 잘리면 안 된다).
-            if await billing.quota_exceeded(session, self.settings, call, datetime.now(UTC)):
+            if await billing.quota_exceeded(
+                session, self.settings, call, datetime.now(UTC), self.revenuecat
+            ):
                 call.state = CallState.ANALYSIS_EXCLUDED.value
                 call.recording_enabled = False
                 call.recording_disabled_reason = billing.QUOTA_EXCEEDED_REASON
@@ -215,6 +222,7 @@ class ProcessingPipeline:
                 call.state = CallState.ANALYSIS_FAILED.value
                 call.processing_error = "Analysis retry limit or audio retention limit reached"
                 call.processing_retry_at = None
+                await billing.release_usage(session, call_id)
                 await session.commit()
                 await self.purge_call_audio(call_id)
                 return
@@ -638,7 +646,7 @@ class ProcessingPipeline:
             await self.purge_call_audio(call_id)
         for call_id in call_ids:
             async with self.database.sessions() as session:
-                await session.execute(
+                failed = await session.execute(
                     update(CallRecord)
                     .where(
                         CallRecord.id == call_id,
@@ -651,6 +659,8 @@ class ProcessingPipeline:
                         processing_retry_at=None,
                     )
                 )
+                if failed.rowcount:
+                    await billing.release_usage(session, call_id)
                 await session.commit()
             await self.purge_call_audio(call_id)
         return len(call_ids)

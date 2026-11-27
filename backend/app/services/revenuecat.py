@@ -43,24 +43,28 @@ class RevenueCatClient:
     ) -> None:
         self.settings = settings
         self._transport = transport
+        # 사용자별 마지막 새로 읽기 요청 시각(time.monotonic). 서버 한 대라 프로세스 메모리면 된다.
+        self.refreshed_at: dict[str, float] = {}
 
     @property
     def configured(self) -> bool:
         return bool(self.settings.revenuecat_secret_key.strip())
 
+    async def _request(self, method: str, app_user_id: str) -> httpx.Response:
+        async with httpx.AsyncClient(timeout=5, transport=self._transport) as client:
+            return await request_with_retry(
+                client,
+                method,
+                f"{API_BASE_URL}/v1/subscribers/{quote(app_user_id, safe='')}",
+                headers={
+                    "Authorization": f"Bearer {self.settings.revenuecat_secret_key.strip()}"
+                },
+            )
+
     async def subscriber(self, app_user_id: str) -> dict[str, Any]:
         """`subscriber` 객체를 돌려준다. 우리 users.id 만 넘긴다."""
         try:
-            async with httpx.AsyncClient(timeout=5, transport=self._transport) as client:
-                response = await request_with_retry(
-                    client,
-                    "GET",
-                    f"{API_BASE_URL}/v1/subscribers/{quote(app_user_id, safe='')}",
-                    headers={
-                        "Authorization": f"Bearer {self.settings.revenuecat_secret_key.strip()}"
-                    },
-                )
-                payload = response.json()
+            payload = (await self._request("GET", app_user_id)).json()
         except (httpx.HTTPError, ValueError) as exc:
             raise RevenueCatError(f"RevenueCat 구독 조회 실패: {exc}") from exc
         subscriber = payload.get("subscriber") if isinstance(payload, dict) else None
@@ -70,7 +74,7 @@ class RevenueCatClient:
 
 
 class MockRevenueCatClient(RevenueCatClient):
-    """시험용. `subscribers` 에 넣어 둔 값을 돌려주고, 부른 ID 를 `requested` 에 남긴다."""
+    """시험용. `subscribers` 에 넣어 둔 값을 돌려주고 부른 ID 를 `requested` 에 남긴다."""
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
@@ -158,24 +162,36 @@ def entitlement_from_subscriber(
     )
 
 
+def from_ms(value: object) -> datetime | None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def entitlement_from_event(event: dict[str, Any], entitlement_id: str) -> EntitlementState | None:
-    """비밀 키가 없을 때 웹훅 본문만으로 읽는다. 그 권한 이야기가 아니면 None."""
+    """비밀 키가 없을 때 웹훅 본문만으로 읽는다. 그 권한 이야기가 아니면 None.
+
+    결제 유예(grace_period_expiration_at_ms)가 만료보다 늦으면 유예 끝까지 유효로 본다.
+    """
     entitlement_ids = event.get("entitlement_ids")
     if not isinstance(entitlement_ids, list) or entitlement_id not in entitlement_ids:
         return None
     if "expiration_at_ms" not in event:
         return None
-    expiration = event["expiration_at_ms"]
-    if expiration is None:
-        active_until = LIFETIME
-    elif isinstance(expiration, int | float) and not isinstance(expiration, bool):
-        try:
-            active_until = datetime.fromtimestamp(expiration / 1000, UTC)
-        except (OverflowError, OSError, ValueError):
-            return None
-    else:
-        return None
     event_type = event.get("type")
+    if event["expiration_at_ms"] is None:
+        active_until = LIFETIME
+    else:
+        expiration = from_ms(event["expiration_at_ms"])
+        if expiration is None:
+            return None
+        grace = from_ms(event.get("grace_period_expiration_at_ms"))
+        active_until = (
+            max(expiration, grace) if grace and event_type != "EXPIRATION" else expiration
+        )
     return EntitlementState(
         active_until=active_until,
         store=text(event.get("store"), 32),
