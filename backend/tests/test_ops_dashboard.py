@@ -342,6 +342,48 @@ def test_operator_sets_a_cohort_that_the_app_never_sees(ops_client: TestClient) 
     assert missing.status_code == 404
 
 
+
+def test_operator_turns_on_billing_preview_without_changing_metrics(
+    ops_client: TestClient,
+) -> None:
+    child_token, child, _, parent = onboard_family(ops_client)
+    headers = {"X-Ops-Code": CODE}
+    path = f"/ops/api/accounts/{child['id']}/billing-preview"
+    before = ops_client.get("/ops/api/summary", headers=headers).json()
+
+    assert ops_client.put(path, json={"billingPreview": True}).status_code == 401
+    assert ops_client.put(
+        path, headers={"X-Ops-Code": "wrong"}, json={"billingPreview": True}
+    ).status_code == 401
+    assert ops_client.get("/v1/account/entitlement", headers=auth(child_token)).json()[
+        "billingEnabled"
+    ] is False
+
+    saved = ops_client.put(path, headers=headers, json={"billingPreview": True})
+    assert saved.status_code == 200
+    assert saved.json() == {"id": child["id"], "billingPreview": True}
+    accounts = {a["id"]: a for a in ops_client.get("/ops/api/accounts", headers=headers).json()[
+        "accounts"
+    ]}
+    assert accounts[child["id"]]["billingPreview"] is True
+    assert accounts[child["id"]]["internal"] is False
+    assert accounts[parent["id"]]["billingPreview"] is False
+    assert ops_client.get("/v1/account/entitlement", headers=auth(child_token)).json()[
+        "billingEnabled"
+    ] is True
+
+    after = ops_client.get("/ops/api/summary", headers=headers).json()
+    for key in ("headline", "scope", "cohorts"):
+        assert after[key] == before[key]
+
+    cleared = ops_client.put(path, headers=headers, json={"billingPreview": False})
+    assert cleared.json() == {"id": child["id"], "billingPreview": False}
+    assert ops_client.put(path, headers=headers, json={}).status_code == 422
+    missing = ops_client.put(
+        "/ops/api/accounts/nobody/billing-preview", headers=headers, json={"billingPreview": True}
+    )
+    assert missing.status_code == 404
+
 def test_summary_counts_push_results_of_new_calls(ops_client: TestClient) -> None:
     child_token, _, _, parent = onboard_family(ops_client)
     created = ops_client.post(

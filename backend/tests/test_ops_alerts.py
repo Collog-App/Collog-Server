@@ -45,8 +45,10 @@ def test_monitor_code_opens_only_alerts(tmp_path: Path) -> None:
                        json={"internal": True}),
             client.put(f"/ops/api/accounts/{child['id']}/cohort", headers=monitor,
                        json={"cohort": "AWARE"}),
+            client.put(f"/ops/api/accounts/{child['id']}/billing-preview", headers=monitor,
+                       json={"billingPreview": True}),
         ]
-        assert [response.status_code for response in blocked] == [403] * 4
+        assert [response.status_code for response in blocked] == [403] * 5
         assert all(child["id"] not in response.text for response in blocked)
 
         for headers in (monitor, operator):

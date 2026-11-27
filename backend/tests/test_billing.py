@@ -18,6 +18,7 @@ from app.models import (
     AudioAsset,
     CallRecord,
     FamilyShare,
+    OpsAccountFlag,
     RevenueCatEvent,
     User,
     UserEntitlement,
@@ -31,7 +32,7 @@ from app.services.revenuecat import (
     entitlement_from_subscriber,
     related_user_ids,
 )
-from tests.conftest import auth
+from tests.conftest import auth, create_user
 from tests.test_api_flow import onboard_family, tone_wav
 
 KST = ZoneInfo("Asia/Seoul")
@@ -1073,3 +1074,99 @@ async def test_rest_client_deletes_the_customer_and_treats_404_as_done() -> None
         ("DELETE", "https://api.revenuecat.com/v1/subscribers/u-1")
     }
     assert all(request.headers["Authorization"] == "Bearer sk_live_value" for request in seen)
+
+
+# --- 결제 미리 켜기(계정별) ----------------------------------------------------------------
+
+
+def preview(client: TestClient, user_id: str, on: bool = True) -> None:
+    async def work(session):
+        flag = await session.get(OpsAccountFlag, user_id)
+        if flag is None:
+            flag = OpsAccountFlag(user_id=user_id, internal=False)
+            session.add(flag)
+        flag.billing_preview = on
+
+    run_db(client, work)
+
+
+def test_preview_turns_billing_on_only_for_that_family(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    other_token, other = create_user(client, "01090000001", "CHILD", "다른집")
+    joined = datetime.now(UTC).replace(microsecond=0) - timedelta(days=30)
+    set_joined(client, [child["id"], parent["id"], other["id"]], joined)
+    preview(client, parent["id"])  # 가족 중 한 명만 표시해도 가족 전체
+
+    for token in (child_token, parent_token):
+        body = entitlement(client, token)
+        assert (body["billingEnabled"], body["plan"], body["source"]) == (True, "FREE", None)
+        # 켜진 날 = 가족에서 가장 먼저 가입한 날 → 오래된 계정은 바로 무료
+        assert datetime.fromisoformat(body["trialEndsAt"]) == joined + timedelta(days=14)
+        assert body["analysis"]["limitSec"] == 2400
+    assert report(client, child_token, parent["id"]).status_code == 402
+
+    theirs = entitlement(client, other_token)
+    assert (theirs["billingEnabled"], theirs["plan"], theirs["source"]) == (False, "PREMIUM", None)
+    assert theirs["analysis"]["limitSec"] == 15000
+
+    # 분량 제한도 미리 켜기 가족에만 걸린다.
+    add_usage(client, 2400, parent["id"], child["id"])
+    call_id = run_call(client, child_token, parent_token, parent)
+    assert call_view(client, child_token, call_id)["recordingDisabledReason"] == (
+        "ANALYSIS_QUOTA_EXCEEDED"
+    )
+
+    # refresh 의 REST 호출도 미리 켜기 가족에만 간다.
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    revenuecat.subscribers[child["id"]] = premium_subscriber()
+    for token in (child_token, other_token):
+        refreshed = client.post("/v1/account/entitlement/refresh", headers=auth(token))
+        assert refreshed.status_code == 200
+    assert revenuecat.requested == [child["id"]]
+    assert entitlement(client, parent_token)["source"] == "PAID"
+
+    preview(client, parent["id"], on=False)
+    assert entitlement(client, child_token)["billingEnabled"] is False
+
+
+def test_new_preview_family_starts_its_trial_at_signup(client: TestClient) -> None:
+    child_token, child, _, parent = onboard_family(client)
+    preview(client, child["id"])
+    body = entitlement(client, child_token)
+    assert (body["billingEnabled"], body["source"]) == (True, "TRIAL")
+    trial_end = datetime.fromisoformat(body["trialEndsAt"])
+    assert abs(trial_end - (datetime.now(UTC) + timedelta(days=14))) < timedelta(minutes=1)
+    assert report(client, child_token, parent["id"]).status_code == 200
+
+
+def test_preview_keeps_its_own_start_when_billing_is_on_for_everyone(
+    client: TestClient,
+) -> None:
+    child_token, child, _, parent = onboard_family(client)
+    other_token, other = create_user(client, "01090000002", "CHILD", "다른집")
+    launch = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
+    enable_billing(client, launch)
+    joined = datetime.now(UTC).replace(microsecond=0) - timedelta(days=100)
+    set_joined(client, [child["id"], parent["id"], other["id"]], joined)
+    preview(client, child["id"])
+
+    # 미리 켜기 가족: 가입+14일(이미 지남) → 무료라 심사원이 결제 화면을 볼 수 있다.
+    mine = entitlement(client, child_token)
+    assert (mine["billingEnabled"], mine["plan"]) == (True, "FREE")
+    assert datetime.fromisoformat(mine["trialEndsAt"]) == joined + timedelta(days=14)
+    # 다른 가족: 전체 켜짐 규칙 그대로(켜진 날+14일 체험).
+    theirs = entitlement(client, other_token)
+    assert (theirs["billingEnabled"], theirs["source"]) == (True, "TRIAL")
+    assert datetime.fromisoformat(theirs["trialEndsAt"]) == launch + timedelta(days=14)
+
+
+def test_deleting_a_preview_account_also_deletes_the_revenuecat_customer(
+    client: TestClient,
+) -> None:
+    child_token, child, _, _ = onboard_family(client)
+    preview(client, child["id"])
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    assert client.delete("/v1/account", headers=auth(child_token)).status_code == 204
+    assert revenuecat.deleted == [child["id"]]

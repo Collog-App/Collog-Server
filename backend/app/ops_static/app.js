@@ -762,6 +762,26 @@ function renderAccounts() {
               }
             },
           });
+          const preview = el("input", {
+            type: "checkbox",
+            checked: a.billingPreview,
+            "aria-label": "결제 미리 켜기",
+            onchange: async () => {
+              preview.disabled = true;
+              try {
+                await api(`/ops/api/accounts/${encodeURIComponent(a.id)}/billing-preview`, {
+                  method: "PUT",
+                  body: JSON.stringify({ billingPreview: preview.checked }),
+                });
+                a.billingPreview = preview.checked;
+              } catch (error) {
+                preview.checked = a.billingPreview;
+                showStatus(`바꾸지 못했습니다 (${error.message})`);
+              } finally {
+                preview.disabled = false;
+              }
+            },
+          });
           const group = el(
             "select",
             {
@@ -801,6 +821,7 @@ function renderAccounts() {
             el("td", {}, fmt(a.connectedCalls)),
             el("td", {}, group),
             el("td", {}, box),
+            el("td", {}, preview),
           );
         }),
     );
@@ -813,7 +834,7 @@ function renderAccounts() {
     el(
       "p",
       { class: "muted" },
-      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다. 그룹(인지·비인지)은 「그룹」 탭 표에만 쓰이고 앱에는 보이지 않습니다.",
+      "팀원·시험·심사 계정에 표시하면 모든 지표에서 빠집니다(위 「팀·시험 계정도 포함」을 켜면 다시 셈). 닉네임이 있으면 「닉네임 (가입 이름)」으로 보입니다. 그룹(인지·비인지)은 「그룹」 탭 표에만 쓰이고 앱에는 보이지 않습니다. 결제 미리 켜기를 켠 계정의 가족은 전체 결제를 켜기 전에도 결제·잠금·분량 제한이 켜지고, 체험은 가족에서 가장 먼저 가입한 날부터 2주입니다(심사·결제 시험용, 지표에는 영향 없음).",
     ),
     filter,
     el(
@@ -828,7 +849,7 @@ function renderAccounts() {
           el(
             "tr",
             {},
-            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "그룹", "팀·시험"].map((h, i) =>
+            ["이름·닉네임", "역할", "기기", "로그인", "가입일", "마지막 사용", "받은 통화", "그룹", "팀·시험", "결제 미리 켜기"].map((h, i) =>
               el("th", { class: i < 4 ? "left" : null }, h),
             ),
           ),

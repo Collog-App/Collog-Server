@@ -1,5 +1,5 @@
 """구독 결제: 분석 분량 원장(analysis_usage), RevenueCat 구독(user_entitlements),
-처리한 웹훅(revenuecat_events).
+처리한 웹훅(revenuecat_events), 계정별 결제 미리 켜기(ops_account_flags.billing_preview).
 
 0023 은 다른 브랜치가 예약해 두었다. 그 브랜치가 먼저 들어가면 down_revision 을 0023 으로 바꾼다.
 """
@@ -44,6 +44,10 @@ def upgrade() -> None:
         sa.Column("received_at", sa.DateTime(timezone=True), nullable=False),
     )
     op.create_index("ix_revenuecat_events_app_user_id", "revenuecat_events", ["app_user_id"])
+    op.add_column(
+        "ops_account_flags",
+        sa.Column("billing_preview", sa.Boolean(), server_default=sa.false(), nullable=False),
+    )
 
 
 def downgrade() -> None:

@@ -555,6 +555,11 @@ class OpsAccountFlag(Base):
     internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     # 테스트 그룹(OpsCohort). 비어 있으면 미정. 운영 화면에서만 쓰고 앱에는 보이지 않는다.
     cohort: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 결제 미리 켜기. 전체 결제(BILLING_LAUNCH_AT)를 켜기 전에 이 계정의 가족만 결제가 켜진 것으로
+    # 본다(App Store 심사·팀 시험). 지표 계산에는 쓰지 않는다.
+    billing_preview: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false()
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

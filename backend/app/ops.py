@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -217,6 +217,8 @@ class Dataset:
         self.profiles: list[Any] = []
         self.signals: list[Any] = []
         self.cohorts: dict[str, str] = {}
+        # 결제 미리 켜기 계정(계정 탭 표시용, 지표 계산에는 쓰지 않는다)
+        self.billing_preview: set[str] = set()
         # 이용 기록(load_events): 그룹 표·「안 울림」이 쓰는 줄, 집계된 건수
         self.events: list[Any] = []
         self.first_event: dict[str, datetime] = {}
@@ -264,6 +266,11 @@ async def load_dataset(session: AsyncSession, settings: Settings) -> Dataset:
     data.internal = set(
         await session.scalars(
             select(OpsAccountFlag.user_id).where(OpsAccountFlag.internal.is_(True))
+        )
+    )
+    data.billing_preview = set(
+        await session.scalars(
+            select(OpsAccountFlag.user_id).where(OpsAccountFlag.billing_preview.is_(True))
         )
     )
     data.cohorts = {
@@ -827,6 +834,7 @@ def build_accounts(data: Dataset) -> list[dict[str, Any]]:
             "connectedCalls": calls[row.id],
             "internal": row.id in data.internal,
             "cohort": data.cohorts.get(row.id),
+            "billingPreview": row.id in data.billing_preview,
         }
         for row in rows
     ]
@@ -1278,6 +1286,30 @@ async def ops_set_cohort(
     await session.commit()
     logger.info("ops account %s cohort=%s by %s", user_id, cohort, operator)
     return {"id": user_id, "cohort": cohort}
+
+
+class BillingPreviewFlag(BaseModel):
+    billing_preview: bool = Field(alias="billingPreview")
+
+
+@router.put("/ops/api/accounts/{user_id}/billing-preview")
+async def ops_set_billing_preview(
+    user_id: str, payload: BillingPreviewFlag, operator: OperatorDep, session: SessionDep
+) -> dict[str, Any]:
+    """그 계정의 가족만 전체 결제보다 먼저 결제가 켜진 것으로 본다(심사·팀 시험)."""
+    if await session.get(User, user_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "계정을 찾을 수 없습니다")
+    flag = await session.get(OpsAccountFlag, user_id)
+    if flag is None:
+        flag = OpsAccountFlag(user_id=user_id, internal=False)
+        session.add(flag)
+    flag.billing_preview = payload.billing_preview
+    flag.updated_at = datetime.now(UTC)
+    await session.commit()
+    logger.info(
+        "ops account %s billing_preview=%s by %s", user_id, payload.billing_preview, operator
+    )
+    return {"id": user_id, "billingPreview": payload.billing_preview}
 
 
 # ---------------------------------------------------------------- 장애 알림

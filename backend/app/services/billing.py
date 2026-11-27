@@ -20,6 +20,7 @@ from app.config import Settings
 from app.models import (
     AnalysisUsage,
     CallRecord,
+    OpsAccountFlag,
     RevenueCatEvent,
     Transcript,
     User,
@@ -71,6 +72,32 @@ async def people_of(session: AsyncSession, user_id: str) -> set[str]:
     return await family_people(session, family) if family is not None else {user_id}
 
 
+async def billing_start(
+    session: AsyncSession, settings: Settings, people: set[str], now: datetime
+) -> datetime | None:
+    """그 가족에게 결제가 켜진 시각(UTC). 꺼져 있으면 None.
+
+    전체 스위치(BILLING_LAUNCH_AT)가 지났거나, 가족 중 누구라도 운영 화면에서 「결제 미리 켜기」를
+    한 계정이면 켜진다. 미리 켜기 가족은 가장 먼저 가입한 사람의 가입 시각부터 켜진 것으로 본다
+    (오래된 심사 계정은 바로 무료가 되어 결제 화면을 끝까지 볼 수 있다).
+    """
+    preview = await session.scalar(
+        select(OpsAccountFlag.user_id).where(
+            OpsAccountFlag.user_id.in_(people), OpsAccountFlag.billing_preview.is_(True)
+        ).limit(1)
+    )
+    if preview is not None:
+        first_joined = await session.scalar(
+            select(func.min(User.created_at)).where(User.id.in_(people))
+        )
+        if first_joined is not None:
+            return aware(first_joined).astimezone(UTC)
+    if billing_enabled(settings, now):
+        assert settings.billing_launch_at is not None
+        return settings.billing_launch_at.astimezone(UTC)
+    return None
+
+
 @dataclass(frozen=True)
 class FamilyPlan:
     billing_enabled: bool
@@ -79,6 +106,8 @@ class FamilyPlan:
     trial_ends_at: datetime | None
     # 유효한 구독이 있는 가족 사람 → (그 구독 만료 시각, 자동 갱신 중인가)
     payers: dict[str, tuple[datetime, bool | None]] = field(default_factory=dict)
+    # 이 가족에게 결제가 켜진 시각. 사용량은 이 뒤의 줄만 센다.
+    started_at: datetime | None = None
 
     @property
     def latest_payer(self) -> str | None:
@@ -101,16 +130,15 @@ async def family_plan(
         user_id: (aware(until), renew) for user_id, until, renew in rows.all()
         if aware(until) > now
     }
-    if not billing_enabled(settings, now):
+    started_at = await billing_start(session, settings, people, now)
+    if started_at is None:
         return FamilyPlan(False, True, None, None, payers)
-    assert settings.billing_launch_at is not None
     # 가장 먼저 가입한 사람의 체험만 본다. 새 사람이 들어와도 가족 체험은 늘지 않는다.
     first_joined = await session.scalar(
         select(func.min(User.created_at)).where(User.id.in_(people))
     )
     trial_ends_at = (
-        max(aware(first_joined), settings.billing_launch_at).astimezone(UTC)
-        + timedelta(days=settings.trial_days)
+        max(aware(first_joined).astimezone(UTC), started_at) + timedelta(days=settings.trial_days)
         if first_joined is not None
         else None
     )
@@ -120,7 +148,15 @@ async def family_plan(
         source = "TRIAL"
     else:
         source = None
-    return FamilyPlan(True, source is not None, source, trial_ends_at, payers)
+    return FamilyPlan(True, source is not None, source, trial_ends_at, payers, started_at)
+
+
+async def billing_on_for(
+    session: AsyncSession, settings: Settings, user_id: str, now: datetime
+) -> bool:
+    """그 사람의 가족에게 결제가 켜져 있는가(전체 스위치 또는 결제 미리 켜기)."""
+    people = await people_of(session, user_id)
+    return await billing_start(session, settings, people, now) is not None
 
 
 async def refresh_lapsed(
@@ -132,7 +168,7 @@ async def refresh_lapsed(
     갱신 웹훅을 놓쳐 유료 사용자가 잠기지 않게 한다. 한 사람당 10분(updated_at)에 한 번만 부르고,
     실패해도 요청을 실패시키지 않고 저장값으로 판정한다. 다시 읽은 사람이 있으면 True.
     """
-    if client is None or not client.configured or not billing_enabled(settings, now):
+    if client is None or not client.configured:
         return False
     lapsed = list(await session.scalars(
         select(UserEntitlement.user_id).where(
@@ -143,6 +179,8 @@ async def refresh_lapsed(
             UserEntitlement.updated_at < now - LAPSED_RECHECK,
         )
     ))
+    if not lapsed or await billing_start(session, settings, people, now) is None:
+        return False
     for user_id in lapsed:
         try:
             await refresh_entitlement(session, settings, client, user_id, now)
@@ -152,9 +190,8 @@ async def refresh_lapsed(
             row = await session.get(UserEntitlement, user_id)
             if row is not None:
                 row.updated_at = now
-    if lapsed:
-        await session.commit()
-    return bool(lapsed)
+    await session.commit()
+    return True
 
 
 async def current_plan(
@@ -173,18 +210,15 @@ def analysis_limit(settings: Settings, plan: FamilyPlan) -> int:
 
 
 async def used_seconds(
-    session: AsyncSession, settings: Settings, people: set[str], month: str, now: datetime
+    session: AsyncSession, people: set[str], month: str, since: datetime | None
 ) -> int:
-    """그 달 가족 사용량. 결제가 켜져 있으면 켜진 뒤에 남은 줄만 센다."""
+    """그 달 가족 사용량. since(그 가족에게 결제가 켜진 시각)가 있으면 그 뒤의 줄만 센다."""
     statement = select(func.coalesce(func.sum(AnalysisUsage.seconds), 0)).where(
         AnalysisUsage.month == month,
         or_(AnalysisUsage.parent_id.in_(people), AnalysisUsage.child_id.in_(people)),
     )
-    if billing_enabled(settings, now):
-        assert settings.billing_launch_at is not None
-        statement = statement.where(
-            AnalysisUsage.created_at >= settings.billing_launch_at.astimezone(UTC)
-        )
+    if since is not None:
+        statement = statement.where(AnalysisUsage.created_at >= since)
     return int(await session.scalar(statement) or 0)
 
 
@@ -192,17 +226,17 @@ async def quota_exceeded(
     session: AsyncSession, settings: Settings, call: CallRecord, now: datetime,
     client: RevenueCatClient | None = None,
 ) -> bool:
-    """결제가 켜져 있고 그 통화 가족의 이번 달 사용량이 한도 이상이면 True.
+    """그 통화 가족에게 결제가 켜져 있고 이번 달 사용량이 한도 이상이면 True.
 
     이미 원장에 오른 통화(STT 를 시작한 뒤 재처리)는 끝까지 분석하므로 보지 않는다.
     """
-    if not billing_enabled(settings, now):
-        return False
     if await session.get(AnalysisUsage, call.id) is not None:
         return False
     people = await people_of(session, call.parent_id) | await people_of(session, call.child_id)
-    used = await used_seconds(session, settings, people, kst_month(now), now)
     plan = await family_plan(session, settings, people, now)
+    if not plan.billing_enabled:
+        return False
+    used = await used_seconds(session, people, kst_month(now), plan.started_at)
     if used < analysis_limit(settings, plan):
         return False
     if await refresh_lapsed(session, settings, client, people, now):
@@ -271,7 +305,7 @@ async def entitlement_view(
         "payerName": payer_name,
         "analysis": {
             "month": month,
-            "usedSec": await used_seconds(session, settings, people, month, now),
+            "usedSec": await used_seconds(session, people, month, plan.started_at),
             "limitSec": analysis_limit(settings, plan),
             "resetsAt": month_resets_at(now),
         },

@@ -245,8 +245,8 @@ async def refresh_entitlement(request: Request, user: CurrentUser, session: Sess
     recent = last is not None and time.monotonic() - last < REFRESH_INTERVAL_SECONDS
     if (
         client.configured
-        and billing.billing_enabled(container.settings, datetime.now(UTC))
         and not recent
+        and await billing.billing_on_for(session, container.settings, user.id, datetime.now(UTC))
     ):
         client.refreshed_at[user.id] = time.monotonic()
         try:
@@ -272,6 +272,10 @@ async def delete_account(
     async with request.app.state.container.calls.reserve_participants([user.id]):
         await lock_account(session, user, deleting=True)
         container = request.app.state.container
+        # 가족·운영 표시를 지우기 전에 결제가 켜진 가족이었는지 본다(RevenueCat 고객 삭제 여부).
+        billing_on = await billing.billing_on_for(
+            session, container.settings, user.id, datetime.now(UTC)
+        )
         identity = None
         client_secret = None
         if user.apple_subject:
@@ -397,9 +401,7 @@ async def delete_account(
                 ) from exc
         await session.commit()
         # RevenueCat 고객 기록도 지운다. 실패해도 계정 삭제는 끝난 것으로 둔다(스토어 구독은 별개).
-        if container.revenuecat.configured and billing.billing_enabled(
-            container.settings, datetime.now(UTC)
-        ):
+        if container.revenuecat.configured and billing_on:
             try:
                 await container.revenuecat.delete_subscriber(user.id)
             except RevenueCatError:

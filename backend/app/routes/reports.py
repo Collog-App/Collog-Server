@@ -19,12 +19,9 @@ router = APIRouter()
 async def ensure_premium(session: AsyncSession, request: Request, user: User) -> None:
     """결제가 켜져 있고 보는 사람의 가족이 프리미엄이 아니면 402(403 은 공유 꺼짐)."""
     container = request.app.state.container
-    now = datetime.now(UTC)
-    if not billing.billing_enabled(container.settings, now):
-        return
     people = await billing.people_of(session, user.id)
     plan = await billing.current_plan(
-        session, container.settings, container.revenuecat, people, now
+        session, container.settings, container.revenuecat, people, datetime.now(UTC)
     )
     if not plan.premium:
         raise HTTPException(402, billing.PREMIUM_REQUIRED_MESSAGE)
