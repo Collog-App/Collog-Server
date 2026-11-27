@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     AcousticAnalysisRun,
     AcousticFeature,
+    AnalysisUsage,
     AppEvent,
     AppleLoginChallenge,
     AssetKind,
@@ -39,9 +40,11 @@ from app.models import (
     RefreshSession,
     RepeatEvent,
     Report,
+    RevenueCatEvent,
     TodoItem,
     Transcript,
     User,
+    UserEntitlement,
     UserRole,
 )
 from app.schemas import (
@@ -53,9 +56,11 @@ from app.schemas import (
     UserView,
 )
 from app.security import CurrentUser, SessionDep
+from app.services import billing
 from app.services.apple_auth import AppleIdentityError, AppleServiceError
 from app.services.apple_oauth import apple_client_secret, revoke_apple_authorization
 from app.services.domain import connected_family_ids, family_of, hand_over_family
+from app.services.revenuecat import RevenueCatError
 from app.services.storage import StorageError
 
 router = APIRouter(prefix="/account", tags=["Account"])
@@ -214,6 +219,34 @@ async def update_sharing(payload: SharingUpdate, user: CurrentUser, session: Ses
     return await sharing_view(session, user)
 
 
+@router.get("/entitlement")
+async def get_entitlement(request: Request, user: CurrentUser, session: SessionDep) -> dict:
+    """가족 요금제와 이번 달 분석 분량. 앱은 화면 잠금을 이 값으로만 정한다."""
+    settings = request.app.state.container.settings
+    return await billing.entitlement_view(session, settings, user, datetime.now(UTC))
+
+
+@router.post("/entitlement/refresh")
+async def refresh_entitlement(request: Request, user: CurrentUser, session: SessionDep) -> dict:
+    """구매·복원 직후 RevenueCat 에서 내 구독을 다시 읽는다.
+
+    비밀 키가 없으면 저장된 값으로만 답한다.
+    """
+    container = request.app.state.container
+    if container.revenuecat.configured:
+        try:
+            await billing.refresh_entitlement(
+                session, container.settings, container.revenuecat, user.id, datetime.now(UTC)
+            )
+        except RevenueCatError as exc:
+            await session.rollback()
+            raise HTTPException(
+                502, "구독 정보를 확인하지 못했어요. 잠시 뒤 다시 시도해 주세요"
+            ) from exc
+        await session.commit()
+    return await billing.entitlement_view(session, container.settings, user, datetime.now(UTC))
+
+
 @router.delete("", status_code=204)
 async def delete_account(
     request: Request, user: CurrentUser, session: SessionDep,
@@ -296,6 +329,13 @@ async def delete_account(
             update(AppEvent).where(AppEvent.call_id.in_(call_ids)).values(call_id=None)
             .execution_options(synchronize_session=False)
         )
+        # 분석 분량 원장은 가족 합계라 줄은 남기고 이 사람 ID 만 비운다.
+        for column in (AnalysisUsage.parent_id, AnalysisUsage.child_id):
+            await session.execute(
+                update(AnalysisUsage).where(column == user.id).values({column.key: None})
+                .execution_options(synchronize_session=False)
+            )
+        await session.execute(delete(RevenueCatEvent).where(RevenueCatEvent.app_user_id == user.id))
         # Reports and baselines can contain summaries derived from the deleted calls.
         for model in (Report, Baseline):
             await session.execute(delete(model).where(model.parent_id.in_(parent_ids)))
@@ -321,7 +361,7 @@ async def delete_account(
         ))
         for model in (
             ConsentRecord, QuestionTtsGrant, Device, RefreshSession,
-            HealthDailySummary, HealthLinkConsent, TodoItem, OpsAccountFlag,
+            HealthDailySummary, HealthLinkConsent, TodoItem, OpsAccountFlag, UserEntitlement,
         ):
             await session.execute(delete(model).where(model.user_id == user.id))
         if user.phone:

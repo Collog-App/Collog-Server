@@ -25,7 +25,7 @@ from app.models import (
     RepeatEvent,
     Transcript,
 )
-from app.services import usage
+from app.services import billing, usage
 from app.services.acoustics import AcousticAnalysisInput, AcousticAnalyzer
 from app.services.deepgram import SttGateway, SttResult
 from app.services.domain import participants_consented
@@ -194,6 +194,16 @@ class ProcessingPipeline:
                 await session.commit()
                 await self.purge_call_audio(call_id)
                 return
+            # 무료 분량을 다 쓴 가족의 통화는 STT·Gemini 를 부르지 않고 동의 실패와 같게 정리한다.
+            # processing_allowed 에 넣지 않는 것은 분석 도중 여러 번 다시 불리기 때문이다(시작한
+            # 통화가 그 사이 다른 통화 때문에 잘리면 안 된다).
+            if await billing.quota_exceeded(session, self.settings, call, datetime.now(UTC)):
+                call.state = CallState.ANALYSIS_EXCLUDED.value
+                call.recording_enabled = False
+                call.recording_disabled_reason = billing.QUOTA_EXCEEDED_REASON
+                await session.commit()
+                await self.purge_call_audio(call_id)
+                return
             assets = (
                 await session.scalars(select(AudioAsset).where(AudioAsset.call_id == call_id))
             ).all()
@@ -323,6 +333,9 @@ class ProcessingPipeline:
         child_audio = await self.storage.read(child_egress.uri) if child_egress else None
         if not await self.processing_allowed(call_id):
             return
+        # 분량 원장은 결제가 꺼져 있어도 STT 를 시작하는 순간 남긴다(재처리 때는 그대로).
+        async with self.database.sessions() as session:
+            await billing.record_usage(session, call, datetime.now(UTC))
         # 두 화자 전사는 서로 기다릴 이유가 없어 함께 보낸다.
         stt_started = time.monotonic()
         transcriptions = [self.stt.transcribe(parent_audio, parent_source.content_type, "PARENT")]

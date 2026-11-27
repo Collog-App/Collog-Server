@@ -35,6 +35,8 @@ def call_to_dict(call: CallRecord) -> dict:
         "recordingDisabledMessage": (
             "녹음이 중단되어 이번 통화는 분석하지 않아요"
             if call.recording_disabled_reason == "RECORDING_INTERRUPTED"
+            else "이번 달 분석 시간을 다 써서 이 통화는 분석하지 않았어요."
+            if call.recording_disabled_reason == "ANALYSIS_QUOTA_EXCEEDED"
             else "녹음과 AI 분석 없이 통화해요" if not call.recording_enabled else None
         ),
         "parentSpeechSec": call.parent_speech_sec,

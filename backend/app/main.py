@@ -123,6 +123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         del request
         code_by_status = {
             401: "UNAUTHORIZED",
+            402: "PREMIUM_REQUIRED",
             403: "SCOPE_DENIED",
             404: "NOT_FOUND",
             409: "CONFLICT",

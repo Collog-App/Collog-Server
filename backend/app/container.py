@@ -16,6 +16,7 @@ from app.services.notifications import create_report_push_gateway, create_voip_p
 from app.services.pipeline import ProcessingPipeline
 from app.services.report_notifications import ReportNotifications
 from app.services.reports import ReportService
+from app.services.revenuecat import create_revenuecat_client
 from app.services.signals import SignalService
 from app.services.storage import create_storage
 from app.services.tts import create_question_tts_gateway
@@ -44,6 +45,7 @@ class AppContainer:
         self.acoustics = create_acoustic_analyzer(settings)
         self.signals = SignalService(settings)
         self.reports = ReportService()
+        self.revenuecat = create_revenuecat_client(settings)
         self.pipeline = ProcessingPipeline(
             settings,
             self.database,
