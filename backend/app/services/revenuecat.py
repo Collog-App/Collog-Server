@@ -73,17 +73,32 @@ class RevenueCatClient:
         return subscriber
 
 
+    async def delete_subscriber(self, app_user_id: str) -> None:
+        """고객을 지운다(RevenueCat 이 비동기로 처리). 없는 고객(404)은 이미 지워진 것으로 본다."""
+        try:
+            await self._request("DELETE", app_user_id)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise RevenueCatError(f"RevenueCat 고객 삭제 실패: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise RevenueCatError(f"RevenueCat 고객 삭제 실패: {exc}") from exc
+
+
 class MockRevenueCatClient(RevenueCatClient):
-    """시험용. `subscribers` 에 넣어 둔 값을 돌려주고 부른 ID 를 `requested` 에 남긴다."""
+    """시험용. `subscribers` 에 넣어 둔 값을 돌려주고 부른 ID 를 `requested`·`deleted` 에 남긴다."""
 
     def __init__(self, settings: Settings) -> None:
         super().__init__(settings)
         self.subscribers: dict[str, dict[str, Any]] = {}
         self.requested: list[str] = []
+        self.deleted: list[str] = []
 
     async def subscriber(self, app_user_id: str) -> dict[str, Any]:
         self.requested.append(app_user_id)
         return self.subscribers.get(app_user_id, {"entitlements": {}, "subscriptions": {}})
+
+    async def delete_subscriber(self, app_user_id: str) -> None:
+        self.deleted.append(app_user_id)
 
 
 def create_revenuecat_client(settings: Settings) -> RevenueCatClient:

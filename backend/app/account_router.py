@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import re
 import time
 from datetime import UTC, datetime, timedelta
@@ -65,6 +66,7 @@ from app.services.revenuecat import RevenueCatError
 from app.services.storage import StorageError
 
 router = APIRouter(prefix="/account", tags=["Account"])
+logger = logging.getLogger(__name__)
 # 같은 사람이 이 간격 안에 다시 새로 읽기를 부르면 RevenueCat 을 부르지 않고 저장값으로 답한다.
 REFRESH_INTERVAL_SECONDS = 30
 
@@ -394,4 +396,12 @@ async def delete_account(
                     503, "Apple 권한 해제를 완료하지 못했어요. 다시 인증 후 삭제해주세요"
                 ) from exc
         await session.commit()
+        # RevenueCat 고객 기록도 지운다. 실패해도 계정 삭제는 끝난 것으로 둔다(스토어 구독은 별개).
+        if container.revenuecat.configured and billing.billing_enabled(
+            container.settings, datetime.now(UTC)
+        ):
+            try:
+                await container.revenuecat.delete_subscriber(user.id)
+            except RevenueCatError:
+                logger.warning("RevenueCat 고객 삭제에 실패했지만 계정 삭제는 마쳤습니다")
         return Response(status_code=204)

@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import httpx
+import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select, update
@@ -26,6 +27,7 @@ from app.services.revenuecat import (
     LIFETIME,
     EntitlementState,
     RevenueCatClient,
+    RevenueCatError,
     entitlement_from_subscriber,
     related_user_ids,
 )
@@ -1014,3 +1016,60 @@ def test_failed_stt_releases_the_usage_but_later_failures_keep_it(client: TestCl
     late = run_call(client, child_token, parent_token, parent, talk_seconds=60)
     assert call_view(client, child_token, late)["state"] == "ANALYSIS_FAILED"
     assert len(usage_rows(client, late)) == 1
+
+
+def test_account_deletion_asks_revenuecat_to_delete_the_customer(client: TestClient) -> None:
+    child_token, child, _, _ = onboard_family(client)
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    end_trial(client, child["id"])
+    revenuecat = client.app.state.container.revenuecat
+    assert client.delete("/v1/account", headers=auth(child_token)).status_code == 204
+    assert revenuecat.deleted == [child["id"]]
+
+
+def test_account_deletion_skips_revenuecat_when_billing_is_off(client: TestClient) -> None:
+    child_token, _, _, _ = onboard_family(client)
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    revenuecat = client.app.state.container.revenuecat
+    assert client.delete("/v1/account", headers=auth(child_token)).status_code == 204
+    assert revenuecat.deleted == []
+
+
+def test_account_deletion_finishes_when_revenuecat_fails(client: TestClient) -> None:
+    child_token, child, _, _ = onboard_family(client)
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    end_trial(client, child["id"])
+    container = client.app.state.container
+    container.revenuecat = RevenueCatClient(
+        container.settings,
+        transport=httpx.MockTransport(lambda request: httpx.Response(401, json={})),
+    )
+    assert client.delete("/v1/account", headers=auth(child_token)).status_code == 204
+
+    async def remaining(session):
+        return await session.get(User, child["id"])
+
+    assert run_db(client, remaining) is None
+
+
+async def test_rest_client_deletes_the_customer_and_treats_404_as_done() -> None:
+    seen: list[httpx.Request] = []
+    status = {"code": 200}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status["code"], json={"app_user_id": "u", "deleted": True})
+
+    client = RevenueCatClient(
+        Settings(revenuecat_secret_key="sk_live_value"), transport=httpx.MockTransport(respond)
+    )
+    await client.delete_subscriber("u-1")
+    status["code"] = 404
+    await client.delete_subscriber("u-1")
+    status["code"] = 401
+    with pytest.raises(RevenueCatError):
+        await client.delete_subscriber("u-1")
+    assert {(request.method, str(request.url)) for request in seen} == {
+        ("DELETE", "https://api.revenuecat.com/v1/subscribers/u-1")
+    }
+    assert all(request.headers["Authorization"] == "Bearer sk_live_value" for request in seen)
