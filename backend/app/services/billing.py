@@ -69,23 +69,30 @@ class FamilyPlan:
     paid_until: datetime | None
     # 유효한 구독이 있는 가족 사람 → 그 구독 만료 시각
     payers: dict[str, datetime] = field(default_factory=dict)
+    # paid_until 을 준 구독이 자동 갱신 중인가. 유료가 아니거나 모르면 None.
+    will_renew: bool | None = None
 
 
 async def family_plan(
     session: AsyncSession, settings: Settings, people: set[str], now: datetime
 ) -> FamilyPlan:
     rows = await session.execute(
-        select(UserEntitlement.user_id, UserEntitlement.active_until).where(
+        select(
+            UserEntitlement.user_id, UserEntitlement.active_until, UserEntitlement.will_renew
+        ).where(
             UserEntitlement.user_id.in_(people),
             UserEntitlement.active_until.is_not(None),
         )
     )
-    payers = {
-        user_id: aware(until) for user_id, until in rows.all() if aware(until) > now
-    }
-    paid_until = max(payers.values()) if payers else None
+    valid = [
+        (user_id, aware(until), renew) for user_id, until, renew in rows.all()
+        if aware(until) > now
+    ]
+    payers = {user_id: until for user_id, until, _ in valid}
+    latest = max(valid, key=lambda item: item[1], default=None)
+    paid_until, will_renew = (latest[1], latest[2]) if latest else (None, None)
     if not billing_enabled(settings, now):
-        return FamilyPlan(False, True, None, None, paid_until, payers)
+        return FamilyPlan(False, True, None, None, paid_until, payers, will_renew)
     assert settings.billing_launch_at is not None
     # 가장 먼저 가입한 사람의 체험만 본다. 새 사람이 들어와도 가족 체험은 늘지 않는다.
     first_joined = await session.scalar(
@@ -103,7 +110,9 @@ async def family_plan(
         source = "TRIAL"
     else:
         source = None
-    return FamilyPlan(True, source is not None, source, trial_ends_at, paid_until, payers)
+    return FamilyPlan(
+        True, source is not None, source, trial_ends_at, paid_until, payers, will_renew
+    )
 
 
 def analysis_limit(settings: Settings, plan: FamilyPlan) -> int:
@@ -175,6 +184,7 @@ async def entitlement_view(
         "trialEndsAt": plan.trial_ends_at,
         "paidUntil": plan.paid_until,
         "paidByMe": paid_by_me,
+        "willRenew": plan.will_renew,
         "payerName": payer_name,
         "analysis": {
             "month": month,

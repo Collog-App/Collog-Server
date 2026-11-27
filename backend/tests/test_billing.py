@@ -217,6 +217,7 @@ def test_billing_off_keeps_everything_open_but_still_records_usage(client: TestC
     assert body["billingEnabled"] is False
     assert (body["plan"], body["source"], body["trialEndsAt"]) == ("PREMIUM", None, None)
     assert (body["paidByMe"], body["payerName"], body["paidUntil"]) == (False, None, None)
+    assert body["willRenew"] is None
     assert body["analysis"]["limitSec"] == 15000
     assert body["analysis"]["usedSec"] == 99_999 + row.seconds
 
@@ -638,6 +639,30 @@ def test_webhook_transfer_refreshes_only_our_users_through_rest(client: TestClie
     assert entitlement(client, parent_token)["paidByMe"] is True
     assert stored_entitlement(client, child["id"]).active_until is None
     assert entitlement(client, child_token)["payerName"] == "김순자"
+
+
+def test_will_renew_follows_the_latest_family_subscription(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    end_trial(client, child["id"], parent["id"])
+    settings_of(client).revenuecat_webhook_auth = WEBHOOK_AUTH
+    assert entitlement(client, child_token)["willRenew"] is None  # 유료가 아니면 null
+
+    post_event(client, purchase_event(child["id"], "evt-r1"))
+    assert entitlement(client, parent_token)["willRenew"] is True
+    post_event(client, purchase_event(child["id"], "evt-r2", "CANCELLATION"))
+    assert entitlement(client, parent_token)["willRenew"] is False
+    post_event(client, purchase_event(child["id"], "evt-r3", "UNCANCELLATION"))
+    assert entitlement(client, child_token)["willRenew"] is True
+
+    # REST 로 읽으면 unsubscribe_detected_at 이 있는 구독은 갱신되지 않는다.
+    settings_of(client).revenuecat_secret_key = "sk_test_key"
+    cancelled = premium_subscriber(days=40)
+    cancelled["subscriptions"]["collog_premium"]["unsubscribe_detected_at"] = "2026-11-20T00:00:00Z"
+    client.app.state.container.revenuecat.subscribers[parent["id"]] = cancelled
+    refreshed = client.post("/v1/account/entitlement/refresh", headers=auth(parent_token)).json()
+    # 가족에서 가장 늦게 끝나는 구독(부모, 40일)의 값을 쓴다.
+    assert (refreshed["paidByMe"], refreshed["willRenew"]) == (True, False)
+    assert entitlement(client, child_token)["willRenew"] is False
 
 
 def test_related_user_ids_reads_every_identity_field() -> None:
