@@ -598,3 +598,46 @@ class AppEvent(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
     )
+
+
+class AnalysisUsage(Base):
+    """분석 분량 원장. 음성 인식(STT)을 시작한 통화마다 한 줄, 통화 길이(duration_sec)를 남긴다.
+
+    통화 행이 지워져도 그 달 분량이 줄지 않게 통화·사용자 외래 키를 걸지 않는다. 계정을 지우면
+    그 사람 ID 칸만 비운다. month 는 한국 시간 'YYYY-MM'(줄을 남긴 때).
+    """
+
+    __tablename__ = "analysis_usage"
+
+    call_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    parent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    child_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    month: Mapped[str] = mapped_column(String(7), index=True)
+    seconds: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class UserEntitlement(Base):
+    """RevenueCat 에서 읽은 그 사람의 프리미엄 구독. active_until 이 지금보다 뒤면 유효하다."""
+
+    __tablename__ = "user_entitlements"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    active_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    store: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    product_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    environment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    will_renew: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RevenueCatEvent(Base):
+    """이미 처리한 RevenueCat 웹훅(event.id). 재시도로 같은 이벤트가 다시 와도 한 번만 반영한다."""
+
+    __tablename__ = "revenuecat_events"
+
+    id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    type: Mapped[str] = mapped_column(String(40))
+    app_user_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    environment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

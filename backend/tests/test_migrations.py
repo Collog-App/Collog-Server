@@ -207,6 +207,30 @@ def test_ai_usage_migration_keeps_existing_calls(tmp_path: Path) -> None:
     assert "Restore a verified backup" in refused.stderr
 
 
+def test_billing_migration_keeps_users_and_refuses_downgrade(tmp_path: Path) -> None:
+    database = tmp_path / "billing.db"
+    assert migrate(database, "upgrade", "0022_call_ai_usage").returncode == 0
+    engine = sa.create_engine(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO users (id, role, name, marketing_opt_in, created_at)"
+                " VALUES ('u1', 'CHILD', 'Test', 0, :now)"
+            ),
+            dict(now=datetime.now(UTC)),
+        )
+    result = migrate(database, "upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text("SELECT name FROM users WHERE id='u1'")) == "Test"
+        tables = set(sa.inspect(connection).get_table_names())
+        assert {"analysis_usage", "user_entitlements", "revenuecat_events"} <= tables
+    engine.dispose()
+    refused = migrate(database, "downgrade", "0022_call_ai_usage")
+    assert refused.returncode != 0
+    assert "Restore a verified backup" in refused.stderr
+
+
 def test_destructive_downgrade_is_refused(tmp_path: Path) -> None:
     database = tmp_path / "rollback.db"
     assert migrate(database, "upgrade", "head").returncode == 0

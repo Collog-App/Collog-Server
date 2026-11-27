@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -99,3 +101,21 @@ def test_instance_role_refuses_static_keys(production: Settings) -> None:
     production.s3_use_instance_role = True
     with pytest.raises(ValueError, match="without static S3 keys"):
         production.validate_runtime()
+
+
+def test_launch_setting_reads_empty_and_naive_values() -> None:
+    # 빈 값은 결제 꺼짐, 시간대 없는 값은 한국 시간.
+    assert Settings(billing_launch_at="").billing_launch_at is None
+    assert Settings(billing_launch_at="2026-12-15T00:00:00").billing_launch_at == datetime(
+        2026, 12, 15, tzinfo=ZoneInfo("Asia/Seoul")
+    )
+    assert Settings(billing_launch_at="2026-12-15T00:00:00+00:00").billing_launch_at == datetime(
+        2026, 12, 15, tzinfo=UTC
+    )
+
+
+def test_production_does_not_require_billing_settings(production: Settings) -> None:
+    # 결제 값이 하나도 없어도 운영 기동을 막지 않는다(결제가 꺼진 채로 동작).
+    assert production.billing_launch_at is None
+    assert production.revenuecat_secret_key == production.revenuecat_webhook_auth == ""
+    production.validate_runtime()

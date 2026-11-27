@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -158,6 +160,30 @@ class Settings(BaseSettings):
     # 코드 자체는 저장하지 않고 해시만 둔다. 형식이 틀린 항목은 건너뛰고(부팅은 막지 않음),
     # 남는 항목이 없으면 /ops 전체가 404다.
     ops_access_codes: str = ""
+
+    # 구독 결제(RevenueCat). BILLING_LAUNCH_AT 이 비었거나 아직 오지 않았으면 결제가 꺼진 것으로
+    # 보고 모두 프리미엄·잠금 없음·분량 제한 없음(분량 원장만 쌓는다). 시간대 없이 적으면
+    # 한국 시간으로 읽는다. 값이 모두 비어 있어도 기동은 막지 않는다(운영 필수 설정이 아님).
+    billing_launch_at: datetime | None = None
+    revenuecat_secret_key: str = ""
+    revenuecat_webhook_auth: str = ""
+    revenuecat_entitlement_id: str = "premium"
+    revenuecat_allow_sandbox: bool = True
+    trial_days: int = Field(default=14, ge=0)
+    free_analysis_seconds: int = Field(default=2400, ge=0)
+    premium_analysis_seconds: int = Field(default=15000, ge=0)
+
+    @field_validator("billing_launch_at", mode="before")
+    @classmethod
+    def empty_launch_is_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("billing_launch_at")
+    @classmethod
+    def naive_launch_is_kst(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+        return value
 
     @property
     def ops_access_code_hashes(self) -> list[tuple[str, str]]:
