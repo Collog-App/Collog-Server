@@ -33,6 +33,7 @@ from app.services.domain import (
 )
 from app.services.livekit import LiveKitError
 from app.services.notifications import IncomingCallPush
+from app.services.reports import REPORT_TIMEZONE
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -407,6 +408,10 @@ async def get_call(
     return call_to_dict(call)
 
 
+def korean_midnight_utc(day: date) -> datetime:
+    return datetime.combine(day, datetime.min.time(), tzinfo=REPORT_TIMEZONE).astimezone(UTC)
+
+
 @router.get("/parents/{parentId}/calls", tags=["Call"])
 async def list_calls(
     parent_id: Annotated[str, Path(alias="parentId")],
@@ -417,13 +422,13 @@ async def list_calls(
 ) -> dict:
     await ensure_subject_access(session, user, parent_id, "timeline")
     statement = select(CallRecord).where(CallRecord.parent_id == parent_id)
+    # 앱은 리포트와 같은 날짜(Asia/Seoul)로 from·to 를 보낸다. 경계를 UTC 자정으로 잡으면
+    # 한국 시간 자정~오전 9시 통화가 리포트와 다른 주에 들어간다.
     if from_:
-        statement = statement.where(
-            CallRecord.started_at >= datetime.combine(from_, datetime.min.time())
-        )
+        statement = statement.where(CallRecord.started_at >= korean_midnight_utc(from_))
     if to:
         statement = statement.where(
-            CallRecord.started_at < datetime.combine(to + timedelta(days=1), datetime.min.time())
+            CallRecord.started_at < korean_midnight_utc(to + timedelta(days=1))
         )
     calls = list(await session.scalars(statement.order_by(CallRecord.started_at.desc())))
     return {"calls": [call_to_dict(call) for call in calls]}
