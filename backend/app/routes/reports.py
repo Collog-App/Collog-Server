@@ -54,7 +54,9 @@ async def get_signals(
     filter: Literal["ALL", "PROMOTED", "ACUTE"] = "ALL",
 ) -> dict:
     await ensure_subject_access(session, user, parent_id, "report")
-    await ensure_premium(session, request, user)
+    # 급성 변화는 요금제와 상관없이 보인다(11-28 결정). 공유 꺼짐 검사는 위에서 먼저 한다.
+    if filter != "ACUTE":
+        await ensure_premium(session, request, user)
     statement = select(ChangeSignal).where(ChangeSignal.parent_id == parent_id)
     if filter == "PROMOTED":
         statement = statement.where(ChangeSignal.promoted.is_(True))

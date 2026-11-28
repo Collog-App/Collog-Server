@@ -266,6 +266,12 @@ def test_trial_over_locks_reports_and_signals_with_402(client: TestClient) -> No
     signals = client.get(f"/v1/parents/{parent['id']}/signals", headers=auth(child_token))
     assert signals.status_code == 402
     assert signals.json()["code"] == "PREMIUM_REQUIRED"
+    # 급성 변화(응급 안내)만은 무료 가족에게도 보인다.
+    for kind, expected in (("ACUTE", 200), ("ALL", 402), ("PROMOTED", 402)):
+        response = client.get(
+            f"/v1/parents/{parent['id']}/signals?filter={kind}", headers=auth(child_token)
+        )
+        assert response.status_code == expected, kind
     # 무료 화면도 쓰는 API 는 막지 않는다.
     for path in (f"/v1/parents/{parent['id']}/baseline", f"/v1/parents/{parent['id']}/calls"):
         assert client.get(path, headers=auth(child_token)).status_code == 200
@@ -282,6 +288,12 @@ def test_share_off_stays_403_and_differs_from_premium_402(client: TestClient) ->
     hidden = report(client, child_token, parent["id"])
     assert hidden.status_code == 403
     assert hidden.json()["code"] == "SCOPE_DENIED"
+    # 공유를 껐으면 무료라도 급성 변화 역시 403 이 먼저다.
+    end_trial(client, child["id"], parent["id"])
+    acute = client.get(
+        f"/v1/parents/{parent['id']}/signals?filter=ACUTE", headers=auth(child_token)
+    )
+    assert (acute.status_code, acute.json()["code"]) == (403, "SCOPE_DENIED")
 
 
 def test_existing_members_get_two_weeks_from_launch(client: TestClient) -> None:
