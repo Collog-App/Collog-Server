@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
@@ -11,6 +11,7 @@ from app.models import Baseline, ChangeSignal, User
 from app.security import CurrentUser, SessionDep
 from app.services import billing
 from app.services.domain import ensure_subject_access
+from app.services.reports import recent_safety_notices
 from app.services.signals import baseline_to_dict, signal_to_dict
 
 router = APIRouter()
@@ -64,6 +65,22 @@ async def get_signals(
         statement = statement.where(ChangeSignal.acute.is_(True))
     items = list(await session.scalars(statement.order_by(ChangeSignal.observed_at.desc())))
     return {"signals": [signal_to_dict(item) for item in items]}
+
+
+@router.get("/parents/{parentId}/safety-notices", tags=["Report"])
+async def get_safety_notices(
+    parent_id: Annotated[str, Path(alias="parentId")],
+    user: CurrentUser,
+    session: SessionDep,
+    days: Annotated[int, Query(ge=1, le=90)] = 14,
+) -> dict:
+    """최근 days 일 동안 끝난 통화의 응급 안내. 요금제와 상관없이 보인다(11-28 결정).
+
+    리포트의 safetyNotices 와 같은 항목이다. 공유 꺼짐(403)만 본다.
+    """
+    await ensure_subject_access(session, user, parent_id, "report")
+    since = datetime.now(UTC) - timedelta(days=days)
+    return {"safetyNotices": await recent_safety_notices(session, parent_id, since)}
 
 
 @router.get("/parents/{parentId}/reports", tags=["Report"])

@@ -1182,3 +1182,62 @@ def test_deleting_a_preview_account_also_deletes_the_revenuecat_customer(
     revenuecat = client.app.state.container.revenuecat
     assert client.delete("/v1/account", headers=auth(child_token)).status_code == 204
     assert revenuecat.deleted == [child["id"]]
+
+
+# --- 응급 안내(무료) ----------------------------------------------------------------------
+
+EMERGENCY_TALK = (
+    "PARENT: 어제 저녁에 가슴이 답답해서 한참 앉아 있었어. 지금은 좀 나아졌고 아침도 "
+    "챙겨 먹었어. 오후에는 공원을 삼십 분 정도 천천히 산책했고 잠도 평소처럼 잤어."
+)
+
+
+def safety_notices(client: TestClient, token: str, parent_id: str, query: str = ""):
+    return client.get(f"/v1/parents/{parent_id}/safety-notices{query}", headers=auth(token))
+
+
+def test_free_family_sees_safety_notices_like_the_report(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    analyzed = run_call(client, child_token, parent_token, parent, parent_text=EMERGENCY_TALK)
+    short = run_call(client, child_token, parent_token, parent, parent_text="PARENT: 가슴이 아파")
+    run_call(client, child_token, parent_token, parent)  # 응급 표현 없는 통화
+    assert call_view(client, child_token, analyzed)["state"] == "ANALYZED"
+    assert call_view(client, child_token, short)["state"] == "ANALYSIS_EXCLUDED"
+    weekly = report(client, child_token, parent["id"]).json()["safetyNotices"]
+
+    end_trial(client, child["id"], parent["id"])
+    assert report(client, child_token, parent["id"]).status_code == 402
+    response = safety_notices(client, child_token, parent["id"])
+    assert response.status_code == 200, response.text
+    notices = response.json()["safetyNotices"]
+    # 리포트와 같은 항목·같은 순서(최근 통화부터), 짧아서 분석에서 빠진 통화도 들어간다.
+    assert notices == weekly
+    assert [item["callId"] for item in notices] == [short, analyzed]
+    assert set(notices[0]) == {"callId", "observedAt", "text"}
+    assert datetime.fromisoformat(notices[0]["observedAt"]).tzinfo is not None
+
+
+def test_safety_notices_follow_the_period_and_sharing(client: TestClient) -> None:
+    child_token, child, parent_token, parent = onboard_family(client)
+    old = run_call(client, child_token, parent_token, parent, parent_text="PARENT: 가슴이 아파")
+
+    async def age(session):
+        await session.execute(update(CallRecord).where(CallRecord.id == old).values(
+            ended_at=datetime.now(UTC) - timedelta(days=20)
+        ))
+
+    run_db(client, age)
+    assert safety_notices(client, child_token, parent["id"]).json()["safetyNotices"] == []
+    wider = safety_notices(client, child_token, parent["id"], "?days=30").json()
+    assert [item["callId"] for item in wider["safetyNotices"]] == [old]
+    for days in (0, 91):
+        assert safety_notices(client, child_token, parent["id"], f"?days={days}").status_code == 422
+
+    async def hide_report(session):
+        session.add(FamilyShare(owner_id=parent["id"], viewer_id=child["id"], report=False))
+
+    run_db(client, hide_report)
+    hidden = safety_notices(client, child_token, parent["id"])
+    assert (hidden.status_code, hidden.json()["code"]) == (403, "SCOPE_DENIED")
+    # 본인은 언제나 본다.
+    assert safety_notices(client, parent_token, parent["id"], "?days=30").status_code == 200

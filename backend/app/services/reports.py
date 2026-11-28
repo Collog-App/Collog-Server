@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import calendar
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -38,6 +39,59 @@ def period_bounds(period: str, target: date | None) -> tuple[date, date]:
     return target.replace(day=1), target.replace(day=last_day)
 
 
+# 리포트에 넣는 통화. 분석에서 빠진 짧은 통화(ANALYSIS_EXCLUDED)의 응급 안내도 보인다.
+REPORT_CALL_STATES = ("ANALYZED", "ANALYSIS_EXCLUDED")
+
+
+async def safety_notices_for(
+    session: AsyncSession, calls: Sequence[CallRecord]
+) -> list[dict[str, Any]]:
+    """통화들의 응급 안내 `{callId, observedAt(통화 끝난 시각), text}`, 최근 통화부터.
+
+    응급 안내는 분석에서 빠진 짧은 통화에도 남는다(pipeline). 리포트와 응급 안내 API 가 같이 쓴다.
+    """
+    if not calls:
+        return []
+    notice_rows = list(
+        await session.scalars(
+            select(HealthExtraction).where(
+                HealthExtraction.call_id.in_([call.id for call in calls]),
+                HealthExtraction.safety_notice.is_not(None),
+            )
+        )
+    )
+    ended_at_by_call = {call.id: call.ended_at for call in calls}
+    return [
+        {
+            "callId": row.call_id,
+            "observedAt": aware_datetime(ended_at_by_call[row.call_id]).isoformat(),
+            "text": row.safety_notice,
+        }
+        for row in sorted(
+            notice_rows,
+            # 스냅샷과 비교하므로 같은 시각이어도 순서가 매번 같아야 한다.
+            key=lambda row: (aware_datetime(ended_at_by_call[row.call_id]), row.call_id),
+            reverse=True,
+        )
+    ]
+
+
+async def recent_safety_notices(
+    session: AsyncSession, parent_id: str, since: datetime
+) -> list[dict[str, Any]]:
+    """since(UTC) 뒤에 끝난 통화의 응급 안내. 리포트와 같은 통화·같은 모양·같은 순서."""
+    calls = (
+        await session.scalars(
+            select(CallRecord).where(
+                CallRecord.parent_id == parent_id,
+                CallRecord.ended_at >= since.astimezone(UTC),
+                CallRecord.state.in_(REPORT_CALL_STATES),
+            )
+        )
+    ).all()
+    return await safety_notices_for(session, calls)
+
+
 class ReportService:
     async def get_or_issue(
         self, session: AsyncSession, parent_id: str, period: str, target: date | None
@@ -58,7 +112,7 @@ class ReportService:
                     CallRecord.parent_id == parent_id,
                     CallRecord.ended_at >= start_dt,
                     CallRecord.ended_at < end_dt,
-                    CallRecord.state.in_(["ANALYZED", "ANALYSIS_EXCLUDED"]),
+                    CallRecord.state.in_(REPORT_CALL_STATES),
                 )
             )
         ).all()
@@ -77,31 +131,7 @@ class ReportService:
             (aware_datetime(call.ended_at) for call in calls if call.ended_at), default=None
         )
         analyzed_ids = [call.id for call in calls if call.state == "ANALYZED"]
-        # 응급 안내는 분석에서 빠진 짧은 통화에도 남는다(pipeline).
-        notice_rows: list[HealthExtraction] = []
-        if calls:
-            notice_rows = list(
-                await session.scalars(
-                    select(HealthExtraction).where(
-                        HealthExtraction.call_id.in_([call.id for call in calls]),
-                        HealthExtraction.safety_notice.is_not(None),
-                    )
-                )
-            )
-        ended_at_by_call = {call.id: call.ended_at for call in calls}
-        safety_notices = [
-            {
-                "callId": row.call_id,
-                "observedAt": aware_datetime(ended_at_by_call[row.call_id]).isoformat(),
-                "text": row.safety_notice,
-            }
-            for row in sorted(
-                notice_rows,
-                # 스냅샷과 비교하므로 같은 시각이어도 순서가 매번 같아야 한다.
-                key=lambda row: (aware_datetime(ended_at_by_call[row.call_id]), row.call_id),
-                reverse=True,
-            )
-        ]
+        safety_notices = await safety_notices_for(session, calls)
         # 분석은 통화가 끝나고 몇 분 뒤에 끝난다. 그 사이에 만든 스냅샷은 종료 시각만 보면
         # 최신으로 보이므로, 분석된 통화 수나 응급 안내가 달라졌으면(지난 기간도) 다시 만든다.
         if (
